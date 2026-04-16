@@ -3,8 +3,17 @@
   "displayName": "Vite Debugger",
   "description": "Debug Vite applications in VSCode by attaching to Chrome DevTools Protocol",
   "version": "0.1.0",
-  "publisher": "vite-debugger",
+  "publisher": "newdlops",
   "license": "MIT",
+  "icon": "images/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/newdlops/vite-debugger"
+  },
+  "bugs": {
+    "url": "https://github.com/newdlops/vite-debugger/issues"
+  },
+  "homepage": "https://github.com/newdlops/vite-debugger#readme",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -19,7 +28,7 @@
         {
           "id": "vite-debugger",
           "title": "Vite Debugger",
-          "icon": "$(bug)"
+          "icon": "images/icon.svg"
         }
       ]
     },
@@ -66,6 +75,12 @@
                 "type": "object",
                 "description": "Source map path overrides for custom mappings",
                 "default": {}
+              },
+              "skipFiles": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Glob patterns for files to skip during stepping (e.g., [\"**/styled-components/**\", \"**/index.tsx\"]). Matched files are stepped over automatically.",
+                "default": []
               }
             }
           },
@@ -90,6 +105,12 @@
                 "type": "object",
                 "description": "Source map path overrides for custom mappings",
                 "default": {}
+              },
+              "skipFiles": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Glob patterns for files to skip during stepping (e.g., [\"**/styled-components/**\", \"**/index.tsx\"]). Matched files are stepped over automatically.",
+                "default": []
               }
             }
           }

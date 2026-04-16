@@ -38,6 +38,7 @@ interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
   chromePort?: number;
   webRoot?: string;
   sourceMapPathOverrides?: Record<string, string>;
+  skipFiles?: string[];
 }
 
 interface AttachRequestArguments extends DebugProtocol.AttachRequestArguments {
@@ -45,6 +46,7 @@ interface AttachRequestArguments extends DebugProtocol.AttachRequestArguments {
   chromePort?: number;
   webRoot?: string;
   sourceMapPathOverrides?: Record<string, string>;
+  skipFiles?: string[];
 }
 
 export class ViteDebugSession extends LoggingDebugSession {
@@ -75,6 +77,8 @@ export class ViteDebugSession extends LoggingDebugSession {
   private stepInTargetLocations = new Map<number, BreakLocation>();
   private tempBreakpointId: string | null = null;
   private sourceMapRetryTimer: NodeJS.Timeout | null = null;
+  /** Glob patterns for files the user wants to skip during stepping */
+  private skipFilePatterns: string[] = [];
 
   constructor() {
     super('vite-debugger.log');
@@ -124,6 +128,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     try {
       const webRoot = args.webRoot || process.cwd();
       const chromePort = args.chromePort || 9222;
+      this.skipFilePatterns = args.skipFiles ?? [];
 
       // Step 1: Detect Vite server
       this.viteServer = await detectFirstViteServer(args.viteUrl);
@@ -155,6 +160,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     try {
       const webRoot = args.webRoot || process.cwd();
       const chromePort = args.chromePort || 9222;
+      this.skipFilePatterns = args.skipFiles ?? [];
 
       // Detect Vite server
       this.viteServer = await detectFirstViteServer(args.viteUrl);
@@ -830,8 +836,11 @@ export class ViteDebugSession extends LoggingDebugSession {
     const isException = params.reason === 'exception' || params.reason === 'promiseRejection';
     const isManualPause = params.reason === 'debugCommand';
 
+    const isExplicitBreakpoint = params.reason === 'breakpoint' ||
+      (params.reason === 'other' && params.hitBreakpoints && params.hitBreakpoints.length > 0);
+
     if (!isException && !isManualPause && this.cdp && this.sourceMapResolver) {
-      const shouldSkip = await this.shouldSmartStep(params);
+      const shouldSkip = await this.shouldSmartStep(params, isExplicitBreakpoint);
       if (shouldSkip) {
         this.smartStepCount++;
 
@@ -909,12 +918,12 @@ export class ViteDebugSession extends LoggingDebugSession {
    * are in the same script URL as user code so they can't be blackboxed.
    *
    * The check:
-   *   1. If the position resolves via source map → user code (stop)
+   *   1. If the position resolves via source map → check skipFiles patterns, then user code (stop)
    *   2. If it doesn't resolve but the script's primary source exists on disk
    *      → still user code with sparse mapping (stop)
    *   3. If it doesn't resolve and no local source → injected code (skip)
    */
-  private async shouldSmartStep(params: PausedEvent): Promise<boolean> {
+  private async shouldSmartStep(params: PausedEvent, isExplicitBreakpoint: boolean = false): Promise<boolean> {
     if (params.callFrames.length === 0) return false;
 
     const topFrame = params.callFrames[0];
@@ -929,8 +938,18 @@ export class ViteDebugSession extends LoggingDebugSession {
         scriptId, lineNumber, columnNumber ?? 0
       );
       if (original) {
-        // Skip node_modules, stop on user code
-        return original.source.includes('/node_modules/');
+        // Skip node_modules
+        if (original.source.includes('/node_modules/')) return true;
+
+        // Skip files matching user-configured skipFiles patterns
+        // (but NOT when an explicit breakpoint was hit — user placed it intentionally)
+        if (!isExplicitBreakpoint && this.shouldSkipFile(original.source)) {
+          logger.debug(`Skipping file (skipFiles match): ${original.source}`);
+          return true;
+        }
+
+        // User code — stop here
+        return false;
       }
 
       // No mapping found at all (even with backwards search) →
@@ -940,6 +959,34 @@ export class ViteDebugSession extends LoggingDebugSession {
 
     // No source map = probably should have been blackboxed, but wasn't.
     return false;
+  }
+
+  /**
+   * Check if a source file path matches any of the user-configured skipFiles patterns.
+   * Supports glob-like patterns: "*" matches any segment, "**" matches multiple segments.
+   */
+  private shouldSkipFile(filePath: string): boolean {
+    if (this.skipFilePatterns.length === 0) return false;
+
+    const normalized = filePath.replace(/\\/g, '/');
+    for (const pattern of this.skipFilePatterns) {
+      if (this.globMatch(normalized, pattern)) return true;
+    }
+    return false;
+  }
+
+  private globMatch(filePath: string, pattern: string): boolean {
+    // Simple glob matching: convert glob to regex
+    // Support: *, **, ?
+    const regexStr = pattern
+      .replace(/\\/g, '/')
+      .replace(/[.+^${}()|[\]]/g, '\\$&')  // Escape regex special chars (except * and ?)
+      .replace(/\*\*/g, '\u0000')            // Placeholder for **
+      .replace(/\*/g, '[^/]*')               // * matches within a segment
+      .replace(/\u0000/g, '.*')              // ** matches across segments
+      .replace(/\?/g, '[^/]');               // ? matches single char
+
+    return new RegExp(regexStr).test(filePath);
   }
 
 

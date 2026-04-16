@@ -2,7 +2,11 @@ src/**
 test/**
 node_modules/**
 .vscode/**
+.claude/**
+.git/**
 tsconfig.json
 .eslintrc.json
 vitest.config.ts
 **/*.map
+*.log
+log.txt

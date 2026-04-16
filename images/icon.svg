@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="vite-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#BD34FE"/>
+      <stop offset="100%" style="stop-color:#47CAFF"/>
+    </linearGradient>
+    <clipPath id="clip">
+      <rect width="128" height="128" rx="16"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#clip)">
+    <!-- Background fills entire viewBox -->
+    <rect width="128" height="128" fill="#1a1a2e"/>
+    <!-- Vite lightning bolt -->
+    <path d="M80 22L42 70h18L38 106l42-48H62z" fill="url(#vite-grad)" stroke="none"/>
+    <!-- Debug dot -->
+    <circle cx="96" cy="96" r="16" fill="#FF6B6B" opacity="0.9"/>
+    <circle cx="96" cy="96" r="6" fill="#1a1a2e"/>
+  </g>
+</svg>
