@@ -1,0 +1,187 @@
+{
+  "name": "vite-debugger",
+  "displayName": "Vite Debugger",
+  "description": "Debug Vite applications in VSCode by attaching to Chrome DevTools Protocol",
+  "version": "0.1.0",
+  "publisher": "vite-debugger",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vite-debugger",
+          "title": "Vite Debugger",
+          "icon": "$(bug)"
+        }
+      ]
+    },
+    "views": {
+      "vite-debugger": [
+        {
+          "id": "viteDebugger.reactComponents",
+          "name": "React Components",
+          "when": "debugType == 'vite'"
+        }
+      ]
+    },
+    "debuggers": [
+      {
+        "type": "vite",
+        "label": "Vite Debugger",
+        "languages": [
+          "javascript",
+          "typescript",
+          "javascriptreact",
+          "typescriptreact",
+          "vue",
+          "svelte"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "viteUrl": {
+                "type": "string",
+                "description": "Vite dev server URL (auto-detected if omitted)",
+                "default": ""
+              },
+              "chromePort": {
+                "type": "number",
+                "description": "Chrome remote debugging port",
+                "default": 9222
+              },
+              "webRoot": {
+                "type": "string",
+                "description": "Workspace root for source resolution",
+                "default": "${workspaceFolder}"
+              },
+              "sourceMapPathOverrides": {
+                "type": "object",
+                "description": "Source map path overrides for custom mappings",
+                "default": {}
+              }
+            }
+          },
+          "attach": {
+            "properties": {
+              "viteUrl": {
+                "type": "string",
+                "description": "Vite dev server URL (auto-detected if omitted)",
+                "default": ""
+              },
+              "chromePort": {
+                "type": "number",
+                "description": "Chrome remote debugging port",
+                "default": 9222
+              },
+              "webRoot": {
+                "type": "string",
+                "description": "Workspace root for source resolution",
+                "default": "${workspaceFolder}"
+              },
+              "sourceMapPathOverrides": {
+                "type": "object",
+                "description": "Source map path overrides for custom mappings",
+                "default": {}
+              }
+            }
+          }
+        },
+        "configurationSnippets": [
+          {
+            "label": "Vite: Attach to Chrome",
+            "description": "Attach to a running Chrome instance debugging a Vite app",
+            "body": {
+              "type": "vite",
+              "request": "attach",
+              "name": "Attach to Vite App",
+              "webRoot": "^\"${workspaceFolder}\""
+            }
+          },
+          {
+            "label": "Vite: Launch Chrome",
+            "description": "Launch Chrome and debug a Vite app",
+            "body": {
+              "type": "vite",
+              "request": "launch",
+              "name": "Debug Vite App",
+              "webRoot": "^\"${workspaceFolder}\""
+            }
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "vite-debugger.startDebug",
+        "title": "Vite Debugger: Start Debug Session"
+      },
+      {
+        "command": "vite-debugger.detectViteServer",
+        "title": "Vite Debugger: Detect Vite Server"
+      },
+      {
+        "command": "vite-debugger.refreshReactTree",
+        "title": "Vite Debugger: Refresh React Component Tree",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "vite-debugger.breakOnRender",
+        "title": "Break on Render"
+      },
+      {
+        "command": "vite-debugger.goToComponent",
+        "title": "Go to Source"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "vite-debugger.refreshReactTree",
+          "when": "view == viteDebugger.reactComponents",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "vite-debugger.breakOnRender",
+          "when": "view == viteDebugger.reactComponents && viewItem == reactComponent"
+        },
+        {
+          "command": "vite-debugger.goToComponent",
+          "when": "view == viteDebugger.reactComponents && viewItem == reactComponent"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap && cp node_modules/source-map/lib/mappings.wasm dist/mappings.wasm",
+    "watch": "npm run build -- --watch",
+    "lint": "eslint src/",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "package": "npm run build && vsce package"
+  },
+  "dependencies": {
+    "@vscode/debugadapter": "^1.65.0",
+    "@vscode/debugprotocol": "^1.65.0",
+    "chrome-remote-interface": "^0.33.2",
+    "source-map": "^0.7.4"
+  },
+  "devDependencies": {
+    "@types/chrome-remote-interface": "^0.31.14",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.3",
+    "vitest": "^1.2.0"
+  }
+}
