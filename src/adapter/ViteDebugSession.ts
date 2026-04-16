@@ -79,6 +79,9 @@ export class ViteDebugSession extends LoggingDebugSession {
   private sourceMapRetryTimer: NodeJS.Timeout | null = null;
   /** Glob patterns for files the user wants to skip during stepping */
   private skipFilePatterns: string[] = [];
+  /** Pending HMR script IDs to batch-process */
+  private pendingHmrScriptIds: string[] = [];
+  private hmrBatchTimer: NodeJS.Timeout | null = null;
 
   constructor() {
     super('vite-debugger.log');
@@ -784,13 +787,12 @@ export class ViteDebugSession extends LoggingDebugSession {
     // (onSourceMapLoaded callback handles the case where source map loads later via retry)
     if (this.breakpointManager && this.sourceMapResolver) {
       if (isHmrReload) {
-        const resolved = await this.breakpointManager.handleHmrReload(params.url);
-        for (const bp of resolved) {
-          this.sendEvent(new BreakpointEvent('changed', {
-            id: bp.dapId,
-            verified: true,
-            line: bp.line,
-          } as DebugProtocol.Breakpoint));
+        // Batch HMR events: collect script IDs and process after a short delay.
+        // A single HMR cycle re-parses many scripts — batching avoids redundant
+        // breakpoint remove/re-set cycles and eliminates log spam.
+        this.pendingHmrScriptIds.push(params.scriptId);
+        if (!this.hmrBatchTimer) {
+          this.hmrBatchTimer = setTimeout(() => this.flushHmrBatch(), 100);
         }
       } else {
         const resolved = await this.breakpointManager.resolveBreakpointsForScript(params.scriptId, params.url);
@@ -821,6 +823,48 @@ export class ViteDebugSession extends LoggingDebugSession {
       loadedSource.sourceReference = ref;
     }
     this.sendEvent(new LoadedSourceEvent(isHmrReload ? 'changed' : 'new', loadedSource));
+  }
+
+  /**
+   * Process batched HMR script events. Collects all affected source paths
+   * from the HMR cycle and handles breakpoints once, then logs a single summary.
+   */
+  private async flushHmrBatch(): Promise<void> {
+    this.hmrBatchTimer = null;
+    const scriptIds = this.pendingHmrScriptIds.splice(0);
+    if (scriptIds.length === 0) return;
+    if (!this.breakpointManager || !this.sourceMapResolver) return;
+
+    // Collect all source file paths affected by this HMR cycle
+    const affectedSourcePaths = new Set<string>();
+    for (const scriptId of scriptIds) {
+      const sources = this.sourceMapResolver.getSourcesForScript(scriptId);
+      for (const s of sources) {
+        affectedSourcePaths.add(s);
+      }
+    }
+
+    if (affectedSourcePaths.size === 0) return;
+
+    const { resolved, unresolved } = await this.breakpointManager.handleHmrReload(affectedSourcePaths);
+    for (const bp of resolved) {
+      this.sendEvent(new BreakpointEvent('changed', {
+        id: bp.dapId,
+        verified: true,
+        line: bp.line,
+      } as DebugProtocol.Breakpoint));
+    }
+    for (const bp of unresolved) {
+      this.sendEvent(new BreakpointEvent('changed', {
+        id: bp.dapId,
+        verified: false,
+        line: bp.line,
+        message: 'Breakpoint not resolved after HMR — source map position changed',
+      } as DebugProtocol.Breakpoint));
+    }
+    if (resolved.length > 0 || unresolved.length > 0) {
+      logger.info(`HMR reload: ${scriptIds.length} scripts, ${resolved.length} breakpoints re-set, ${unresolved.length} unresolved`);
+    }
   }
 
   private async onPaused(params: PausedEvent): Promise<void> {
@@ -1254,6 +1298,11 @@ export class ViteDebugSession extends LoggingDebugSession {
     if (this.sourceMapRetryTimer) {
       clearTimeout(this.sourceMapRetryTimer);
       this.sourceMapRetryTimer = null;
+    }
+    if (this.hmrBatchTimer) {
+      clearTimeout(this.hmrBatchTimer);
+      this.hmrBatchTimer = null;
+      this.pendingHmrScriptIds.length = 0;
     }
     this.sourceMapResolver?.clear();
     this.breakpointManager?.clear();

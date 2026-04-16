@@ -407,6 +407,15 @@ export class SourceMapResolver {
     return scripts ? [...scripts] : [];
   }
 
+  /**
+   * Get the source file paths mapped by a given scriptId.
+   * Returns an empty array if the script's source map hasn't been loaded yet.
+   */
+  getSourcesForScript(scriptId: string): string[] {
+    const entry = this.scripts.get(scriptId);
+    return entry ? [...entry.sources] : [];
+  }
+
   hasSourceMap(scriptId: string): boolean {
     return this.cache.has(scriptId) || this.scriptMetas.has(scriptId);
   }

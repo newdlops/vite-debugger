@@ -181,60 +181,96 @@ export class BreakpointManager {
     return resolved;
   }
 
-  async handleHmrReload(scriptUrl: string): Promise<ManagedBreakpoint[]> {
-    // URL-regex breakpoints (setBreakpointByUrl) persist across page reloads
-    // in CDP — Chrome automatically applies them to new scripts matching the
-    // regex. So we only need to re-resolve breakpoints that were pending
-    // (not yet verified), or whose source map positions may have changed.
+  /**
+   * Handle HMR reload for a set of affected source paths.
+   * Only processes breakpoints whose source files are in the affected set,
+   * skipping non-browser files (e.g., .py) that can never resolve to browser scripts.
+   */
+  async handleHmrReload(affectedSourcePaths: Set<string>): Promise<{ resolved: ManagedBreakpoint[]; unresolved: ManagedBreakpoint[] }> {
     const resolved: ManagedBreakpoint[] = [];
+    const unresolved: ManagedBreakpoint[] = [];
 
     for (const [sourcePath, bps] of this.breakpoints) {
+      // Only process breakpoints for sources affected by this HMR cycle
+      if (!affectedSourcePaths.has(sourcePath)) continue;
+
       for (const bp of bps) {
-        // If already verified with a CDP breakpoint, it persists — just
-        // re-verify the source map position in case lines shifted.
+        // Remove the old CDP breakpoint — its generated position is stale
+        if (bp.cdpBreakpointId) {
+          try {
+            await this.cdp.removeBreakpoint(bp.cdpBreakpointId);
+          } catch (e) {
+            logger.debug(`Failed to remove old breakpoint during HMR: ${e}`);
+          }
+          bp.cdpBreakpointId = undefined;
+        }
+
+        // Resolve the new generated position from the updated source map
         const generated = await this.sourceMapResolver.originalToGenerated(
           sourcePath, bp.line, bp.column ?? 0
         );
 
-        if (!generated) continue;
-
-        if (bp.cdpBreakpointId && bp.verified) {
-          // Breakpoint still exists in CDP — keep it, just re-verify
-          resolved.push(bp);
+        if (!generated) {
+          bp.verified = false;
+          unresolved.push(bp);
           continue;
         }
 
-        // Breakpoint was pending or lost — try to set it
         try {
+          // Refine position using getPossibleBreakpoints
+          const refined = await this.refineBreakpointPosition(generated, sourcePath);
+          const targetLine = refined?.lineNumber ?? generated.lineNumber;
+          const targetColumn = refined?.columnNumber ?? generated.columnNumber;
+
           const condition = this.buildCdpCondition(bp);
 
           const result = await this.cdp.setBreakpointByUrl(
-            generated.lineNumber,
+            targetLine,
             {
               urlRegex: this.buildUrlRegex(sourcePath),
-              columnNumber: generated.columnNumber,
+              columnNumber: targetColumn,
               condition,
             }
           );
 
           bp.cdpBreakpointId = result.breakpointId;
           bp.verified = true;
+
+          // Map the actual CDP location back to original source
+          // to report the correct line to VS Code
+          if (result.locations.length > 0) {
+            const actualLoc = result.locations[0];
+            const actualOriginal = await this.sourceMapResolver.generatedToOriginal(
+              actualLoc.scriptId, actualLoc.lineNumber, actualLoc.columnNumber
+            );
+            if (actualOriginal) {
+              bp.line = actualOriginal.line;
+            }
+          }
+
           resolved.push(bp);
+
+          logger.debug(
+            `Breakpoint re-set after HMR: ${sourcePath}:${bp.line} -> ` +
+            `CDP ${result.breakpointId} at generated ${targetLine}:${targetColumn}`
+          );
         } catch (e) {
           const msg = String(e);
           if (msg.includes('already exists')) {
-            // URL-regex breakpoint persisted from before — it's still active
+            // CDP already has this breakpoint (URL regex matched the new script automatically).
+            // Keep it verified without redundant logging.
             bp.verified = true;
             resolved.push(bp);
-            logger.debug(`Breakpoint already exists after HMR: ${sourcePath}:${bp.line}`);
           } else {
+            bp.verified = false;
+            unresolved.push(bp);
             logger.warn(`Failed to re-set breakpoint after HMR: ${e}`);
           }
         }
       }
     }
 
-    return resolved;
+    return { resolved, unresolved };
   }
 
   getAllBreakpoints(): Map<string, ManagedBreakpoint[]> {
