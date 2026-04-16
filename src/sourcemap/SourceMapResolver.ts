@@ -420,6 +420,26 @@ export class SourceMapResolver {
     return this.cache.has(scriptId) || this.scriptMetas.has(scriptId);
   }
 
+  /** The script has a declared sourceMappingURL (metadata registered). */
+  hasSourceMapUrl(scriptId: string): boolean {
+    return this.scriptMetas.has(scriptId);
+  }
+
+  /** The source map has been successfully fetched and parsed. */
+  isSourceMapLoaded(scriptId: string): boolean {
+    return this.cache.has(scriptId);
+  }
+
+  /** Source map fetch was attempted and failed (will be retried on explicit retry). */
+  hasSourceMapFailed(scriptId: string): boolean {
+    return this.failedScripts.has(scriptId);
+  }
+
+  /** Source map load is currently in flight. */
+  isSourceMapLoading(scriptId: string): boolean {
+    return this.loadingPromises.has(scriptId);
+  }
+
   /**
    * Get the primary source file path for a script from its source map.
    * Returns the first resolved source path, which is typically the original

@@ -239,6 +239,28 @@ export class CdpClient extends EventEmitter {
     return result.result;
   }
 
+  /**
+   * Evaluate an expression and return its value deserialized directly (via V8's
+   * returnByValue path). The expression must evaluate to a JSON-serializable
+   * value — no functions, symbols, or cycles. Used for structured data fetching
+   * where the shape is known ahead of time (e.g. React component tree walks).
+   */
+  async evaluateForValue<T = unknown>(expression: string): Promise<T | undefined> {
+    const result = await this.client!.Runtime.evaluate({
+      expression,
+      silent: true,
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    if (result.exceptionDetails) {
+      const text = result.exceptionDetails.text
+        || result.exceptionDetails.exception?.description
+        || 'Evaluation failed';
+      throw new Error(text);
+    }
+    return result.result?.value as T | undefined;
+  }
+
   async callFunctionOn(objectId: string, functionDeclaration: string, args?: CallArgument[]): Promise<RemoteObject> {
     const result = await this.client!.Runtime.callFunctionOn({
       objectId,

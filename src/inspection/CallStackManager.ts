@@ -49,31 +49,36 @@ export class CallStackManager {
       const isNodeModules = localPath?.includes('/node_modules/') ?? cdpFrame.url.includes('/node_modules/');
       const isInternal = this.isInternalFrame(cdpFrame.url);
 
-      // Step 2: Try source map for accurate line/column mapping
+      // Step 2: Try source map for accurate line/column mapping.
+      // If the source map resolves — even to a node_modules file — prefer the
+      // original position. This lets the user see the actual package source
+      // (e.g., react-dom.development.js) instead of the pre-bundled Vite artifact.
       const original = await this.sourceMapResolver.generatedToOriginal(
         scriptId, lineNumber, columnNumber ?? 0
       );
 
-      if (original && !original.source.includes('/node_modules/')) {
-        // Source map resolved to user code — use its line/column
+      if (original) {
+        const originalInNodeModules = original.source.includes('/node_modules/');
         const onDisk = this.fileExists(original.source);
         source = { name: original.source.split('/').pop() ?? 'unknown' };
         line = original.line;
         column = original.column + 1;
         if (onDisk) {
           source.path = original.source;
-        } else if (isLocalFile && localPath) {
-          // Source map path doesn't exist but URL-based path does — use that
+        } else if (isLocalFile && localPath && !originalInNodeModules) {
+          // Source-mapped path missing, but the URL-mapped file exists.
+          // Only fall back to the URL path for non-node_modules frames — for
+          // deps, the URL-mapped path is the bundled artifact, not useful.
           source.path = localPath;
         }
-        if (!isNodeModules && !isInternal && source.path) {
+        if (!originalInNodeModules && !isInternal && source.path) {
           logger.debug(
             `Frame ${frameId}: ${cdpFrame.functionName || '(anonymous)'} → ` +
             `${source.path}:${line}:${original.column} (gen ${lineNumber}:${columnNumber ?? 0})`
           );
         }
       } else if (isLocalFile && localPath && !isNodeModules && !isInternal) {
-        // No source map (or maps to node_modules) but local file exists — show file with generated position
+        // No source map but local file exists — show file with generated position
         source = { name: localPath.split('/').pop() ?? 'unknown', path: localPath };
         line = lineNumber + 1;
         column = (columnNumber ?? 0) + 1;
@@ -82,14 +87,15 @@ export class CallStackManager {
           `${localPath}:${line}:${column} (from URL)`
         );
       } else {
-        // node_modules, Vite internals, or truly unknown
+        // node_modules artifact without source map, Vite internals, or unknown
         source = { name: cdpFrame.functionName || cdpFrame.url.split('/').pop() || 'unknown' };
         line = lineNumber + 1;
         column = (columnNumber ?? 0) + 1;
         presentationHint = 'subtle';
       }
 
-      if (isNodeModules || isInternal) {
+      const resolvedInNodeModules = source.path?.includes('/node_modules/') ?? isNodeModules;
+      if (resolvedInNodeModules || isInternal) {
         presentationHint = 'subtle';
       }
 

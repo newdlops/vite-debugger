@@ -76,7 +76,19 @@ export function activate(context: vscode.ExtensionContext): void {
     treeDataProvider: reactTreeProvider,
     showCollapseAll: true,
   });
+  treeView.message = reactTreeProvider.getStatus() ?? undefined;
   context.subscriptions.push(treeView);
+
+  context.subscriptions.push(
+    reactTreeProvider.onDidChangeStatus((message) => {
+      treeView.message = message ?? undefined;
+    }),
+    // When the user opens the React panel, refresh so the tree reflects the
+    // current page state (it may have rendered after the session started).
+    treeView.onDidChangeVisibility((e) => {
+      if (e.visible) reactTreeProvider.refresh();
+    }),
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('vite-debugger.refreshReactTree', () => {
@@ -84,7 +96,6 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand('vite-debugger.breakOnRender', (node: any) => {
       if (node && node.filePath && node.line) {
-        // Open file and set breakpoint at component definition
         const uri = vscode.Uri.file(node.filePath);
         const position = new vscode.Position((node.line || 1) - 1, 0);
         const location = new vscode.Location(uri, position);
@@ -92,6 +103,11 @@ export function activate(context: vscode.ExtensionContext): void {
           new vscode.SourceBreakpoint(location, true)
         ]);
         vscode.window.showInformationMessage(`Breakpoint set on <${node.name}> render`);
+      } else {
+        vscode.window.showWarningMessage(
+          `No source location available for <${node?.name ?? 'component'}>. ` +
+          `Ensure your Vite config enables JSX source info (default for @vitejs/plugin-react).`
+        );
       }
     }),
     vscode.commands.registerCommand('vite-debugger.goToComponent', (node: any) => {
@@ -166,6 +182,12 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // Update status bar and React tree based on debug session state
+  let autoRefreshTimer: NodeJS.Timeout | undefined;
+  const scheduleAutoRefresh = (delayMs: number) => {
+    if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = setTimeout(() => reactTreeProvider.refresh(), delayMs);
+  };
+
   context.subscriptions.push(
     vscode.debug.onDidStartDebugSession((session) => {
       if (session.type === 'vite') {
@@ -173,31 +195,55 @@ export function activate(context: vscode.ExtensionContext): void {
         statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.debuggingBackground');
         statusBarItem.show();
 
-        // Set evaluator that uses the debug session
+        // Use the custom DAP request so values come back by value (not as
+        // formatted preview strings from the Variables converter).
         reactTreeProvider.setEvaluator(async (expr) => {
           try {
-            const result = await session.customRequest('evaluate', {
+            const result = await session.customRequest('viteDebugger.evalForValue', {
               expression: expr,
-              context: 'repl',
             });
-            // Parse the result - it comes back as a string from the debug adapter
-            try { return JSON.parse(result.result); } catch { return result.result; }
-          } catch { return null; }
+            return result?.value ?? null;
+          } catch {
+            return null;
+          }
         });
-        // Auto-refresh after a short delay (let scripts load)
-        setTimeout(() => reactTreeProvider.refresh(), 3000);
-      }
-    })
-  );
 
-  context.subscriptions.push(
+        // The app often mounts shortly after the session attaches. Retry a
+        // couple of times so the tree populates once React is ready.
+        scheduleAutoRefresh(1500);
+        setTimeout(() => reactTreeProvider.refresh(), 4000);
+      }
+    }),
     vscode.debug.onDidTerminateDebugSession((session) => {
       if (session.type === 'vite') {
         statusBarItem.text = '$(debug) Vite Debug';
         statusBarItem.backgroundColor = undefined;
+        if (autoRefreshTimer) { clearTimeout(autoRefreshTimer); autoRefreshTimer = undefined; }
         reactTreeProvider.clear();
       }
-    })
+    }),
+    vscode.debug.onDidChangeActiveDebugSession(() => {
+      if (vscode.debug.activeDebugSession?.type === 'vite') scheduleAutoRefresh(500);
+    }),
+  );
+
+  // Observe DAP stopped/continued events via a tracker so the tree refreshes
+  // at pause points — these are natural sync moments and avoid evaluating in
+  // the middle of a render.
+  context.subscriptions.push(
+    vscode.debug.registerDebugAdapterTrackerFactory('vite', {
+      createDebugAdapterTracker(session) {
+        return {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          onDidSendMessage(message: any) {
+            if (!message || message.type !== 'event') return;
+            if (message.event === 'stopped' || message.event === 'continued') {
+              if (session.type === 'vite') scheduleAutoRefresh(150);
+            }
+          },
+        };
+      },
+    }),
   );
 
   // Show status bar if a Vite server is likely (workspace has vite.config)

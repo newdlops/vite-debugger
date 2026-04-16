@@ -82,6 +82,9 @@ export class ViteDebugSession extends LoggingDebugSession {
   /** Pending HMR script IDs to batch-process */
   private pendingHmrScriptIds: string[] = [];
   private hmrBatchTimer: NodeJS.Timeout | null = null;
+  /** Scripts we've permanently blackboxed at the CDP level because they have
+   *  no source map and no local counterpart. Step-through skips them entirely. */
+  private unmappableScripts = new Set<string>();
 
   constructor() {
     super('vite-debugger.log');
@@ -240,34 +243,46 @@ export class ViteDebugSession extends LoggingDebugSession {
       this.cdp?.pause();
     });
 
-    // Blackbox library/framework code so step-into skips through React
-    // internals and lands on the next user component.
-    // Chrome natively handles this: when stepping into blackboxed code,
-    // it continues until it reaches non-blackboxed (user) code.
+    // Blackbox Vite-generated runtime code that has no source-map equivalent.
+    // We deliberately do NOT blanket-blackbox /node_modules/ — the user may
+    // want to step into library code, and when a source map is available the
+    // original source (e.g., react-dom.development.js) is readable. For
+    // unmappable dep scripts we apply a per-script blackbox range on-demand
+    // via markScriptUnmappable().
     await this.cdp.setBlackboxPatterns([
-      '/node_modules/',        // All library code (React, react-dom, etc.)
       '/@vite/',               // Vite client internals
       '/@react-refresh',       // React refresh runtime
       '__vite_',               // Vite HMR helpers
       '@vite-plugin-checker',  // Vite plugins
     ]);
-    logger.info('Blackbox patterns set for library code');
+    logger.info('Blackbox patterns set for Vite runtime code');
 
-    // Wire up source map loaded callback — resolve pending breakpoints when a
-    // source map is loaded (covers both initial load and retried loads)
+    // Wire up source map loaded callback. Three responsibilities:
+    //  (1) Resolve pending breakpoints against the newly mapped source.
+    //  (2) If we had blackboxed this script because the map was missing
+    //      earlier, lift the blackbox now so stepping can enter it.
     this.sourceMapResolver.onSourceMapLoaded = (scriptId: string) => {
-      if (!this.breakpointManager || !this.breakpointManager.hasPendingBreakpoints()) return;
-      const url = this.scriptIdToUrl.get(scriptId);
-      if (url) {
-        this.breakpointManager.resolveBreakpointsForScript(scriptId, url).then(resolved => {
-          for (const bp of resolved) {
-            this.sendEvent(new BreakpointEvent('changed', {
-              id: bp.dapId,
-              verified: true,
-              line: bp.line,
-            } as DebugProtocol.Breakpoint));
-          }
-        }).catch(() => {});
+      // (1) Pending breakpoints
+      if (this.breakpointManager && this.breakpointManager.hasPendingBreakpoints()) {
+        const url = this.scriptIdToUrl.get(scriptId);
+        if (url) {
+          this.breakpointManager.resolveBreakpointsForScript(scriptId, url).then(resolved => {
+            for (const bp of resolved) {
+              this.sendEvent(new BreakpointEvent('changed', {
+                id: bp.dapId,
+                verified: true,
+                line: bp.line,
+              } as DebugProtocol.Breakpoint));
+            }
+          }).catch(() => {});
+        }
+      }
+
+      // (2) Undo any prior "server-only" blackbox — we can now show the map.
+      if (this.unmappableScripts.has(scriptId) && this.cdp) {
+        this.unmappableScripts.delete(scriptId);
+        this.cdp.setBlackboxedRanges(scriptId, []).catch(() => {});
+        logger.debug(`Lifted blackbox for ${scriptId} after source map loaded`);
       }
     };
 
@@ -751,6 +766,46 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.sendResponse(response);
   }
 
+  // --- Custom Requests ---
+
+  /**
+   * Handle extension-specific DAP requests. Used for the React component tree
+   * view to evaluate expressions and get values back directly (bypassing the
+   * preview-oriented Variables conversion used by the DAP `evaluate` request).
+   */
+  protected async customRequest(
+    command: string,
+    response: DebugProtocol.Response,
+    args: { expression?: string } | undefined,
+  ): Promise<void> {
+    if (command === 'viteDebugger.evalForValue') {
+      if (!this.cdp) {
+        response.success = false;
+        response.message = 'Debug session not connected';
+        this.sendResponse(response);
+        return;
+      }
+      const expression = args?.expression;
+      if (typeof expression !== 'string') {
+        response.success = false;
+        response.message = 'Missing expression argument';
+        this.sendResponse(response);
+        return;
+      }
+      try {
+        const value = await this.cdp.evaluateForValue(expression);
+        response.body = { value };
+        this.sendResponse(response);
+      } catch (e) {
+        response.success = false;
+        response.message = e instanceof Error ? e.message : String(e);
+        this.sendResponse(response);
+      }
+      return;
+    }
+    super.customRequest(command, response, args as never);
+  }
+
   // --- CDP Event Handlers ---
 
   private async onScriptParsed(params: ScriptParsedEvent): Promise<void> {
@@ -883,6 +938,13 @@ export class ViteDebugSession extends LoggingDebugSession {
     const isExplicitBreakpoint = params.reason === 'breakpoint' ||
       (params.reason === 'other' && params.hitBreakpoints && params.hitBreakpoints.length > 0);
 
+    // Lazy source-map handshake for the top frame's script. If the script
+    // declared a sourceMappingURL but the map hasn't finished loading yet,
+    // wait briefly so the user sees the resolved original position (not a
+    // minified line/column). If the script has no map and isn't synced to
+    // disk, blackbox it so subsequent stepping skips through.
+    await this.ensureTopFrameSourceMap(params);
+
     if (!isException && !isManualPause && this.cdp && this.sourceMapResolver) {
       const shouldSkip = await this.shouldSmartStep(params, isExplicitBreakpoint);
       if (shouldSkip) {
@@ -954,40 +1016,160 @@ export class ViteDebugSession extends LoggingDebugSession {
   }
 
   /**
+   * Ensure the source map for the current pause's top frame is loaded before
+   * we decide how to present / step this location. Handles two pain points:
+   *
+   * 1. **Lazy handshake**: Vite serves source maps on demand. If the map
+   *    request is in flight when we pause, we'd otherwise surface a minified
+   *    location to VS Code. Waiting briefly (bounded) gives the map a chance
+   *    to land, so the user sees the original `.tsx` or `node_modules/.../X.js`
+   *    file with the right line/column.
+   *
+   * 2. **Server-only scripts**: Some Vite-served scripts (e.g., `.vite/deps/
+   *    chunk-*.js` that aren't shipped with source maps) have no local
+   *    counterpart we can map to. For these we apply a per-script CDP
+   *    blackbox so Chrome's native stepper skips them entirely — the user's
+   *    next step-over/step-into continues past this frame instead of sitting
+   *    in unreadable generated code.
+   */
+  private async ensureTopFrameSourceMap(params: PausedEvent): Promise<void> {
+    if (!this.cdp || !this.sourceMapResolver) return;
+    const topFrame = params.callFrames[0];
+    if (!topFrame) return;
+    const scriptId = topFrame.location.scriptId;
+
+    // Already blackboxed — nothing more to do.
+    if (this.unmappableScripts.has(scriptId)) return;
+
+    const hasUrl = this.sourceMapResolver.hasSourceMapUrl(scriptId);
+    const alreadyLoaded = this.sourceMapResolver.isSourceMapLoaded(scriptId);
+
+    if (hasUrl && !alreadyLoaded) {
+      // Bounded wait: prefer correctness (wait for map) but don't hang the
+      // pause indefinitely if the server is slow.
+      try {
+        await this.withTimeout(
+          this.sourceMapResolver.ensureSourceMap(scriptId),
+          1500,
+        );
+      } catch {
+        // Timeout or load error — fall through to the no-map branch below.
+      }
+    }
+
+    // Still no map after the handshake attempt? Decide whether the script
+    // can be surfaced locally or should be blackboxed as server-only.
+    if (!this.sourceMapResolver.isSourceMapLoaded(scriptId)) {
+      if (this.isServerOnlyScript(scriptId)) {
+        await this.markScriptUnmappable(scriptId);
+      }
+    }
+  }
+
+  /** Race a promise against a timeout. Rejects if the timeout fires first. */
+  private withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms);
+      promise.then(
+        (v) => { clearTimeout(timer); resolve(v); },
+        (e) => { clearTimeout(timer); reject(e); },
+      );
+    });
+  }
+
+  /**
+   * A script is "server-only" — i.e. can't be meaningfully shown to the user
+   * without a source map — when:
+   *   - Its URL has no resolvable local path, OR
+   *   - It's a Vite runtime URL (@vite, @react-refresh, …), OR
+   *   - Its local path is a pre-bundled artifact (node_modules, .vite/deps)
+   *     whose on-disk file is the generated output rather than original source, OR
+   *   - The local file simply doesn't exist.
+   *
+   * For user-authored files (src/**), we do NOT mark them server-only even
+   * if the source map is missing — stepping can fall back to generated
+   * line/column on the user's own file, which is still navigable.
+   */
+  private isServerOnlyScript(scriptId: string): boolean {
+    const url = this.scriptIdToUrl.get(scriptId);
+    if (!url) return true;
+    if (this.urlMapper?.isViteInternalUrl(url)) return true;
+
+    const local = this.urlMapper?.viteUrlToFilePath(url);
+    if (!local) return true;
+
+    // Pre-bundled / third-party artifact — unreadable without a source map.
+    if (local.includes('/node_modules/')) return true;
+
+    try {
+      const fs = require('fs');
+      return !fs.statSync(local).isFile();
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Blackbox a single script at the CDP level so Chrome's stepping engine
+   * skips it. Using ranges (rather than URL patterns) lets us target
+   * specific scripts we've decided we can't resolve — without taking the
+   * whole URL out of the debuggable set.
+   */
+  private async markScriptUnmappable(scriptId: string): Promise<void> {
+    if (this.unmappableScripts.has(scriptId) || !this.cdp) return;
+    this.unmappableScripts.add(scriptId);
+    try {
+      // Blackbox the entire script: range from (0, 0) to a very large line.
+      // An odd-length positions array is also valid (open-ended), but we
+      // send an explicit pair for clarity across CDP versions.
+      await this.cdp.setBlackboxedRanges(scriptId, [
+        { lineNumber: 0, columnNumber: 0 },
+        { lineNumber: Number.MAX_SAFE_INTEGER, columnNumber: 0 },
+      ]);
+      const url = this.scriptIdToUrl.get(scriptId);
+      logger.debug(`Blackboxed unmappable script ${scriptId}${url ? ` (${url})` : ''}`);
+    } catch (e) {
+      // Blackboxing is best-effort — smart-step will still skip via shouldSmartStep.
+      logger.debug(`Failed to blackbox script ${scriptId}: ${e}`);
+    }
+  }
+
+  /**
    * Determine if the current pause location is non-user code that should be skipped.
    *
-   * Note: node_modules and Vite internal URLs are handled by Chrome's blackbox
-   * mechanism (setBlackboxPatterns). Smart stepping only handles Vite-injected
-   * code WITHIN user files (e.g., _s(), $RefreshSig$, HMR wrappers) — these
-   * are in the same script URL as user code so they can't be blackboxed.
-   *
-   * The check:
-   *   1. If the position resolves via source map → check skipFiles patterns, then user code (stop)
-   *   2. If it doesn't resolve but the script's primary source exists on disk
-   *      → still user code with sparse mapping (stop)
-   *   3. If it doesn't resolve and no local source → injected code (skip)
+   * Decision table (in order):
+   *   1. Explicit breakpoint hit → never auto-skip.
+   *   2. No source map AND script already marked unmappable → skip (getting out of it).
+   *   3. Source map resolves to user code → stop (unless skipFiles matches).
+   *   4. Source map resolves to node_modules → skip by default, BUT respect
+   *      a prior `stepInto` so the user can descend into library code.
+   *   5. Source map exists but this position has no mapping → Vite-injected
+   *      preamble (e.g. `_s()`, `$RefreshSig$`). Skip.
    */
   private async shouldSmartStep(params: PausedEvent, isExplicitBreakpoint: boolean = false): Promise<boolean> {
+    if (isExplicitBreakpoint) return false;
     if (params.callFrames.length === 0) return false;
 
     const topFrame = params.callFrames[0];
     const { scriptId, lineNumber, columnNumber } = topFrame.location;
 
-    // Only smart-step for scripts that HAVE a source map registered.
-    // Scripts without source maps (pure library code) are handled by blackboxing.
+    // Already-blackboxed unmappable script — get out of it.
+    if (this.unmappableScripts.has(scriptId)) return true;
+
     if (this.sourceMapResolver && this.sourceMapResolver.hasSourceMap(scriptId)) {
-      // generatedToOriginal now searches backwards through generated lines,
-      // so it resolves even for lines without exact mappings.
       const original = await this.sourceMapResolver.generatedToOriginal(
         scriptId, lineNumber, columnNumber ?? 0
       );
       if (original) {
-        // Skip node_modules
-        if (original.source.includes('/node_modules/')) return true;
+        if (original.source.includes('/node_modules/')) {
+          // A deliberate step-into is the user's explicit intent to descend
+          // into library code — don't second-guess them.
+          if (this.lastStepAction === 'stepInto') return false;
+          return true;
+        }
 
-        // Skip files matching user-configured skipFiles patterns
-        // (but NOT when an explicit breakpoint was hit — user placed it intentionally)
-        if (!isExplicitBreakpoint && this.shouldSkipFile(original.source)) {
+        // User-configured skipFiles patterns
+        if (this.shouldSkipFile(original.source)) {
           logger.debug(`Skipping file (skipFiles match): ${original.source}`);
           return true;
         }
@@ -996,12 +1178,13 @@ export class ViteDebugSession extends LoggingDebugSession {
         return false;
       }
 
-      // No mapping found at all (even with backwards search) →
-      // Vite-injected code (_s(), $RefreshSig$, etc.)
+      // Has source map but no mapping at this position → injected preamble
       return true;
     }
 
-    // No source map = probably should have been blackboxed, but wasn't.
+    // No source map at all — the ensureTopFrameSourceMap helper should have
+    // either loaded one or marked the script unmappable. If we got here with
+    // neither, it's a transient state; don't auto-step.
     return false;
   }
 
@@ -1311,6 +1494,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.callStackManager?.clear();
     this.scopeManager?.clear();
     this.variableManager?.clear();
+    this.unmappableScripts.clear();
 
     if (this.cdp) {
       await this.cdp.disconnect();
