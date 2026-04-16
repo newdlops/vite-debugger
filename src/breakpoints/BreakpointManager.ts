@@ -241,6 +241,13 @@ export class BreakpointManager {
     return this.breakpoints;
   }
 
+  hasPendingBreakpoints(): boolean {
+    for (const bps of this.breakpoints.values()) {
+      if (bps.some(bp => !bp.verified)) return true;
+    }
+    return false;
+  }
+
   clear(): void {
     this.breakpoints.clear();
   }

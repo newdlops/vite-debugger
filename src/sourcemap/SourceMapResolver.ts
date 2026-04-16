@@ -23,18 +23,50 @@ interface ScriptEntry {
   sources: string[];  // Resolved absolute file paths from the source map
   /** The `file` field from the source map — often the absolute path of the original file */
   sourceMapFile: string | undefined;
+  /** Whether the source map has been fetched and parsed */
+  loaded: boolean;
+}
+
+/** Lightweight metadata stored immediately on scriptParsed */
+interface ScriptMeta {
+  scriptId: string;
+  url: string;
+  sourceMapUrl: string;
 }
 
 function httpGet(url: string, timeout: number = 5000): Promise<string> {
   return new Promise((resolve, reject) => {
     const req = http.get(url, { timeout }, (res) => {
+      const statusCode = res.statusCode ?? 0;
+      if (statusCode < 200 || statusCode >= 300) {
+        // Consume response to free the socket
+        res.resume();
+        reject(new Error(`HTTP ${statusCode} for ${url}`));
+        return;
+      }
       let body = '';
       res.on('data', (chunk) => { body += chunk; });
       res.on('end', () => resolve(body));
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+    req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout after ${timeout}ms for ${url}`)); });
   });
+}
+
+async function httpGetWithRetry(url: string, retries: number = 2, timeout: number = 5000): Promise<string> {
+  let lastError: Error | undefined;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await httpGet(url, timeout);
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      if (attempt < retries) {
+        // Exponential backoff: 200ms, 600ms
+        await new Promise(r => setTimeout(r, 200 * (attempt + 1) * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError;
 }
 
 function resolveSourceMapUrl(scriptUrl: string, sourceMapUrl: string): string {
@@ -51,30 +83,78 @@ function resolveSourceMapUrl(scriptUrl: string, sourceMapUrl: string): string {
 export class SourceMapResolver {
   private cache = new SourceMapCache();
   private scripts = new Map<string, ScriptEntry>();
+  private scriptMetas = new Map<string, ScriptMeta>();  // scriptId -> metadata (pre-load)
   private sourceToScripts = new Map<string, Set<string>>();  // filePath -> Set<scriptId>
   private webRoot: string;
   private viteRoot: string;
   private registeredScriptCount = 0;
   private pendingSourceMisses = new Set<string>();  // Tracks already-logged "no scripts" sources
+  private loadingPromises = new Map<string, Promise<void>>();  // Prevent duplicate loads
+  private failedScripts = new Set<string>();  // scriptIds whose source map failed to load
+  /** Callback invoked after a source map is successfully loaded (for resolving pending breakpoints) */
+  onSourceMapLoaded: ((scriptId: string) => void) | null = null;
 
   constructor(webRoot: string, viteRoot?: string) {
     this.webRoot = webRoot.replace(/\/$/, '');
     this.viteRoot = (viteRoot ?? webRoot).replace(/\/$/, '');
   }
 
-  async registerScript(scriptId: string, url: string, sourceMapUrl?: string): Promise<void> {
+  /**
+   * Track a script for lazy source map loading. Called immediately on scriptParsed.
+   * Only stores metadata — does NOT fetch or parse the source map.
+   */
+  trackScript(scriptId: string, url: string, sourceMapUrl?: string): void {
     if (!sourceMapUrl || !url) return;
-    if (url.includes('/@vite/') && !sourceMapUrl) return;
-
     const resolvedSmUrl = resolveSourceMapUrl(url, sourceMapUrl);
+    this.scriptMetas.set(scriptId, { scriptId, url, sourceMapUrl: resolvedSmUrl });
 
+    // Clean up old entry for same URL (HMR reload)
+    for (const [existingId, meta] of this.scriptMetas) {
+      if (meta.url === url && existingId !== scriptId) {
+        this.unregisterScript(existingId);
+        this.scriptMetas.delete(existingId);
+        break;
+      }
+    }
+  }
+
+  /**
+   * Ensure the source map for a script is loaded. Fetches and parses on first call,
+   * returns immediately on subsequent calls. Safe to call concurrently.
+   */
+  async ensureSourceMap(scriptId: string): Promise<boolean> {
+    // Already loaded
+    if (this.cache.has(scriptId)) return true;
+
+    // Loading in progress — wait for it
+    const existing = this.loadingPromises.get(scriptId);
+    if (existing) {
+      await existing;
+      return this.cache.has(scriptId);
+    }
+
+    // Need to load — get metadata
+    const meta = this.scriptMetas.get(scriptId);
+    if (!meta) return false;
+
+    const promise = this.loadSourceMap(scriptId, meta);
+    this.loadingPromises.set(scriptId, promise);
     try {
-      const { consumer, rawMap } = await this.fetchAndParseSourceMap(scriptId, resolvedSmUrl);
-      if (!consumer) return;
+      await promise;
+    } finally {
+      this.loadingPromises.delete(scriptId);
+    }
+    return this.cache.has(scriptId);
+  }
 
-      // Vite source maps have a `file` field with the absolute path of the original file
-      // e.g., file: "/Users/lky/project/captain/zuzu/client/src/index.tsx"
-      // This is the key to resolving relative `sources` entries
+  private async loadSourceMap(scriptId: string, meta: ScriptMeta): Promise<void> {
+    try {
+      const { consumer, rawMap } = await this.fetchAndParseSourceMap(scriptId, meta.sourceMapUrl);
+      if (!consumer) {
+        this.failedScripts.add(scriptId);
+        return;
+      }
+
       const sourceMapFile: string | undefined = rawMap.file;
       const sourceMapFileDir = sourceMapFile ? path.dirname(sourceMapFile) : undefined;
 
@@ -88,7 +168,7 @@ export class SourceMapResolver {
 
       const sources: string[] = [];
       for (const sourceName of sourceNames) {
-        const resolved = this.resolveSourcePath(sourceName, url, sourceMapFileDir);
+        const resolved = this.resolveSourcePath(sourceName, meta.url, sourceMapFileDir);
         sources.push(resolved);
 
         if (!this.sourceToScripts.has(resolved)) {
@@ -97,20 +177,65 @@ export class SourceMapResolver {
         this.sourceToScripts.get(resolved)!.add(scriptId);
       }
 
-      // Individual resolved sources logged only at trace level — see getRegisteredScriptCount() for summary
+      this.scripts.set(scriptId, {
+        scriptId, url: meta.url, sourceMapUrl: meta.sourceMapUrl,
+        sources, sourceMapFile, loaded: true,
+      });
 
-      // Clean up old entry for same URL (HMR reload)
-      for (const [existingId, entry] of this.scripts) {
-        if (entry.url === url && existingId !== scriptId) {
-          this.unregisterScript(existingId);
-          break;
-        }
+      // Clear from failed set if a retry succeeded
+      this.failedScripts.delete(scriptId);
+      // Clear pending misses for resolved sources so they can be looked up again
+      for (const s of sources) {
+        this.pendingSourceMisses.delete(s);
       }
 
-      this.scripts.set(scriptId, { scriptId, url, sourceMapUrl: resolvedSmUrl, sources, sourceMapFile });
+      logger.debug(`Source map loaded for ${meta.url}: ${sources.length} source(s) [${sources.map(s => s.split('/').pop()).join(', ')}]`);
+
+      // Notify listener (e.g., breakpoint manager) that new source mappings are available
+      if (this.onSourceMapLoaded) {
+        try { this.onSourceMapLoaded(scriptId); } catch {}
+      }
     } catch (e) {
-      logger.warn(`Failed to register source map for ${url}: ${e}`);
+      this.failedScripts.add(scriptId);
+      logger.warn(`Failed to load source map for ${meta.url} (${meta.sourceMapUrl.startsWith('data:') ? 'data URI' : meta.sourceMapUrl}): ${e}`);
     }
+  }
+
+  /** Eagerly register a script with source map (used for breakpoint resolution on scriptParsed) */
+  async registerScript(scriptId: string, url: string, sourceMapUrl?: string): Promise<void> {
+    this.trackScript(scriptId, url, sourceMapUrl);
+    await this.ensureSourceMap(scriptId);
+  }
+
+  /**
+   * Retry loading source maps that previously failed.
+   * Returns scriptIds that were successfully loaded on retry.
+   */
+  async retryFailed(): Promise<string[]> {
+    const loaded: string[] = [];
+    for (const scriptId of [...this.failedScripts]) {
+      const meta = this.scriptMetas.get(scriptId);
+      if (!meta) {
+        this.failedScripts.delete(scriptId);
+        continue;
+      }
+      try {
+        await this.loadSourceMap(scriptId, meta);
+        if (this.cache.has(scriptId)) {
+          loaded.push(scriptId);
+        }
+      } catch {
+        // Still failing — will be retried next time
+      }
+    }
+    if (loaded.length > 0) {
+      logger.info(`Retried source maps: ${loaded.length} recovered`);
+    }
+    return loaded;
+  }
+
+  hasFailedScripts(): boolean {
+    return this.failedScripts.size > 0;
   }
 
   unregisterScript(scriptId: string): void {
@@ -210,51 +335,67 @@ export class SourceMapResolver {
   }
 
   async generatedToOriginal(scriptId: string, lineNumber: number, columnNumber: number = 0): Promise<OriginalLocation | null> {
+    // Lazy load: if source map not yet loaded, load it now
+    if (!this.cache.has(scriptId) && this.scriptMetas.has(scriptId)) {
+      await this.ensureSourceMap(scriptId);
+    }
+
     const consumer = this.cache.get(scriptId);
     if (!consumer) return null;
 
     const entry = this.scripts.get(scriptId);
     if (!entry) return null;
 
+    const sourceMapFileDir = entry.sourceMapFile ? path.dirname(entry.sourceMapFile) : undefined;
+
+    // GREATEST_LOWER_BOUND (default): find the mapping at or just before
+    // the given position. This is critical for Vite's 1-line minified output
+    // where code like `line 1, column 3000` needs to find the nearest mapping
+    // segment at `column <= 3000` on the same line.
     const original = consumer.originalPositionFor({
       line: lineNumber + 1,
       column: columnNumber,
     });
 
-    if (original.source === null || original.line === null) return null;
+    if (original.source !== null && original.line !== null) {
+      return {
+        source: this.resolveSourcePath(original.source, entry.url, sourceMapFileDir),
+        line: original.line,
+        column: original.column ?? 0,
+      };
+    }
 
-    const sourceMapFileDir = entry.sourceMapFile ? path.dirname(entry.sourceMapFile) : undefined;
-    const resolvedPath = this.resolveSourcePath(original.source, entry.url, sourceMapFileDir);
+    // LEAST_UPPER_BOUND: if no mapping at-or-before, try at-or-after.
+    // This helps when paused at the very start of a mapping segment.
+    const upper = consumer.originalPositionFor({
+      line: lineNumber + 1,
+      column: columnNumber,
+      // @ts-ignore — bias is supported but not in all type definitions
+      bias: 2,  // SourceMapConsumer.LEAST_UPPER_BOUND
+    });
 
-    return {
-      source: resolvedPath,
-      line: original.line,
-      column: original.column ?? 0,
-    };
-  }
+    if (upper.source !== null && upper.line !== null) {
+      return {
+        source: this.resolveSourcePath(upper.source, entry.url, sourceMapFileDir),
+        line: upper.line,
+        column: upper.column ?? 0,
+      };
+    }
 
-  /**
-   * Find the nearest mapped original location for a generated position.
-   * When the exact position has no mapping (sparse source map), searches
-   * nearby generated lines (up to ±maxDistance) to find the closest one
-   * that DOES have a mapping. Returns null only if no mapping is found
-   * within the search range.
-   */
-  async nearestOriginalLocation(scriptId: string, lineNumber: number, columnNumber: number = 0, maxDistance: number = 5): Promise<OriginalLocation | null> {
-    // Try exact match first
-    const exact = await this.generatedToOriginal(scriptId, lineNumber, columnNumber);
-    if (exact) return exact;
-
-    // Search nearby lines, preferring closer ones
-    for (let delta = 1; delta <= maxDistance; delta++) {
-      // Try line before
-      if (lineNumber - delta >= 0) {
-        const before = await this.generatedToOriginal(scriptId, lineNumber - delta, 0);
-        if (before) return before;
+    // No mapping on this line at all — search backwards through previous lines.
+    // This handles multi-line generated code where some lines have no mappings.
+    for (let searchLine = lineNumber - 1; searchLine >= Math.max(0, lineNumber - 50); searchLine--) {
+      const prev = consumer.originalPositionFor({
+        line: searchLine + 1,
+        column: Infinity,  // Find the LAST mapping on the previous line
+      });
+      if (prev.source !== null && prev.line !== null) {
+        return {
+          source: this.resolveSourcePath(prev.source, entry.url, sourceMapFileDir),
+          line: prev.line,
+          column: prev.column ?? 0,
+        };
       }
-      // Try line after
-      const after = await this.generatedToOriginal(scriptId, lineNumber + delta, 0);
-      if (after) return after;
     }
 
     return null;
@@ -267,7 +408,7 @@ export class SourceMapResolver {
   }
 
   hasSourceMap(scriptId: string): boolean {
-    return this.cache.has(scriptId);
+    return this.cache.has(scriptId) || this.scriptMetas.has(scriptId);
   }
 
   /**
@@ -289,41 +430,61 @@ export class SourceMapResolver {
   /**
    * Compute blackbox positions for Vite-injected preamble/epilogue in a script.
    *
-   * Only blackboxes lines BEFORE the first source-mapped line (preamble: HMR setup,
-   * _s() declarations) and AFTER the last source-mapped line (epilogue: $RefreshReg$,
-   * import.meta.hot.accept). Lines in between are left alone — even unmapped gaps
-   * in the middle of user code are NOT blackboxed, since sparse source maps could
-   * cause legitimate user code to be skipped.
+   * Handles both multi-line and single-line (minified) scripts:
+   * - Multi-line: blackbox lines before first mapping and after last mapping
+   * - Single-line (line 0 only): blackbox columns before first mapping column
+   *   and after last mapping column on that single line
    */
   getBlackboxPositions(scriptId: string, scriptEndLine: number): Array<{ lineNumber: number; columnNumber: number }> | null {
     const consumer = this.cache.get(scriptId);
     if (!consumer) return null;
 
-    // Find the first and last generated lines that have a source mapping
-    let firstMapped = Infinity;
-    let lastMapped = -1;
+    // Find the bounds of source-mapped regions
+    let firstMappedLine = Infinity;
+    let lastMappedLine = -1;
+    let firstMappedCol = Infinity;
+    let lastMappedCol = -1;
+
     consumer.eachMapping((mapping) => {
-      if (mapping.source) {
-        const line = mapping.generatedLine - 1;  // Convert to 0-based
-        if (line < firstMapped) firstMapped = line;
-        if (line > lastMapped) lastMapped = line;
+      if (!mapping.source) return;
+      const line = mapping.generatedLine - 1;  // 0-based
+      const col = mapping.generatedColumn;      // already 0-based
+
+      if (line < firstMappedLine || (line === firstMappedLine && col < firstMappedCol)) {
+        firstMappedLine = line;
+        firstMappedCol = col;
+      }
+      if (line > lastMappedLine || (line === lastMappedLine && col > lastMappedCol)) {
+        lastMappedLine = line;
+        lastMappedCol = col;
       }
     });
 
-    if (lastMapped < 0) return null;  // No mappings at all
+    if (lastMappedLine < 0) return null;  // No mappings at all
 
+    const isSingleLine = (scriptEndLine === 0) || (firstMappedLine === lastMappedLine && firstMappedLine === 0);
     const positions: Array<{ lineNumber: number; columnNumber: number }> = [];
 
-    // Blackbox preamble: lines 0..<firstMapped> (Vite HMR setup, _s() declarations)
-    if (firstMapped > 0) {
-      positions.push({ lineNumber: 0, columnNumber: 0 });
-      positions.push({ lineNumber: firstMapped, columnNumber: 0 });
-    }
-
-    // Blackbox epilogue: lines after lastMapped ($RefreshReg$, hot.accept)
-    if (lastMapped < scriptEndLine) {
-      positions.push({ lineNumber: lastMapped + 1, columnNumber: 0 });
-      positions.push({ lineNumber: scriptEndLine + 1, columnNumber: 0 });
+    if (isSingleLine) {
+      // Single-line script: blackbox preamble columns (before first mapping)
+      if (firstMappedCol > 0) {
+        positions.push({ lineNumber: 0, columnNumber: 0 });
+        positions.push({ lineNumber: 0, columnNumber: firstMappedCol });
+      }
+      // We skip epilogue blackboxing for single-line scripts because
+      // lastMappedCol is just the start of the last mapping, not its end.
+      // Chrome's blackbox would cut off the tail of user code.
+    } else {
+      // Multi-line script: blackbox preamble lines
+      if (firstMappedLine > 0) {
+        positions.push({ lineNumber: 0, columnNumber: 0 });
+        positions.push({ lineNumber: firstMappedLine, columnNumber: 0 });
+      }
+      // Blackbox epilogue lines
+      if (lastMappedLine < scriptEndLine) {
+        positions.push({ lineNumber: lastMappedLine + 1, columnNumber: 0 });
+        positions.push({ lineNumber: scriptEndLine + 1, columnNumber: 0 });
+      }
     }
 
     return positions.length > 0 ? positions : null;
@@ -332,7 +493,10 @@ export class SourceMapResolver {
   clear(): void {
     this.cache.clear();
     this.scripts.clear();
+    this.scriptMetas.clear();
     this.sourceToScripts.clear();
+    this.loadingPromises.clear();
+    this.failedScripts.clear();
     this.registeredScriptCount = 0;
     this.pendingSourceMisses.clear();
   }
@@ -353,10 +517,22 @@ export class SourceMapResolver {
       }
       rawMapStr = Buffer.from(match[1], 'base64').toString('utf-8');
     } else {
-      rawMapStr = await httpGet(sourceMapUrl);
+      rawMapStr = await httpGetWithRetry(sourceMapUrl, 2, 8000);
     }
 
-    const rawMap: RawSourceMap = JSON.parse(rawMapStr);
+    let rawMap: RawSourceMap;
+    try {
+      rawMap = JSON.parse(rawMapStr);
+    } catch (e) {
+      logger.warn(`Invalid JSON in source map for ${scriptId}: ${rawMapStr.substring(0, 100)}...`);
+      return { consumer: null, rawMap: {} as RawSourceMap };
+    }
+
+    if (!rawMap.mappings && !(rawMap as any).sections) {
+      logger.warn(`Source map for ${scriptId} has no mappings (keys: ${Object.keys(rawMap).join(', ')})`);
+      return { consumer: null, rawMap };
+    }
+
     const consumer = await new SourceMapConsumer(rawMap);
     this.cache.set(scriptId, consumer);
     return { consumer, rawMap };

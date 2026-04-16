@@ -74,6 +74,7 @@ export class ViteDebugSession extends LoggingDebugSession {
   private lastStepAction: 'stepOver' | 'stepInto' | 'stepOut' | null = null;
   private stepInTargetLocations = new Map<number, BreakLocation>();
   private tempBreakpointId: string | null = null;
+  private sourceMapRetryTimer: NodeJS.Timeout | null = null;
 
   constructor() {
     super('vite-debugger.log');
@@ -243,6 +244,24 @@ export class ViteDebugSession extends LoggingDebugSession {
     ]);
     logger.info('Blackbox patterns set for library code');
 
+    // Wire up source map loaded callback — resolve pending breakpoints when a
+    // source map is loaded (covers both initial load and retried loads)
+    this.sourceMapResolver.onSourceMapLoaded = (scriptId: string) => {
+      if (!this.breakpointManager || !this.breakpointManager.hasPendingBreakpoints()) return;
+      const url = this.scriptIdToUrl.get(scriptId);
+      if (url) {
+        this.breakpointManager.resolveBreakpointsForScript(scriptId, url).then(resolved => {
+          for (const bp of resolved) {
+            this.sendEvent(new BreakpointEvent('changed', {
+              id: bp.dapId,
+              verified: true,
+              line: bp.line,
+            } as DebugProtocol.Breakpoint));
+          }
+        }).catch(() => {});
+      }
+    };
+
     // Set up CDP event handlers
     this.cdp.on('scriptParsed', (params: ScriptParsedEvent) => this.onScriptParsed(params));
     this.cdp.on('paused', (params: PausedEvent) => this.onPaused(params));
@@ -253,6 +272,9 @@ export class ViteDebugSession extends LoggingDebugSession {
 
     // Set exception breakpoint state
     await this.cdp.setPauseOnExceptions(this.exceptionBreakMode);
+
+    // Schedule retry for failed source maps (Vite might not be ready for all modules immediately)
+    this.scheduleSourceMapRetry();
 
     this.sendEvent(new OutputEvent('Connected to Chrome DevTools\n', 'console'));
   }
@@ -731,39 +753,32 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.knownScriptUrls.set(params.url, params.scriptId);
     this.scriptIdToUrl.set(params.scriptId, params.url);
 
-    // Register source map
+    // Register source map: track metadata immediately, then load eagerly.
+    // ensureSourceMap populates sourceToScripts which is needed for breakpoint resolution.
     if (this.sourceMapResolver) {
       if (isHmrReload) {
         this.sourceMapResolver.unregisterScript(previousScriptId);
       }
-      await this.sourceMapResolver.registerScript(params.scriptId, params.url, params.sourceMapURL);
+      this.sourceMapResolver.trackScript(params.scriptId, params.url, params.sourceMapURL);
 
-      // Blackbox unmapped line ranges (Vite-injected code: _s(), $RefreshReg$, HMR wrappers)
-      // Chrome natively skips these during stepping — no smart-step round-trips needed
-      if (this.cdp) {
-        const positions = this.sourceMapResolver.getBlackboxPositions(params.scriptId, params.endLine);
-        if (positions) {
-          try {
-            await this.cdp.setBlackboxedRanges(params.scriptId, positions);
-          } catch {
-            // Some scripts (e.g., eval'd) may not support blackboxing — ignore
-          }
+      // Await source map load — needed for breakpoint resolution below.
+      // If loading fails, onSourceMapLoaded callback won't fire, and retry timer
+      // will handle it later.
+      const loaded = await this.sourceMapResolver.ensureSourceMap(params.scriptId);
+      if (!loaded) {
+        logger.warn(`Source map not available for ${params.url} — breakpoints for this file will be pending`);
+        // Schedule retry if there are pending breakpoints
+        if (this.breakpointManager?.hasPendingBreakpoints()) {
+          this.scheduleSourceMapRetry();
         }
-      }
-
-      // Log summary every 500 scripts instead of per-script
-      const count = this.sourceMapResolver.getRegisteredScriptCount();
-      if (count > 0 && count % 500 === 0 && count !== this.lastLoggedScriptCount) {
-        this.lastLoggedScriptCount = count;
-        logger.debug(`Registered ${count} scripts so far...`);
       }
     }
 
-    // Resolve pending breakpoints
-    if (this.breakpointManager) {
+    // Resolve pending breakpoints for this script
+    // (onSourceMapLoaded callback handles the case where source map loads later via retry)
+    if (this.breakpointManager && this.sourceMapResolver) {
       if (isHmrReload) {
         const resolved = await this.breakpointManager.handleHmrReload(params.url);
-        // Notify VSCode of newly verified breakpoints
         for (const bp of resolved) {
           this.sendEvent(new BreakpointEvent('changed', {
             id: bp.dapId,
@@ -841,15 +856,6 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.lastStepAction = null;
     this.smartStepCount = 0;
 
-    // Log script registration summary once on first pause
-    if (this.sourceMapResolver && this.lastLoggedScriptCount !== -1) {
-      const total = this.sourceMapResolver.getRegisteredScriptCount();
-      if (total > 0) {
-        logger.info(`Registered ${total} scripts with source maps`);
-        this.lastLoggedScriptCount = -1;  // Only log once
-      }
-    }
-
     // Clear previous pause state
     this.scopeManager?.clear();
     this.variableManager?.clear();
@@ -917,30 +923,22 @@ export class ViteDebugSession extends LoggingDebugSession {
     // Only smart-step for scripts that HAVE a source map registered.
     // Scripts without source maps (pure library code) are handled by blackboxing.
     if (this.sourceMapResolver && this.sourceMapResolver.hasSourceMap(scriptId)) {
-      // Try exact mapping first
+      // generatedToOriginal now searches backwards through generated lines,
+      // so it resolves even for lines without exact mappings.
       const original = await this.sourceMapResolver.generatedToOriginal(
         scriptId, lineNumber, columnNumber ?? 0
       );
       if (original) {
-        // Has mapping — skip only if it's in node_modules (library code)
+        // Skip node_modules, stop on user code
         return original.source.includes('/node_modules/');
       }
 
-      // No exact mapping — try nearest neighbor
-      const nearest = await this.sourceMapResolver.nearestOriginalLocation(
-        scriptId, lineNumber, columnNumber ?? 0
-      );
-      if (nearest) {
-        // Found nearby mapping — skip if node_modules, stop if local user code
-        return nearest.source.includes('/node_modules/');
-      }
-
-      // No mapping found at all — Vite-injected code (_s(), $RefreshSig$, etc.)
+      // No mapping found at all (even with backwards search) →
+      // Vite-injected code (_s(), $RefreshSig$, etc.)
       return true;
     }
 
     // No source map = probably should have been blackboxed, but wasn't.
-    // Don't smart-step — let normal stepping behavior handle it.
     return false;
   }
 
@@ -1182,7 +1180,34 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.sendEvent(new TerminatedEvent());
   }
 
+  /**
+   * Periodically retry failed source map loads.
+   * Vite transforms modules on-demand, so the source map might not be available
+   * immediately when Chrome first parses the script. Retrying after a delay
+   * catches these cases.
+   */
+  private scheduleSourceMapRetry(): void {
+    if (this.sourceMapRetryTimer) return;
+    this.sourceMapRetryTimer = setTimeout(async () => {
+      this.sourceMapRetryTimer = null;
+      if (!this.sourceMapResolver?.hasFailedScripts()) return;
+      if (!this.breakpointManager?.hasPendingBreakpoints()) return;
+
+      logger.debug('Retrying failed source map loads...');
+      await this.sourceMapResolver.retryFailed();
+
+      // If there are still failures and pending breakpoints, schedule another retry
+      if (this.sourceMapResolver.hasFailedScripts() && this.breakpointManager.hasPendingBreakpoints()) {
+        this.scheduleSourceMapRetry();
+      }
+    }, 3000);
+  }
+
   private async cleanup(): Promise<void> {
+    if (this.sourceMapRetryTimer) {
+      clearTimeout(this.sourceMapRetryTimer);
+      this.sourceMapRetryTimer = null;
+    }
     this.sourceMapResolver?.clear();
     this.breakpointManager?.clear();
     this.networkBreakpointManager?.clear();

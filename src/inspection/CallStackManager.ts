@@ -38,97 +38,58 @@ export class CallStackManager {
       this.frameMap.set(frameId, cdpFrame);
 
       const { scriptId, lineNumber, columnNumber } = cdpFrame.location;
-
-      // Try to resolve through source map
-      const original = await this.sourceMapResolver.generatedToOriginal(
-        scriptId, lineNumber, columnNumber ?? 0
-      );
-
       let source: DebugProtocol.Source;
       let line: number;
       let column: number;
       let presentationHint: 'normal' | 'label' | 'subtle' | undefined;
 
-      if (original) {
-        const onDisk = this.fileExists(original.source);
-        source = {
-          name: original.source.split('/').pop() ?? 'unknown',
-        };
-        line = original.line;
-        column = original.column + 1; // DAP columns are 1-based
+      // Step 1: Determine the local file path from Vite URL (always available, no source map needed)
+      const localPath = this.urlMapper.viteUrlToFilePath(cdpFrame.url);
+      const isLocalFile = localPath ? this.fileExists(localPath) : false;
+      const isNodeModules = localPath?.includes('/node_modules/') ?? cdpFrame.url.includes('/node_modules/');
+      const isInternal = this.isInternalFrame(cdpFrame.url);
 
+      // Step 2: Try source map for accurate line/column mapping
+      const original = await this.sourceMapResolver.generatedToOriginal(
+        scriptId, lineNumber, columnNumber ?? 0
+      );
+
+      if (original && !original.source.includes('/node_modules/')) {
+        // Source map resolved to user code — use its line/column
+        const onDisk = this.fileExists(original.source);
+        source = { name: original.source.split('/').pop() ?? 'unknown' };
+        line = original.line;
+        column = original.column + 1;
         if (onDisk) {
           source.path = original.source;
-        } else if (registerSourceRef) {
-          // Not on disk — only use sourceReference, no path
-          source.sourceReference = registerSourceRef(scriptId);
+        } else if (isLocalFile && localPath) {
+          // Source map path doesn't exist but URL-based path does — use that
+          source.path = localPath;
         }
-
-        if (onDisk) {
+        if (!isNodeModules && !isInternal && source.path) {
           logger.debug(
             `Frame ${frameId}: ${cdpFrame.functionName || '(anonymous)'} → ` +
-            `${original.source}:${line}`
+            `${source.path}:${line}:${original.column} (gen ${lineNumber}:${columnNumber ?? 0})`
           );
         }
-      } else {
-        // generatedToOriginal failed — try finding the nearest mapped location
-        const nearest = await this.sourceMapResolver.nearestOriginalLocation(
-          scriptId, lineNumber, columnNumber ?? 0, 20
+      } else if (isLocalFile && localPath && !isNodeModules && !isInternal) {
+        // No source map (or maps to node_modules) but local file exists — show file with generated position
+        source = { name: localPath.split('/').pop() ?? 'unknown', path: localPath };
+        line = lineNumber + 1;
+        column = (columnNumber ?? 0) + 1;
+        logger.debug(
+          `Frame ${frameId}: ${cdpFrame.functionName || '(anonymous)'} → ` +
+          `${localPath}:${line}:${column} (from URL)`
         );
-
-        if (nearest && !nearest.source.includes('/node_modules/')) {
-          // Nearest mapping found in user code
-          const onDisk = this.fileExists(nearest.source);
-          source = {
-            name: nearest.source.split('/').pop() ?? 'unknown',
-          };
-          line = nearest.line;
-          column = nearest.column + 1;
-
-          if (onDisk) {
-            source.path = nearest.source;
-            logger.debug(
-              `Frame ${frameId}: ${cdpFrame.functionName || '(anonymous)'} → ` +
-              `${nearest.source}:${line} (nearest mapping)`
-            );
-          } else if (registerSourceRef) {
-            source.sourceReference = registerSourceRef(scriptId);
-          }
-        } else {
-          // Nearest not found or is node_modules — use primarySource as fallback
-          const primarySource = this.sourceMapResolver.getPrimarySourceForScript(scriptId);
-          const isNodeModules = primarySource?.includes('/node_modules/') ?? true;
-          const primaryOnDisk = primarySource ? this.fileExists(primarySource) : false;
-
-          if (primaryOnDisk && !isNodeModules) {
-            // Local user file — show file path (line 1 as best guess)
-            source = {
-              name: primarySource!.split('/').pop() ?? 'unknown',
-              path: primarySource!,
-            };
-            line = 1;
-            column = 1;
-            logger.debug(
-              `Frame ${frameId}: ${cdpFrame.functionName || '(anonymous)'} → ` +
-              `${primarySource} (no exact mapping)`
-            );
-          } else {
-            // node_modules or unknown — deemphasize
-            source = {
-              name: cdpFrame.functionName || cdpFrame.url.split('/').pop() || 'unknown',
-            };
-            if (registerSourceRef) {
-              source.sourceReference = registerSourceRef(scriptId);
-            }
-            line = lineNumber + 1;
-            column = (columnNumber ?? 0) + 1;
-            presentationHint = 'subtle';
-          }
-        }
+      } else {
+        // node_modules, Vite internals, or truly unknown
+        source = { name: cdpFrame.functionName || cdpFrame.url.split('/').pop() || 'unknown' };
+        line = lineNumber + 1;
+        column = (columnNumber ?? 0) + 1;
+        presentationHint = 'subtle';
       }
 
-      // Deemphasize Vite internal frames
-      if (this.isInternalFrame(cdpFrame.url)) {
+      if (isNodeModules || isInternal) {
         presentationHint = 'subtle';
       }
 
