@@ -19,6 +19,21 @@ export class BreakpointManager {
   private breakpoints = new Map<string, ManagedBreakpoint[]>();  // sourcePath -> breakpoints
   private urlRegexCache = new Map<string, string>();  // sourcePath -> precomputed CDP urlRegex
   private nextDapId = 1;
+  /**
+   * Serializes all CDP-touching operations (setBreakpoints,
+   * resolveBreakpointsForScript, handleHmrReload).
+   *
+   * Why: VSCode can fire `setBreakpoints` while an HMR batch is mid-flight,
+   * and multiple `setBreakpoints` for the same source can arrive on
+   * successive saves. If their async `await`s interleave, two
+   * `setBreakpointByUrl` calls can hit the same location and Chrome returns
+   * "Breakpoint at specified location already exists" for the loser.
+   * Previously the loser's `cdpBreakpointId` stayed undefined, so a later
+   * `setBreakpoints(path, [])` skipped the remove pass and the CDP
+   * breakpoint leaked — the user saw pauses at breakpoints they had
+   * cleared.
+   */
+  private opQueue: Promise<unknown> = Promise.resolve();
 
   constructor(
     private cdp: CdpClient,
@@ -26,7 +41,28 @@ export class BreakpointManager {
     private viteUrl: string,
   ) {}
 
+  /**
+   * Append `fn` to the CDP operation queue. Each queued op starts only
+   * after the previous one settles (success or failure); errors do not
+   * poison the chain, they just don't short-circuit subsequent work.
+   */
+  private serialize<T>(fn: () => Promise<T>): Promise<T> {
+    const run = (): Promise<T> => fn();
+    const next = this.opQueue.then(run, run);
+    this.opQueue = next.catch(() => undefined);
+    return next;
+  }
+
   async setBreakpoints(
+    sourcePath: string,
+    sourceBreakpoints: DebugProtocol.SourceBreakpoint[]
+  ): Promise<DebugProtocol.Breakpoint[]> {
+    return this.serialize(() =>
+      this.setBreakpointsInternal(sourcePath, sourceBreakpoints),
+    );
+  }
+
+  private async setBreakpointsInternal(
     sourcePath: string,
     sourceBreakpoints: DebugProtocol.SourceBreakpoint[]
   ): Promise<DebugProtocol.Breakpoint[]> {
@@ -134,7 +170,11 @@ export class BreakpointManager {
     this.breakpoints.delete(sourcePath);
   }
 
-  async resolveBreakpointsForScript(scriptId: string, _url: string): Promise<ManagedBreakpoint[]> {
+  async resolveBreakpointsForScript(scriptId: string, url: string): Promise<ManagedBreakpoint[]> {
+    return this.serialize(() => this.resolveBreakpointsForScriptInternal(scriptId, url));
+  }
+
+  private async resolveBreakpointsForScriptInternal(scriptId: string, _url: string): Promise<ManagedBreakpoint[]> {
     // Narrow the work to sources that actually belong to THIS script, avoiding
     // the previous O(sources × bps) scan that re-ran `originalToGenerated`
     // against every unrelated bp on every scriptParsed event.
@@ -194,6 +234,10 @@ export class BreakpointManager {
    * skipping non-browser files (e.g., .py) that can never resolve to browser scripts.
    */
   async handleHmrReload(affectedSourcePaths: Set<string>): Promise<{ resolved: ManagedBreakpoint[]; unresolved: ManagedBreakpoint[] }> {
+    return this.serialize(() => this.handleHmrReloadInternal(affectedSourcePaths));
+  }
+
+  private async handleHmrReloadInternal(affectedSourcePaths: Set<string>): Promise<{ resolved: ManagedBreakpoint[]; unresolved: ManagedBreakpoint[] }> {
     // Collect all bps affected by this HMR cycle so we can pipeline the
     // remove/resolve/set per-bp — each step was previously a hard await that
     // serialized ~3N CDP round-trips for N breakpoints.

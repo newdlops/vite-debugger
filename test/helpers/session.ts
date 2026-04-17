@@ -1,3 +1,4 @@
+import { DebugProtocol } from '@vscode/debugprotocol';
 import { DAPClient } from './dapClient';
 import { FixtureViteServer, startFixtureVite } from './viteServer';
 import { LaunchedChrome, launchTestChrome } from './chrome';
@@ -28,6 +29,41 @@ export interface StartOptions {
  * Tests then call `dap.request('initialize' | 'launch' | ...)` to drive the
  * adapter. Teardown disposes everything in reverse order.
  */
+/**
+ * Full bring-up sequence that most breakpoint-oriented tests want:
+ *  start session → initialize → launch → configurationDone → navigate.
+ * After this returns the fixture page is loaded, the adapter is attached,
+ * and setBreakpoints calls will resolve against real scriptParsed events.
+ */
+export async function startAttachedSession(): Promise<E2ESession> {
+  const session = await startE2ESession();
+  await session.dap.request<
+    DebugProtocol.InitializeRequest,
+    DebugProtocol.InitializeResponse
+  >('initialize', {
+    adapterID: 'vite',
+    linesStartAt1: true,
+    columnsStartAt1: true,
+    pathFormat: 'path',
+  });
+  const initialized = session.dap.waitForEvent('initialized', 30_000);
+  await session.dap.request<
+    DebugProtocol.LaunchRequest,
+    DebugProtocol.LaunchResponse
+  >('launch', {
+    viteUrl: session.vite.url,
+    chromePort: session.chrome.port,
+    webRoot: session.webRoot,
+  });
+  await initialized;
+  await session.dap.request('configurationDone', {});
+  await session.browser.navigate(session.vite.url);
+  // Let Vite dep-optimize + React hydrate + scriptParsed fan-out settle so
+  // subsequent setBreakpoints resolves against live scripts.
+  await new Promise((r) => setTimeout(r, 1500));
+  return session;
+}
+
 export async function startE2ESession(options: StartOptions = {}): Promise<E2ESession> {
   const vite = await startFixtureVite();
   let chrome: LaunchedChrome | null = null;
