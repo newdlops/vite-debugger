@@ -78,7 +78,9 @@
               },
               "skipFiles": {
                 "type": "array",
-                "items": { "type": "string" },
+                "items": {
+                  "type": "string"
+                },
                 "description": "Glob patterns for files to skip during stepping (e.g., [\"**/styled-components/**\", \"**/index.tsx\"]). Matched files are stepped over automatically.",
                 "default": []
               }
@@ -108,7 +110,9 @@
               },
               "skipFiles": {
                 "type": "array",
-                "items": { "type": "string" },
+                "items": {
+                  "type": "string"
+                },
                 "description": "Glob patterns for files to skip during stepping (e.g., [\"**/styled-components/**\", \"**/index.tsx\"]). Matched files are stepped over automatically.",
                 "default": []
               }
@@ -188,6 +192,10 @@
     "lint": "eslint src/",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "vitest run --config vitest.config.ts",
+    "test:vscode": "node ./test/vscode-host/runTest.js",
+    "pretest:vscode": "npm run build",
+    "test:all": "npm run test:e2e && npm run test:vscode",
     "package": "npm run build && vsce package"
   },
   "dependencies": {
@@ -198,10 +206,20 @@
   },
   "devDependencies": {
     "@types/chrome-remote-interface": "^0.31.14",
+    "@types/mocha": "10.0.10",
     "@types/node": "^20.11.0",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
     "@types/vscode": "^1.85.0",
+    "@vitejs/plugin-react": "4.3.4",
+    "@vscode/test-electron": "2.4.1",
+    "chrome-launcher": "1.1.2",
     "esbuild": "^0.20.0",
     "eslint": "^8.56.0",
+    "glob": "11.0.0",
+    "mocha": "10.8.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
     "typescript": "^5.3.3",
     "vitest": "^1.2.0"
   }

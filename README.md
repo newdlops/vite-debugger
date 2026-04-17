@@ -108,6 +108,34 @@ The debugger finds a debuggable Chrome in this order:
 - Chrome allows only one debugger connection per tab. See [Chrome Debugging Limitation](docs/chrome-debugging-limitation.md) for details.
 - Source maps for dynamically imported modules load on-demand — breakpoints in lazy-loaded files become active when the module is first imported.
 
+## Testing
+
+The repo ships with two layers of regression tests.
+
+**Adapter-level E2E (`vitest`)** — boots a real Vite dev server + headless Chrome and drives `ViteDebugSession` via DAP. Covers launch, breakpoint set/hit/clear, stack/scopes/variables, evaluate, continue, and source-map resolution. No VSCode UI is required.
+
+```sh
+npm run test:e2e
+```
+
+**VSCode host smoke (`@vscode/test-electron` + mocha)** — launches a real VSCode, loads the extension, and asserts activation + contributed commands.
+
+```sh
+npm run test:vscode
+```
+
+**Both:**
+
+```sh
+npm run test:all
+```
+
+Environment variables:
+
+- `VITE_DEBUGGER_TEST_LOG=1` — mirror the extension's internal logger + adapter `OutputEvent`s to stderr during `test:e2e`. Useful when a regression pauses in an unexpected location.
+
+Fixtures live under `test/fixtures/sample-app/` (tiny React + Vite project with a deterministic breakpoint target at `src/math.ts:2`) and `test/vscode-host/fixture-workspace/`.
+
 ## License
 
 [MIT](LICENSE)
