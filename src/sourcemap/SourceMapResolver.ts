@@ -27,6 +27,11 @@ interface ScriptEntry {
    *  Pre-computed once at load so `findSourceName` is O(1) instead of an
    *  O(m) eachMapping scan on every originalToGenerated call. */
   sourceNameByPath: Map<string, string>;
+  /** source-name → (originalLine → generated positions on that line).
+   *  Built from a single eachMapping pass at load; lets `breakpointLocations`
+   *  and JSX-aware bp placement enumerate all breakable positions on an
+   *  original line without per-lookup full scans. */
+  generatedByLine: Map<string, Map<number, Array<{ lineNumber: number; columnNumber: number }>>>;
   /** Whether the source map has been fetched and parsed */
   loaded: boolean;
 }
@@ -186,11 +191,32 @@ export class SourceMapResolver {
 
       this.registeredScriptCount++;
 
-      // Single pass: collect unique source names AND build the reverse map
-      // (resolved-path → source-name) so findSourceName is O(1) later.
+      // Single pass: collect unique source names, build the reverse map
+      // (resolved-path → source-name) so findSourceName is O(1) later, AND
+      // build a per-line index of generated positions so breakpointLocations
+      // can enumerate valid bp positions without a second full scan.
       const sourceNames = new Set<string>();
+      const generatedByLine = new Map<
+        string,
+        Map<number, Array<{ lineNumber: number; columnNumber: number }>>
+      >();
       consumer.eachMapping((mapping) => {
-        if (mapping.source) sourceNames.add(mapping.source);
+        if (!mapping.source) return;
+        sourceNames.add(mapping.source);
+        let lineMap = generatedByLine.get(mapping.source);
+        if (!lineMap) {
+          lineMap = new Map();
+          generatedByLine.set(mapping.source, lineMap);
+        }
+        let bucket = lineMap.get(mapping.originalLine);
+        if (!bucket) {
+          bucket = [];
+          lineMap.set(mapping.originalLine, bucket);
+        }
+        bucket.push({
+          lineNumber: mapping.generatedLine - 1,
+          columnNumber: mapping.generatedColumn,
+        });
       });
 
       const sources: string[] = [];
@@ -208,7 +234,7 @@ export class SourceMapResolver {
 
       this.scripts.set(scriptId, {
         scriptId, url: meta.url, sourceMapUrl: meta.sourceMapUrl,
-        sources, sourceMapFile, sourceNameByPath, loaded: true,
+        sources, sourceMapFile, sourceNameByPath, generatedByLine, loaded: true,
       });
 
       // Clear from failed set if a retry succeeded
@@ -435,6 +461,47 @@ export class SourceMapResolver {
     const normalizedPath = filePath.replace(/\\/g, '/');
     const scripts = this.sourceToScripts.get(normalizedPath);
     return scripts ? [...scripts] : [];
+  }
+
+  /**
+   * Enumerate every generated position that maps to `line` in `filePath`,
+   * across all scripts that include that source. Used by
+   * `breakpointLocationsRequest` to discover which columns are breakable
+   * on a source line (multi-line JSX, single-line lambdas, etc.).
+   *
+   * Returns positions sorted by generated line then column. O(1) lookup
+   * per script thanks to the generatedByLine index built at load time.
+   */
+  getGeneratedPositionsForOriginalLine(filePath: string, line: number): GeneratedLocation[] {
+    const normalizedPath = filePath.replace(/\\/g, '/');
+    const scriptIds = this.sourceToScripts.get(normalizedPath);
+    if (!scriptIds || scriptIds.size === 0) return [];
+
+    const results: GeneratedLocation[] = [];
+    for (const scriptId of scriptIds) {
+      const entry = this.scripts.get(scriptId);
+      if (!entry) continue;
+      const sourceName = entry.sourceNameByPath.get(normalizedPath);
+      if (!sourceName) continue;
+      const lineMap = entry.generatedByLine.get(sourceName);
+      if (!lineMap) continue;
+      const positions = lineMap.get(line);
+      if (!positions) continue;
+      for (const p of positions) {
+        results.push({
+          scriptId,
+          lineNumber: p.lineNumber,
+          columnNumber: p.columnNumber,
+        });
+      }
+    }
+
+    results.sort((a, b) => {
+      if (a.scriptId !== b.scriptId) return a.scriptId < b.scriptId ? -1 : 1;
+      if (a.lineNumber !== b.lineNumber) return a.lineNumber - b.lineNumber;
+      return a.columnNumber - b.columnNumber;
+    });
+    return results;
   }
 
   /**

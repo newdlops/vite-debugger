@@ -16,6 +16,17 @@ export function App(): JSX.Element {
       <h1>Fixture app</h1>
       <p data-testid="count">count: {state.version}</p>
       <button data-testid="inc" onClick={handleClick}>increment</button>
+      <button data-testid="lambda-one" onClick={() => { const n = add(state.version, 10); bump(); void n; }}>one-line-lambda</button>
+      <button
+        data-testid="lambda-multi"
+        onClick={() => {
+          const n = add(state.version, 100);
+          bump();
+          void n;
+        }}
+      >
+        multi-line-lambda
+      </button>
     </div>
   );
 }

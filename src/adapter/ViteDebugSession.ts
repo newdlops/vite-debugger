@@ -129,6 +129,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     response.body.supportsLogPoints = true;
     response.body.supportsExceptionOptions = true;
     response.body.supportsLoadedSourcesRequest = true;
+    response.body.supportsBreakpointLocationsRequest = true;
     response.body.exceptionBreakpointFilters = [
       {
         filter: 'uncaught',
@@ -345,6 +346,113 @@ export class ViteDebugSession extends LoggingDebugSession {
       sourcePath,
       args.breakpoints ?? []
     );
+
+    response.body = { breakpoints };
+    this.sendResponse(response);
+  }
+
+  /**
+   * DAP `breakpointLocations` — tells the client which (line, column) pairs
+   * accept a breakpoint inside the requested source range. VSCode renders
+   * these as the clickable bp dots in the gutter, which is how the user
+   * places a breakpoint inside a single-line lambda body or on a specific
+   * prop of multi-line JSX.
+   *
+   * Strategy: for every original line in range, get all generated positions
+   * via the source-map-level index, ask CDP `getPossibleBreakpoints` for
+   * each distinct generated line, then back-map each result to original
+   * (line, column). Positions outside the requested source are dropped.
+   */
+  protected async breakpointLocationsRequest(
+    response: DebugProtocol.BreakpointLocationsResponse,
+    args: DebugProtocol.BreakpointLocationsArguments,
+  ): Promise<void> {
+    const sourcePath = args.source.path;
+    if (!sourcePath || !this.sourceMapResolver || !this.cdp) {
+      response.body = { breakpoints: [] };
+      this.sendResponse(response);
+      return;
+    }
+
+    const startLine = args.line;
+    const endLine = args.endLine ?? args.line;
+    const normalizedPath = sourcePath.replace(/\\/g, '/');
+
+    // Collect distinct (scriptId, genLine) ranges we need to query. A single
+    // original line often maps to many generated positions spread across
+    // several generated lines (JSX expansion, HMR wrappers, etc.); a single
+    // generated line can also host mappings for several original lines.
+    // Dedupe so getPossibleBreakpoints is called once per distinct gen-line.
+    const genLinesByScript = new Map<string, Set<number>>();
+    for (let origLine = startLine; origLine <= endLine; origLine++) {
+      const genPositions = this.sourceMapResolver.getGeneratedPositionsForOriginalLine(
+        sourcePath,
+        origLine,
+      );
+      for (const gp of genPositions) {
+        let lines = genLinesByScript.get(gp.scriptId);
+        if (!lines) {
+          lines = new Set();
+          genLinesByScript.set(gp.scriptId, lines);
+        }
+        lines.add(gp.lineNumber);
+      }
+    }
+
+    if (genLinesByScript.size === 0) {
+      response.body = { breakpoints: [] };
+      this.sendResponse(response);
+      return;
+    }
+
+    // Query CDP per (scriptId, genLine) in parallel.
+    const queryResults = await Promise.all(
+      [...genLinesByScript].flatMap(([scriptId, lines]) =>
+        [...lines].map(async (genLine) => {
+          try {
+            const locations = await this.cdp!.getPossibleBreakpoints(
+              { scriptId, lineNumber: genLine, columnNumber: 0 },
+              { scriptId, lineNumber: genLine + 1, columnNumber: 0 },
+            );
+            return { scriptId, locations };
+          } catch {
+            return { scriptId, locations: [] as BreakLocation[] };
+          }
+        }),
+      ),
+    );
+
+    // Back-map each CDP location to the original source; keep only those
+    // that land in the requested source and line range.
+    const seen = new Set<string>();
+    const breakpoints: DebugProtocol.BreakpointLocation[] = [];
+    for (const { scriptId, locations } of queryResults) {
+      const backs = await Promise.all(
+        locations.map((loc) =>
+          this.sourceMapResolver!.generatedToOriginal(
+            scriptId,
+            loc.lineNumber,
+            loc.columnNumber ?? 0,
+          ),
+        ),
+      );
+      for (const original of backs) {
+        if (!original) continue;
+        if (original.source !== normalizedPath) continue;
+        if (original.line < startLine || original.line > endLine) continue;
+        // DAP columns are 1-based; generatedToOriginal returns 0-based.
+        const col = (original.column ?? 0) + 1;
+        const key = `${original.line}:${col}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        breakpoints.push({ line: original.line, column: col });
+      }
+    }
+
+    breakpoints.sort((a, b) => {
+      if (a.line !== b.line) return a.line - b.line;
+      return (a.column ?? 0) - (b.column ?? 0);
+    });
 
     response.body = { breakpoints };
     this.sendResponse(response);
@@ -1007,9 +1115,20 @@ export class ViteDebugSession extends LoggingDebugSession {
         // channel during React internal loops.
         if (this.smartStepCount === 1 || this.smartStepCount % 5 === 0) {
           const topLoc = params.callFrames[0]?.location;
-          logger.debug(`Smart step #${this.smartStepCount}: skipping injected code (script ${topLoc?.scriptId}, line ${(topLoc?.lineNumber ?? 0) + 1})`);
+          logger.debug(`Smart step #${this.smartStepCount}: skipping injected code (script ${topLoc?.scriptId}, line ${(topLoc?.lineNumber ?? 0) + 1}, cmd=${this.lastStepAction ?? 'stepOver'})`);
         }
-        await this.cdp.stepOver();
+        // Respect the user's original intent when skipping: if they asked to
+        // stepInto, keep descending so a user callback invoked from inside
+        // library code (e.g., React reconciler → user Component, useMemo
+        // factory) is reached rather than stepped over. stepOut continues
+        // stepping out. Otherwise fall back to stepOver for line-level skips.
+        if (this.lastStepAction === 'stepInto') {
+          await this.cdp.stepInto();
+        } else if (this.lastStepAction === 'stepOut') {
+          await this.cdp.stepOut();
+        } else {
+          await this.cdp.stepOver();
+        }
         return;
       }
     }
@@ -1226,9 +1345,14 @@ export class ViteDebugSession extends LoggingDebugSession {
       );
       if (original) {
         if (original.source.includes('/node_modules/')) {
-          // A deliberate step-into is the user's explicit intent to descend
-          // into library code — don't second-guess them.
-          if (this.lastStepAction === 'stepInto') return false;
+          // Always skip library code. The step command used to skip adapts
+          // to the user's intent: stepInto keeps descending (so a user
+          // callback invoked from inside a library — React reconciler
+          // calling a Component, a useMemo factory, etc. — is still
+          // reached), while stepOver/stepOut stay at the caller-level.
+          // The previous "respect stepInto by stopping in node_modules"
+          // left users stranded in React internals whenever they tried to
+          // step into a JSX element or a hook.
           return true;
         }
 
