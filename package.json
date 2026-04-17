@@ -2,7 +2,7 @@
   "name": "vite-debugger",
   "displayName": "Vite Debugger",
   "description": "Debug Vite applications in VSCode by attaching to Chrome DevTools Protocol",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "images/icon.png",

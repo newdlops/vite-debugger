@@ -23,6 +23,10 @@ interface ScriptEntry {
   sources: string[];  // Resolved absolute file paths from the source map
   /** The `file` field from the source map — often the absolute path of the original file */
   sourceMapFile: string | undefined;
+  /** Resolved-absolute-path → original source-name (as used inside the map).
+   *  Pre-computed once at load so `findSourceName` is O(1) instead of an
+   *  O(m) eachMapping scan on every originalToGenerated call. */
+  sourceNameByPath: Map<string, string>;
   /** Whether the source map has been fetched and parsed */
   loaded: boolean;
 }
@@ -69,6 +73,9 @@ async function httpGetWithRetry(url: string, retries: number = 2, timeout: numbe
   throw lastError;
 }
 
+/** Pre-compiled — this regex is hit for every inline source-map (common in HMR). */
+const DATA_URI_BASE64_RE = /^data:[^;]+;base64,(.+)$/;
+
 function resolveSourceMapUrl(scriptUrl: string, sourceMapUrl: string): string {
   if (sourceMapUrl.startsWith('http://') || sourceMapUrl.startsWith('https://')) {
     return sourceMapUrl;
@@ -78,6 +85,19 @@ function resolveSourceMapUrl(scriptUrl: string, sourceMapUrl: string): string {
   }
   const base = scriptUrl.substring(0, scriptUrl.lastIndexOf('/') + 1);
   return base + sourceMapUrl;
+}
+
+/**
+ * Strip Vite's versioning query params (`?v=<hash>`, `?t=<ts>`, `?import`) so
+ * that the same logical file across HMR cycles is recognized as the same URL.
+ * Without this, each HMR reload creates a distinct URL, leaving stale entries
+ * in scriptMetas, knownScriptUrls, and loadingPromises.
+ */
+export function normalizeViteUrl(url: string): string {
+  if (!url) return url;
+  if (url.startsWith('data:')) return url;
+  const qIdx = url.indexOf('?');
+  return qIdx >= 0 ? url.slice(0, qIdx) : url;
 }
 
 export class SourceMapResolver {
@@ -102,15 +122,21 @@ export class SourceMapResolver {
   /**
    * Track a script for lazy source map loading. Called immediately on scriptParsed.
    * Only stores metadata — does NOT fetch or parse the source map.
+   *
+   * URLs are normalized (Vite's ?v=/?t= cache-busters stripped) so HMR reloads
+   * of the same file are recognized and the old scriptId is cleaned up.
    */
   trackScript(scriptId: string, url: string, sourceMapUrl?: string): void {
     if (!sourceMapUrl || !url) return;
+    const normalizedUrl = normalizeViteUrl(url);
     const resolvedSmUrl = resolveSourceMapUrl(url, sourceMapUrl);
-    this.scriptMetas.set(scriptId, { scriptId, url, sourceMapUrl: resolvedSmUrl });
+    this.scriptMetas.set(scriptId, { scriptId, url: normalizedUrl, sourceMapUrl: resolvedSmUrl });
 
-    // Clean up old entry for same URL (HMR reload)
+    // Clean up old entry for same URL (HMR reload). Comparing normalized URLs
+    // so `/src/App.tsx?v=old` and `/src/App.tsx?v=new` are recognized as the
+    // same logical file.
     for (const [existingId, meta] of this.scriptMetas) {
-      if (meta.url === url && existingId !== scriptId) {
+      if (meta.url === normalizedUrl && existingId !== scriptId) {
         this.unregisterScript(existingId);
         this.scriptMetas.delete(existingId);
         break;
@@ -160,16 +186,19 @@ export class SourceMapResolver {
 
       this.registeredScriptCount++;
 
-      // Collect unique source names from mappings
+      // Single pass: collect unique source names AND build the reverse map
+      // (resolved-path → source-name) so findSourceName is O(1) later.
       const sourceNames = new Set<string>();
       consumer.eachMapping((mapping) => {
         if (mapping.source) sourceNames.add(mapping.source);
       });
 
       const sources: string[] = [];
+      const sourceNameByPath = new Map<string, string>();
       for (const sourceName of sourceNames) {
         const resolved = this.resolveSourcePath(sourceName, meta.url, sourceMapFileDir);
         sources.push(resolved);
+        sourceNameByPath.set(resolved, sourceName);
 
         if (!this.sourceToScripts.has(resolved)) {
           this.sourceToScripts.set(resolved, new Set());
@@ -179,7 +208,7 @@ export class SourceMapResolver {
 
       this.scripts.set(scriptId, {
         scriptId, url: meta.url, sourceMapUrl: meta.sourceMapUrl,
-        sources, sourceMapFile, loaded: true,
+        sources, sourceMapFile, sourceNameByPath, loaded: true,
       });
 
       // Clear from failed set if a retry succeeded
@@ -274,7 +303,8 @@ export class SourceMapResolver {
       const entry = this.scripts.get(scriptId);
       if (!entry) continue;
 
-      const sourceName = this.findSourceName(consumer, normalizedPath, entry.url, entry.sourceMapFile);
+      // Pre-computed at load time — O(1).
+      const sourceName = entry.sourceNameByPath.get(normalizedPath);
       if (!sourceName) continue;
 
       // Use allGeneratedPositionsFor to get ALL generated positions for this
@@ -539,7 +569,7 @@ export class SourceMapResolver {
     let rawMapStr: string;
 
     if (sourceMapUrl.startsWith('data:')) {
-      const match = sourceMapUrl.match(/^data:[^;]+;base64,(.+)$/);
+      const match = DATA_URI_BASE64_RE.exec(sourceMapUrl);
       if (!match) {
         logger.warn(`Invalid data URI source map for script ${scriptId}`);
         return { consumer: null, rawMap: {} as RawSourceMap };
@@ -626,25 +656,4 @@ export class SourceMapResolver {
     }
   }
 
-  private findSourceName(
-    consumer: SourceMapConsumer,
-    filePath: string,
-    scriptUrl: string,
-    sourceMapFile?: string,
-  ): string | null {
-    let match: string | null = null;
-    const seen = new Set<string>();
-    const sourceMapFileDir = sourceMapFile ? path.dirname(sourceMapFile) : undefined;
-
-    consumer.eachMapping((mapping) => {
-      if (match || !mapping.source || seen.has(mapping.source)) return;
-      seen.add(mapping.source);
-      const resolved = this.resolveSourcePath(mapping.source, scriptUrl, sourceMapFileDir);
-      if (resolved === filePath) {
-        match = mapping.source;
-      }
-    });
-
-    return match;
-  }
 }

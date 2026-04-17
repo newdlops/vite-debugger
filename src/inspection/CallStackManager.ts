@@ -1,8 +1,8 @@
-import * as fs from 'fs';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { CallFrame } from '../cdp/CdpTypes';
 import { SourceMapResolver } from '../sourcemap/SourceMapResolver';
 import { ViteUrlMapper } from '../vite/ViteUrlMapper';
+import { fileExistsCache } from '../util/FileExists';
 import { logger } from '../util/Logger';
 
 export interface ResolvedCallFrame {
@@ -17,7 +17,6 @@ export type SourceRefRegistrar = (scriptId: string) => number;
 export class CallStackManager {
   private frameIdCounter = 0;
   private frameMap = new Map<number, CallFrame>();
-  private fileExistsCache = new Map<string, boolean>();
 
   constructor(
     private sourceMapResolver: SourceMapResolver,
@@ -125,18 +124,7 @@ export class CallStackManager {
 
   /** Check if path exists as a regular file (not a directory) */
   private fileExists(filePath: string): boolean {
-    const cached = this.fileExistsCache.get(filePath);
-    if (cached !== undefined) return cached;
-
-    try {
-      const stat = fs.statSync(filePath);
-      const isFile = stat.isFile();
-      this.fileExistsCache.set(filePath, isFile);
-      return isFile;
-    } catch {
-      this.fileExistsCache.set(filePath, false);
-      return false;
-    }
+    return fileExistsCache.existsSync(filePath);
   }
 
   private isInternalFrame(url: string): boolean {

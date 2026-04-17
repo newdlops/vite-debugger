@@ -75,45 +75,43 @@ function getNodeListeningPorts(): Promise<number[]> {
   });
 }
 
-async function isViteServer(port: number): Promise<ViteServerInfo | null> {
-  const hosts = ['localhost', '127.0.0.1'];
+async function probeViteHost(baseUrl: string): Promise<ViteServerInfo | null> {
+  try {
+    // Primary check: /@vite/client endpoint — unique to Vite
+    const clientRes = await httpGet(`${baseUrl}/@vite/client`);
+    if (clientRes.status === 200) {
+      const contentType = clientRes.headers['content-type'] ?? '';
+      const isJs = contentType.includes('javascript') || contentType.includes('text/plain');
+      const bodyHasVite = clientRes.body.includes('vite') ||
+                          clientRes.body.includes('@vite') ||
+                          clientRes.body.includes('__vite');
 
-  for (const host of hosts) {
-    const baseUrl = `http://${host}:${port}`;
-
-    try {
-      // Primary check: /@vite/client endpoint — unique to Vite
-      const clientRes = await httpGet(`${baseUrl}/@vite/client`);
-      if (clientRes.status === 200) {
-        const contentType = clientRes.headers['content-type'] ?? '';
-        const isJs = contentType.includes('javascript') || contentType.includes('text/plain');
-        const bodyHasVite = clientRes.body.includes('vite') ||
-                            clientRes.body.includes('@vite') ||
-                            clientRes.body.includes('__vite');
-
-        if (isJs || bodyHasVite) {
-          logger.info(`Vite server detected at ${baseUrl} via /@vite/client`);
-          const versionMatch = clientRes.body.match(/vite\/dist\/client|vite\/([\d.]+)/i);
-          return { url: baseUrl, version: versionMatch?.[1] };
-        }
+      if (isJs || bodyHasVite) {
+        logger.info(`Vite server detected at ${baseUrl} via /@vite/client`);
+        const versionMatch = clientRes.body.match(/vite\/dist\/client|vite\/([\d.]+)/i);
+        return { url: baseUrl, version: versionMatch?.[1] };
       }
-    } catch {
-      continue;
     }
+  } catch { /* try fallback */ }
 
-    try {
-      // Fallback: check if the HTML page includes vite client script
-      const htmlRes = await httpGet(baseUrl);
-      if (htmlRes.status === 200 && htmlRes.body.includes('/@vite/client')) {
-        logger.info(`Vite server detected at ${baseUrl} via HTML content`);
-        return { url: baseUrl };
-      }
-    } catch {
-      // Not a Vite server on this host
+  try {
+    // Fallback: check if the HTML page includes vite client script
+    const htmlRes = await httpGet(baseUrl);
+    if (htmlRes.status === 200 && htmlRes.body.includes('/@vite/client')) {
+      logger.info(`Vite server detected at ${baseUrl} via HTML content`);
+      return { url: baseUrl };
     }
-  }
+  } catch { /* not a vite server on this host */ }
 
   return null;
+}
+
+async function isViteServer(port: number): Promise<ViteServerInfo | null> {
+  // Probe both hostnames in parallel — `localhost` and `127.0.0.1` resolve to
+  // the same socket on most setups, so one request should succeed fast.
+  const probes = ['localhost', '127.0.0.1'].map(h => probeViteHost(`http://${h}:${port}`));
+  const results = await Promise.all(probes);
+  return results.find(r => r !== null) ?? null;
 }
 
 export async function detectViteServers(preferredUrl?: string): Promise<ViteServerInfo[]> {
@@ -231,18 +229,20 @@ async function findEntryModulePath(viteUrl: string): Promise<string | undefined>
     logger.debug(`Failed to fetch HTML: ${e}`);
   }
 
-  // Fallback: try common Vite entry points
+  // Fallback: try common Vite entry points in parallel (was sequential with
+  // 2s timeout each — could wait up to 12s when the entry wasn't any of them).
   const commonEntries = ['/src/main.tsx', '/src/main.ts', '/src/index.tsx', '/src/index.ts', '/src/main.jsx', '/src/main.js'];
-  for (const entry of commonEntries) {
+  const results = await Promise.all(commonEntries.map(async (entry) => {
     try {
-      const res = await httpGet(`${viteUrl}${entry}`, 2000);
-      if (res.status === 200 && res.body.length > 0) {
-        logger.debug(`Vite entry point (fallback probe): ${entry}`);
-        return entry;
-      }
-    } catch {
-      // not this one
-    }
+      const res = await httpGet(`${viteUrl}${entry}`, 1500);
+      if (res.status === 200 && res.body.length > 0) return entry;
+    } catch { /* not this one */ }
+    return null;
+  }));
+  const hit = results.find(r => r !== null);
+  if (hit) {
+    logger.debug(`Vite entry point (fallback probe): ${hit}`);
+    return hit;
   }
 
   logger.debug('Could not find any Vite entry module');

@@ -2,11 +2,17 @@ import { CdpClient } from '../cdp/CdpClient';
 import { FetchRequestPausedEvent } from '../cdp/CdpTypes';
 import { logger } from '../util/Logger';
 
+function compileUrlPattern(pattern: string): RegExp {
+  return new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
+}
+
 interface NetworkBreakpointRule {
   id: number;
   name: string;
   type: 'fetch' | 'graphql' | 'xhr';
   pattern: string;
+  /** Pre-compiled URL regex for fetch/xhr rules (undefined for graphql) */
+  urlRegex?: RegExp;
   verified: boolean;
 }
 
@@ -52,13 +58,9 @@ export class NetworkBreakpointManager {
   private findMatchingRule(params: FetchRequestPausedEvent): NetworkBreakpointRule | null {
     for (const rule of this.rules) {
       if (rule.type === 'graphql') {
-        // Match GraphQL operation name from POST body
         if (this.matchGraphQL(params, rule.pattern)) return rule;
-      } else if (rule.type === 'fetch') {
-        // Match URL pattern (support * wildcard)
-        if (this.matchUrlPattern(params.request.url, rule.pattern)) return rule;
-      } else if (rule.type === 'xhr') {
-        if (this.matchUrlPattern(params.request.url, rule.pattern)) return rule;
+      } else if (rule.urlRegex && rule.urlRegex.test(params.request.url)) {
+        return rule;
       }
     }
     return null;
@@ -76,23 +78,18 @@ export class NetworkBreakpointManager {
     }
   }
 
-  private matchUrlPattern(url: string, pattern: string): boolean {
-    // Convert wildcard pattern to regex
-    const regex = new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
-    return regex.test(url);
-  }
-
   private parseBreakpointName(name: string, id: number): NetworkBreakpointRule | null {
     if (name.startsWith('graphql:')) {
       return { id, name, type: 'graphql', pattern: name.slice('graphql:'.length).trim(), verified: true };
     }
     if (name.startsWith('fetch:')) {
-      return { id, name, type: 'fetch', pattern: name.slice('fetch:'.length).trim(), verified: true };
+      const pattern = name.slice('fetch:'.length).trim();
+      return { id, name, type: 'fetch', pattern, urlRegex: compileUrlPattern(pattern), verified: true };
     }
     if (name.startsWith('xhr:')) {
-      return { id, name, type: 'xhr', pattern: name.slice('xhr:'.length).trim(), verified: true };
+      const pattern = name.slice('xhr:'.length).trim();
+      return { id, name, type: 'xhr', pattern, urlRegex: compileUrlPattern(pattern), verified: true };
     }
-    // Not a network breakpoint
     return null;
   }
 

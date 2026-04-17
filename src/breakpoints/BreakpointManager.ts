@@ -17,6 +17,7 @@ interface ManagedBreakpoint {
 
 export class BreakpointManager {
   private breakpoints = new Map<string, ManagedBreakpoint[]>();  // sourcePath -> breakpoints
+  private urlRegexCache = new Map<string, string>();  // sourcePath -> precomputed CDP urlRegex
   private nextDapId = 1;
 
   constructor(
@@ -133,52 +134,58 @@ export class BreakpointManager {
     this.breakpoints.delete(sourcePath);
   }
 
-  async resolveBreakpointsForScript(scriptId: string, url: string): Promise<ManagedBreakpoint[]> {
-    const resolved: ManagedBreakpoint[] = [];
+  async resolveBreakpointsForScript(scriptId: string, _url: string): Promise<ManagedBreakpoint[]> {
+    // Narrow the work to sources that actually belong to THIS script, avoiding
+    // the previous O(sources × bps) scan that re-ran `originalToGenerated`
+    // against every unrelated bp on every scriptParsed event.
+    const relevantSources = new Set(this.sourceMapResolver.getSourcesForScript(scriptId));
+    if (relevantSources.size === 0) return [];
 
+    const candidates: { sourcePath: string; bp: ManagedBreakpoint }[] = [];
     for (const [sourcePath, bps] of this.breakpoints) {
+      if (!relevantSources.has(sourcePath)) continue;
       for (const bp of bps) {
-        if (bp.verified) continue;  // Already resolved
-
-        const generated = await this.sourceMapResolver.originalToGenerated(
-          sourcePath, bp.line, bp.column ?? 0
-        );
-
-        if (generated && generated.scriptId === scriptId) {
-          try {
-            const condition = this.buildCdpCondition(bp);
-
-            const result = await this.cdp.setBreakpointByUrl(
-              generated.lineNumber,
-              {
-                urlRegex: this.buildUrlRegex(sourcePath),
-                columnNumber: generated.columnNumber,
-                condition,
-              }
-            );
-
-            bp.cdpBreakpointId = result.breakpointId;
-            bp.verified = true;
-            resolved.push(bp);
-
-            logger.info(
-              `Pending breakpoint resolved: ${sourcePath}:${bp.line} -> ${result.breakpointId}`
-            );
-          } catch (e) {
-            const msg = String(e);
-            if (msg.includes('already exists')) {
-              bp.verified = true;
-              resolved.push(bp);
-              logger.debug(`Pending breakpoint already exists: ${sourcePath}:${bp.line}`);
-            } else {
-              logger.warn(`Failed to resolve pending breakpoint: ${e}`);
-            }
-          }
-        }
+        if (!bp.verified) candidates.push({ sourcePath, bp });
       }
     }
+    if (candidates.length === 0) return [];
 
-    return resolved;
+    // Resolve + set breakpoints in parallel — each bp is independent at the
+    // CDP layer, so we can pipeline them instead of serializing awaits.
+    const results = await Promise.all(candidates.map(async ({ sourcePath, bp }) => {
+      const generated = await this.sourceMapResolver.originalToGenerated(
+        sourcePath, bp.line, bp.column ?? 0
+      );
+      if (!generated || generated.scriptId !== scriptId) return null;
+
+      try {
+        const result = await this.cdp.setBreakpointByUrl(
+          generated.lineNumber,
+          {
+            urlRegex: this.buildUrlRegex(sourcePath),
+            columnNumber: generated.columnNumber,
+            condition: this.buildCdpCondition(bp),
+          }
+        );
+        bp.cdpBreakpointId = result.breakpointId;
+        bp.verified = true;
+        logger.info(
+          `Pending breakpoint resolved: ${sourcePath}:${bp.line} -> ${result.breakpointId}`
+        );
+        return bp;
+      } catch (e) {
+        const msg = String(e);
+        if (msg.includes('already exists')) {
+          bp.verified = true;
+          logger.debug(`Pending breakpoint already exists: ${sourcePath}:${bp.line}`);
+          return bp;
+        }
+        logger.warn(`Failed to resolve pending breakpoint: ${e}`);
+        return null;
+      }
+    }));
+
+    return results.filter((bp): bp is ManagedBreakpoint => bp !== null);
   }
 
   /**
@@ -187,89 +194,75 @@ export class BreakpointManager {
    * skipping non-browser files (e.g., .py) that can never resolve to browser scripts.
    */
   async handleHmrReload(affectedSourcePaths: Set<string>): Promise<{ resolved: ManagedBreakpoint[]; unresolved: ManagedBreakpoint[] }> {
+    // Collect all bps affected by this HMR cycle so we can pipeline the
+    // remove/resolve/set per-bp — each step was previously a hard await that
+    // serialized ~3N CDP round-trips for N breakpoints.
+    const targets: { sourcePath: string; bp: ManagedBreakpoint }[] = [];
+    for (const [sourcePath, bps] of this.breakpoints) {
+      if (!affectedSourcePaths.has(sourcePath)) continue;
+      for (const bp of bps) targets.push({ sourcePath, bp });
+    }
+    if (targets.length === 0) return { resolved: [], unresolved: [] };
+
     const resolved: ManagedBreakpoint[] = [];
     const unresolved: ManagedBreakpoint[] = [];
 
-    for (const [sourcePath, bps] of this.breakpoints) {
-      // Only process breakpoints for sources affected by this HMR cycle
-      if (!affectedSourcePaths.has(sourcePath)) continue;
+    const perBp = targets.map(async ({ sourcePath, bp }) => {
+      // Old CDP breakpoint is stale after the script replaced — remove it.
+      if (bp.cdpBreakpointId) {
+        try { await this.cdp.removeBreakpoint(bp.cdpBreakpointId); }
+        catch (e) { logger.debug(`Failed to remove old breakpoint during HMR: ${e}`); }
+        bp.cdpBreakpointId = undefined;
+      }
 
-      for (const bp of bps) {
-        // Remove the old CDP breakpoint — its generated position is stale
-        if (bp.cdpBreakpointId) {
-          try {
-            await this.cdp.removeBreakpoint(bp.cdpBreakpointId);
-          } catch (e) {
-            logger.debug(`Failed to remove old breakpoint during HMR: ${e}`);
+      const generated = await this.sourceMapResolver.originalToGenerated(
+        sourcePath, bp.line, bp.column ?? 0
+      );
+      if (!generated) { bp.verified = false; unresolved.push(bp); return; }
+
+      try {
+        const refined = await this.refineBreakpointPosition(generated, sourcePath);
+        const targetLine = refined?.lineNumber ?? generated.lineNumber;
+        const targetColumn = refined?.columnNumber ?? generated.columnNumber;
+
+        const result = await this.cdp.setBreakpointByUrl(
+          targetLine,
+          {
+            urlRegex: this.buildUrlRegex(sourcePath),
+            columnNumber: targetColumn,
+            condition: this.buildCdpCondition(bp),
           }
-          bp.cdpBreakpointId = undefined;
-        }
-
-        // Resolve the new generated position from the updated source map
-        const generated = await this.sourceMapResolver.originalToGenerated(
-          sourcePath, bp.line, bp.column ?? 0
         );
 
-        if (!generated) {
+        bp.cdpBreakpointId = result.breakpointId;
+        bp.verified = true;
+
+        if (result.locations.length > 0) {
+          const actualLoc = result.locations[0];
+          const actualOriginal = await this.sourceMapResolver.generatedToOriginal(
+            actualLoc.scriptId, actualLoc.lineNumber, actualLoc.columnNumber
+          );
+          if (actualOriginal) bp.line = actualOriginal.line;
+        }
+
+        resolved.push(bp);
+        logger.debug(
+          `Breakpoint re-set after HMR: ${sourcePath}:${bp.line} -> ` +
+          `CDP ${result.breakpointId} at generated ${targetLine}:${targetColumn}`
+        );
+      } catch (e) {
+        if (String(e).includes('already exists')) {
+          bp.verified = true;
+          resolved.push(bp);
+        } else {
           bp.verified = false;
           unresolved.push(bp);
-          continue;
-        }
-
-        try {
-          // Refine position using getPossibleBreakpoints
-          const refined = await this.refineBreakpointPosition(generated, sourcePath);
-          const targetLine = refined?.lineNumber ?? generated.lineNumber;
-          const targetColumn = refined?.columnNumber ?? generated.columnNumber;
-
-          const condition = this.buildCdpCondition(bp);
-
-          const result = await this.cdp.setBreakpointByUrl(
-            targetLine,
-            {
-              urlRegex: this.buildUrlRegex(sourcePath),
-              columnNumber: targetColumn,
-              condition,
-            }
-          );
-
-          bp.cdpBreakpointId = result.breakpointId;
-          bp.verified = true;
-
-          // Map the actual CDP location back to original source
-          // to report the correct line to VS Code
-          if (result.locations.length > 0) {
-            const actualLoc = result.locations[0];
-            const actualOriginal = await this.sourceMapResolver.generatedToOriginal(
-              actualLoc.scriptId, actualLoc.lineNumber, actualLoc.columnNumber
-            );
-            if (actualOriginal) {
-              bp.line = actualOriginal.line;
-            }
-          }
-
-          resolved.push(bp);
-
-          logger.debug(
-            `Breakpoint re-set after HMR: ${sourcePath}:${bp.line} -> ` +
-            `CDP ${result.breakpointId} at generated ${targetLine}:${targetColumn}`
-          );
-        } catch (e) {
-          const msg = String(e);
-          if (msg.includes('already exists')) {
-            // CDP already has this breakpoint (URL regex matched the new script automatically).
-            // Keep it verified without redundant logging.
-            bp.verified = true;
-            resolved.push(bp);
-          } else {
-            bp.verified = false;
-            unresolved.push(bp);
-            logger.warn(`Failed to re-set breakpoint after HMR: ${e}`);
-          }
+          logger.warn(`Failed to re-set breakpoint after HMR: ${e}`);
         }
       }
-    }
+    });
 
+    await Promise.all(perBp);
     return { resolved, unresolved };
   }
 
@@ -286,6 +279,7 @@ export class BreakpointManager {
 
   clear(): void {
     this.breakpoints.clear();
+    this.urlRegexCache.clear();
   }
 
   /**
@@ -385,25 +379,26 @@ export class BreakpointManager {
   }
 
   private buildUrlRegex(sourcePath: string): string {
+    const cached = this.urlRegexCache.get(sourcePath);
+    if (cached !== undefined) return cached;
+
     // Build a URL regex that matches the Vite-served version of this file
     // e.g., /src/App.tsx -> matches http://localhost:5173/src/App.tsx
     const normalizedPath = sourcePath.replace(/\\/g, '/');
+    const port = new URL(this.viteUrl).port;
 
-    // Try to extract the relative path from webRoot
-    // The regex should match both localhost and 127.0.0.1
-    const viteUrlObj = new URL(this.viteUrl);
-    const port = viteUrlObj.port;
-
-    // Extract relative part after common prefixes
+    let regex: string;
     const srcIndex = normalizedPath.lastIndexOf('/src/');
     if (srcIndex !== -1) {
       const relative = normalizedPath.slice(srcIndex);
-      return `https?://(?:localhost|127\\.0\\.0\\.1):${port}${escapeRegex(relative)}`;
+      regex = `https?://(?:localhost|127\\.0\\.0\\.1):${port}${escapeRegex(relative)}`;
+    } else {
+      const basename = normalizedPath.split('/').pop() ?? '';
+      regex = `https?://(?:localhost|127\\.0\\.0\\.1):${port}/.*${escapeRegex(basename)}`;
     }
 
-    // Fallback: use the filename
-    const basename = normalizedPath.split('/').pop() ?? '';
-    return `https?://(?:localhost|127\\.0\\.0\\.1):${port}/.*${escapeRegex(basename)}`;
+    this.urlRegexCache.set(sourcePath, regex);
+    return regex;
   }
 }
 

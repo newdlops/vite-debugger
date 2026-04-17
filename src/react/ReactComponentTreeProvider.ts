@@ -28,7 +28,15 @@ interface EvalResult {
   message?: string;
 }
 
-export type Evaluator = (expression: string) => Promise<unknown>;
+/**
+ * Evaluate an expression in the page and return its value. When `cacheKey` is
+ * provided, the session-side handler may compile the expression once (keyed by
+ * `cacheKey`) and reuse the compiled script on subsequent calls — avoiding
+ * repeated parse+compile of the same large walker expression.
+ */
+export type Evaluator = (expression: string, cacheKey?: string) => Promise<unknown>;
+
+const WALKER_CACHE_KEY = 'reactComponentTree';
 
 /**
  * Expression evaluated inside the page. Must be self-contained and return a
@@ -255,6 +263,7 @@ export class ReactComponentTreeProvider implements vscode.TreeDataProvider<React
   readonly onDidChangeStatus = this._onDidChangeStatus.event;
 
   private roots: ReactComponentNode[] = [];
+  private nameIndex = new Map<string, ReactComponentNode>();
   private evaluator: Evaluator | null = null;
   private statusMessage: string | null = 'Start a Vite debug session to inspect components.';
   private refreshInFlight = false;
@@ -288,7 +297,7 @@ export class ReactComponentTreeProvider implements vscode.TreeDataProvider<React
 
     this.refreshInFlight = true;
     try {
-      const raw = await this.evaluator(PAGE_EXPRESSION);
+      const raw = await this.evaluator(PAGE_EXPRESSION, WALKER_CACHE_KEY);
       const result = raw as EvalResult | null | undefined;
 
       if (!result || typeof result !== 'object') {
@@ -302,6 +311,7 @@ export class ReactComponentTreeProvider implements vscode.TreeDataProvider<React
         this.setStatus(`React inspection failed: ${result.message ?? 'unknown error'}`);
       } else if (Array.isArray(result.roots)) {
         this.roots = result.roots;
+        this.rebuildNameIndex();
         this.setStatus(result.roots.length === 0 ? 'React mounted but no components rendered yet.' : null);
       } else {
         this.roots = [];
@@ -319,9 +329,24 @@ export class ReactComponentTreeProvider implements vscode.TreeDataProvider<React
 
   clear(): void {
     this.roots = [];
+    this.nameIndex.clear();
     this.evaluator = null;
     this.setStatus('Start a Vite debug session to inspect components.');
     this._onDidChangeTreeData.fire(undefined);
+  }
+
+  /** Build a flat name→first-node map so findComponent is O(1). */
+  private rebuildNameIndex(): void {
+    this.nameIndex.clear();
+    const visit = (nodes: ReactComponentNode[]): void => {
+      for (const node of nodes) {
+        if (!this.nameIndex.has(node.name)) {
+          this.nameIndex.set(node.name, node);
+        }
+        if (node.children.length > 0) visit(node.children);
+      }
+    };
+    visit(this.roots);
   }
 
   getTreeItem(element: ReactComponentNode): vscode.TreeItem {
@@ -361,15 +386,7 @@ export class ReactComponentTreeProvider implements vscode.TreeDataProvider<React
   }
 
   findComponent(name: string): ReactComponentNode | undefined {
-    const search = (nodes: ReactComponentNode[]): ReactComponentNode | undefined => {
-      for (const node of nodes) {
-        if (node.name === name) return node;
-        const found = search(node.children);
-        if (found) return found;
-      }
-      return undefined;
-    };
-    return search(this.roots);
+    return this.nameIndex.get(name);
   }
 }
 

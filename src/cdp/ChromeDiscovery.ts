@@ -172,24 +172,23 @@ function parseChromeProcessLines(stdout: string): ChromeProcessInfo[] {
 export async function findExistingChromeDebugPort(): Promise<number | null> {
   const processes = await detectChromeProcesses();
 
-  // First check processes that explicitly have --remote-debugging-port
+  // Probe every candidate port in parallel (was sequential, adding up to 3s
+  // of HTTP timeouts per failed port before we got to the answer).
+  const candidatePorts = new Set<number>([9222, 9223, 9224, 9225]);
   for (const proc of processes) {
-    if (proc.debugPort) {
-      const targets = await listChromeTargets(proc.debugPort);
-      if (targets.length > 0) {
-        logger.info(`Found Chrome (PID ${proc.pid}) with debug port ${proc.debugPort}`);
-        return proc.debugPort;
-      }
-    }
+    if (proc.debugPort) candidatePorts.add(proc.debugPort);
   }
 
-  // Also probe common ports in case we missed it from process args
-  for (const port of [9222, 9223, 9224, 9225]) {
-    const targets = await listChromeTargets(port);
-    if (targets.length > 0) {
-      logger.info(`Found Chrome debug port ${port} via probe`);
-      return port;
-    }
+  const results = await Promise.all(
+    [...candidatePorts].map(async (port) => {
+      const targets = await listChromeTargets(port);
+      return targets.length > 0 ? port : null;
+    })
+  );
+  const found = results.find((p): p is number => p !== null);
+  if (found !== undefined) {
+    logger.info(`Found Chrome debug port ${found}`);
+    return found;
   }
 
   return null;
@@ -267,8 +266,12 @@ export async function launchDebugChrome(
   });
   proc.unref();
 
-  // Wait for debug port to be ready
-  for (let i = 0; i < 40; i++) {
+  // Wait for debug port to be ready. Exponential backoff up to ~15s total —
+  // catches fast starts (~300ms on warm disk) without burning CPU on long
+  // polls, and fails faster than the old fixed 500ms × 40 probe.
+  const deadline = Date.now() + 15_000;
+  let delay = 100;
+  while (Date.now() < deadline) {
     try {
       const targets = await listChromeTargets(port);
       if (targets.length > 0) {
@@ -278,10 +281,11 @@ export async function launchDebugChrome(
     } catch {
       // Not ready yet
     }
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, delay));
+    delay = Math.min(delay * 2, 1000);
   }
 
-  throw new Error(`Debug Chrome did not start on port ${port} within 20s`);
+  throw new Error(`Debug Chrome did not start on port ${port} within 15s`);
 }
 
 /**

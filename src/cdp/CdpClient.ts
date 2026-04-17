@@ -174,6 +174,26 @@ export class CdpClient extends EventEmitter {
     return result.result;
   }
 
+  /**
+   * Evaluate an expression in the paused frame's scope and return its value
+   * by value. Unlike `Runtime.evaluate` with `awaitPromise: true`, this
+   * cannot hang while the debugger is paused — `Debugger.evaluateOnCallFrame`
+   * doesn't wait on promises.
+   */
+  async evaluateOnCallFrameForValue<T = unknown>(callFrameId: string, expression: string): Promise<T | undefined> {
+    const result = await this.client!.Debugger.evaluateOnCallFrame({
+      callFrameId,
+      expression,
+      silent: true,
+      returnByValue: true,
+      generatePreview: false,
+    });
+    if (result.exceptionDetails) {
+      throw new Error(result.exceptionDetails.text || 'Evaluation failed');
+    }
+    return result.result?.value as T | undefined;
+  }
+
   async setBlackboxPatterns(patterns: string[]): Promise<void> {
     await this.client!.Debugger.setBlackboxPatterns({ patterns });
   }
@@ -257,6 +277,38 @@ export class CdpClient extends EventEmitter {
         || result.exceptionDetails.exception?.description
         || 'Evaluation failed';
       throw new Error(text);
+    }
+    return result.result?.value as T | undefined;
+  }
+
+  /**
+   * Persistently compile an expression in the page and return its scriptId.
+   * Subsequent `runCompiledScript` calls reuse the compiled form, avoiding
+   * repeated parse+compile of the same expression (e.g. the React walker).
+   * V8 invalidates the scriptId if the page navigates; call sites must catch
+   * errors and re-compile as a fallback.
+   */
+  async compileScript(expression: string): Promise<string> {
+    const result = await this.client!.Runtime.compileScript({
+      expression,
+      sourceURL: '',
+      persistScript: true,
+    });
+    if (result.exceptionDetails) {
+      throw new Error(result.exceptionDetails.text || 'compileScript failed');
+    }
+    return result.scriptId;
+  }
+
+  async runCompiledScript<T = unknown>(scriptId: string): Promise<T | undefined> {
+    const result = await this.client!.Runtime.runScript({
+      scriptId,
+      returnByValue: true,
+      awaitPromise: true,
+      silent: true,
+    });
+    if (result.exceptionDetails) {
+      throw new Error(result.exceptionDetails.text || 'runScript failed');
     }
     return result.result?.value as T | undefined;
   }

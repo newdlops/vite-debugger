@@ -21,7 +21,8 @@ import {
 } from '../cdp/ChromeDiscovery';
 import { detectFirstViteServer, ViteServerInfo } from '../vite/ViteServerDetector';
 import { ViteUrlMapper } from '../vite/ViteUrlMapper';
-import { SourceMapResolver } from '../sourcemap/SourceMapResolver';
+import { SourceMapResolver, normalizeViteUrl } from '../sourcemap/SourceMapResolver';
+import { fileExistsCache } from '../util/FileExists';
 import { BreakpointManager } from '../breakpoints/BreakpointManager';
 import { CallStackManager, ResolvedCallFrame, SourceRefRegistrar } from '../inspection/CallStackManager';
 import { ScopeManager } from '../inspection/ScopeManager';
@@ -32,6 +33,21 @@ import { logger } from '../util/Logger';
 const THREAD_ID = 1;
 const REACT_SCOPE_REF_BASE = 900000;
 const REACT_HOOKS_REF_BASE = 910000;
+
+/**
+ * Compile a glob pattern (*, **, ?) to a RegExp. Called once per pattern at
+ * launch/attach time — cached on the session so hot paths never re-compile.
+ */
+function compileGlob(pattern: string): RegExp {
+  const regexStr = pattern
+    .replace(/\\/g, '/')
+    .replace(/[.+^${}()|[\]]/g, '\\$&')
+    .replace(/\*\*/g, '\u0000')
+    .replace(/\*/g, '[^/]*')
+    .replace(/\u0000/g, '.*')
+    .replace(/\?/g, '[^/]');
+  return new RegExp(regexStr);
+}
 
 interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
   viteUrl?: string;
@@ -71,20 +87,22 @@ export class ViteDebugSession extends LoggingDebugSession {
   private reactComponentObjectId: string | null = null;
   private reactHooksObjectId: string | null = null;
   private smartStepCount = 0;
-  private lastLoggedScriptCount = 0;
   private static readonly MAX_SMART_STEPS = 20;
   private lastStepAction: 'stepOver' | 'stepInto' | 'stepOut' | null = null;
   private stepInTargetLocations = new Map<number, BreakLocation>();
   private tempBreakpointId: string | null = null;
   private sourceMapRetryTimer: NodeJS.Timeout | null = null;
-  /** Glob patterns for files the user wants to skip during stepping */
-  private skipFilePatterns: string[] = [];
+  /** Precompiled regexes for user-configured skipFiles globs */
+  private skipFileRegexes: RegExp[] = [];
   /** Pending HMR script IDs to batch-process */
   private pendingHmrScriptIds: string[] = [];
   private hmrBatchTimer: NodeJS.Timeout | null = null;
   /** Scripts we've permanently blackboxed at the CDP level because they have
    *  no source map and no local counterpart. Step-through skips them entirely. */
   private unmappableScripts = new Set<string>();
+  /** cacheKey → persistent scriptId produced by Runtime.compileScript. Lets
+   *  the React tree walker (~6 KB expression) be parsed once and reused. */
+  private compiledScripts = new Map<string, string>();
 
   constructor() {
     super('vite-debugger.log');
@@ -134,7 +152,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     try {
       const webRoot = args.webRoot || process.cwd();
       const chromePort = args.chromePort || 9222;
-      this.skipFilePatterns = args.skipFiles ?? [];
+      this.skipFileRegexes = (args.skipFiles ?? []).map(compileGlob);
 
       // Step 1: Detect Vite server
       this.viteServer = await detectFirstViteServer(args.viteUrl);
@@ -166,7 +184,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     try {
       const webRoot = args.webRoot || process.cwd();
       const chromePort = args.chromePort || 9222;
-      this.skipFilePatterns = args.skipFiles ?? [];
+      this.skipFileRegexes = (args.skipFiles ?? []).map(compileGlob);
 
       // Detect Vite server
       this.viteServer = await detectFirstViteServer(args.viteUrl);
@@ -401,6 +419,12 @@ export class ViteDebugSession extends LoggingDebugSession {
       .slice(startFrame, startFrame + maxFrames)
       .map(f => f.dapFrame);
 
+    logger.debug(
+      `stackTraceRequest: start=${startFrame} levels=${args.levels ?? 'all'} ` +
+      `returning=${frames.length}/${this.resolvedFrames.length} ` +
+      `top=${frames[0] ? `${frames[0].source?.path ?? frames[0].source?.name ?? '?'}:${frames[0].line}` : 'none'}`
+    );
+
     response.body = {
       stackFrames: frames,
       totalFrames: this.resolvedFrames.length,
@@ -567,40 +591,39 @@ export class ViteDebugSession extends LoggingDebugSession {
       // Filter to 'call' type locations (function call sites)
       const callLocations = locations.filter(loc => loc.type === 'call');
 
-      const targets: DebugProtocol.StepInTarget[] = [];
-      let targetId = 1;
-
-      // Clear previous step-in target locations
       this.stepInTargetLocations.clear();
-
       const locsToUse = callLocations.length > 0 ? callLocations : locations;
 
-      for (const loc of locsToUse) {
-        // Try to resolve to original source position
-        const original = await this.sourceMapResolver.generatedToOriginal(
-          scriptId, loc.lineNumber, loc.columnNumber ?? 0
-        );
+      // Resolve all original positions in parallel — each lookup is independent
+      // but the old loop awaited them in series.
+      const originals = await Promise.all(locsToUse.map((loc) =>
+        this.sourceMapResolver!.generatedToOriginal(scriptId, loc.lineNumber, loc.columnNumber ?? 0)
+      ));
+
+      const targets: DebugProtocol.StepInTarget[] = locsToUse.map((loc, idx) => {
+        const original = originals[idx];
+        const targetId = idx + 1;
+        this.stepInTargetLocations.set(targetId, loc);
 
         let label: string;
         if (original) {
+          const name = original.source.split('/').pop();
           label = callLocations.length > 0
-            ? `Call at ${original.source.split('/').pop()}:${original.line}:${original.column + 1}`
-            : `${original.source.split('/').pop()}:${original.line}:${original.column + 1}`;
+            ? `Call at ${name}:${original.line}:${original.column + 1}`
+            : `${name}:${original.line}:${original.column + 1}`;
         } else {
           label = callLocations.length > 0
             ? `Call at line ${loc.lineNumber + 1}:${(loc.columnNumber ?? 0) + 1}`
             : `line ${loc.lineNumber + 1}:${(loc.columnNumber ?? 0) + 1}`;
         }
 
-        this.stepInTargetLocations.set(targetId, loc);
-
-        targets.push({
-          id: targetId++,
+        return {
+          id: targetId,
           label,
           line: original?.line,
           column: original ? original.column + 1 : undefined,
-        });
-      }
+        };
+      });
 
       response.body = { targets };
     } catch (e) {
@@ -682,8 +705,8 @@ export class ViteDebugSession extends LoggingDebugSession {
         const primarySource = this.sourceMapResolver.getPrimarySourceForScript(scriptId);
         if (primarySource) {
           try {
-            const fs = require('fs');
-            const content = fs.readFileSync(primarySource, 'utf-8');
+            const fs = await import('fs');
+            const content = await fs.promises.readFile(primarySource, 'utf-8');
             response.body = {
               content,
               mimeType: primarySource.endsWith('.tsx') || primarySource.endsWith('.ts')
@@ -712,45 +735,32 @@ export class ViteDebugSession extends LoggingDebugSession {
 
   // --- Loaded Sources ---
 
-  protected loadedSourcesRequest(
+  protected async loadedSourcesRequest(
     response: DebugProtocol.LoadedSourcesResponse,
     _args: DebugProtocol.LoadedSourcesArguments
-  ): void {
-    const sources: DebugProtocol.Source[] = [];
+  ): Promise<void> {
+    // Resolve every script's file existence in parallel — was O(N) sync stats
+    // inside a for-loop that blocked the event loop on large projects.
+    const entries = [...this.knownScriptUrls]
+      .filter(([url]) => !(url.includes('/@vite/') || url.includes('/@react-refresh') || url.includes('__vite_')));
 
-    for (const [url, scriptId] of this.knownScriptUrls) {
-      // Skip internal Vite URLs
-      if (url.includes('/@vite/') || url.includes('/@react-refresh') || url.includes('__vite_')) continue;
-
+    const sources: DebugProtocol.Source[] = await Promise.all(entries.map(async ([url, scriptId]) => {
       const filePath = this.urlMapper?.viteUrlToFilePath(url);
-      const name = url.split('/').pop() ?? url;
+      const source: DebugProtocol.Source = { name: url.split('/').pop() ?? url };
 
-      const source: DebugProtocol.Source = { name };
-
-      // Check if file exists on disk
-      if (filePath) {
-        try {
-          const stat = require('fs').statSync(filePath);
-          if (stat.isFile()) {
-            source.path = filePath;
-          }
-        } catch {}
-      }
-
-      // If not on disk, provide sourceReference
-      if (!source.path) {
+      if (filePath && await fileExistsCache.existsAsync(filePath)) {
+        source.path = filePath;
+      } else {
         const ref = this.nextSourceRef++;
         this.sourceRefToScriptId.set(ref, scriptId);
         source.sourceReference = ref;
       }
 
-      // Deemphasize node_modules
       if (url.includes('/node_modules/')) {
         source.presentationHint = 'deemphasize';
       }
-
-      sources.push(source);
-    }
+      return source;
+    }));
 
     response.body = { sources };
     this.sendResponse(response);
@@ -776,7 +786,7 @@ export class ViteDebugSession extends LoggingDebugSession {
   protected async customRequest(
     command: string,
     response: DebugProtocol.Response,
-    args: { expression?: string } | undefined,
+    args: { expression?: string; cacheKey?: string } | undefined,
   ): Promise<void> {
     if (command === 'viteDebugger.evalForValue') {
       if (!this.cdp) {
@@ -793,7 +803,9 @@ export class ViteDebugSession extends LoggingDebugSession {
         return;
       }
       try {
-        const value = await this.cdp.evaluateForValue(expression);
+        const value = args?.cacheKey
+          ? await this.runCompiledOrEval(args.cacheKey, expression)
+          : await this.cdp.evaluateForValue(expression);
         response.body = { value };
         this.sendResponse(response);
       } catch (e) {
@@ -806,16 +818,47 @@ export class ViteDebugSession extends LoggingDebugSession {
     super.customRequest(command, response, args as never);
   }
 
+  /**
+   * Run a cached compiled script if we have one; otherwise compile (once) and
+   * run. Falls back to Runtime.evaluate if persistent compilation isn't
+   * available (older Chrome) or the cached scriptId got invalidated by a page
+   * navigation — on the next call we'll recompile.
+   */
+  private async runCompiledOrEval(cacheKey: string, expression: string): Promise<unknown> {
+    if (!this.cdp) throw new Error('Not connected');
+    const cached = this.compiledScripts.get(cacheKey);
+    if (cached) {
+      try {
+        return await this.cdp.runCompiledScript(cached);
+      } catch {
+        this.compiledScripts.delete(cacheKey);
+      }
+    }
+    try {
+      const scriptId = await this.cdp.compileScript(expression);
+      this.compiledScripts.set(cacheKey, scriptId);
+      return await this.cdp.runCompiledScript(scriptId);
+    } catch {
+      // compileScript / runScript not available — fall back to plain evaluate.
+      return this.cdp.evaluateForValue(expression);
+    }
+  }
+
   // --- CDP Event Handlers ---
 
   private async onScriptParsed(params: ScriptParsedEvent): Promise<void> {
     if (!params.url || !params.sourceMapURL) return;
 
-    // Track URL <-> scriptId mappings
-    const previousScriptId = this.knownScriptUrls.get(params.url);
+    // Normalize for HMR detection — Vite's ?v=/?t= change on every reload.
+    const normalizedUrl = normalizeViteUrl(params.url);
+    const previousScriptId = this.knownScriptUrls.get(normalizedUrl);
     const isHmrReload = previousScriptId !== undefined && previousScriptId !== params.scriptId;
-    this.knownScriptUrls.set(params.url, params.scriptId);
-    this.scriptIdToUrl.set(params.scriptId, params.url);
+    this.knownScriptUrls.set(normalizedUrl, params.scriptId);
+    this.scriptIdToUrl.set(params.scriptId, normalizedUrl);
+    if (isHmrReload && previousScriptId) {
+      this.scriptIdToUrl.delete(previousScriptId);
+      this.unmappableScripts.delete(previousScriptId);
+    }
 
     // Register source map: track metadata immediately, then load eagerly.
     // ensureSourceMap populates sourceToScripts which is needed for breakpoint resolution.
@@ -864,15 +907,9 @@ export class ViteDebugSession extends LoggingDebugSession {
     // Notify VSCode's Loaded Sources panel
     const loadedSource: DebugProtocol.Source = { name: params.url.split('/').pop() ?? params.url };
     const filePath = this.urlMapper?.viteUrlToFilePath(params.url);
-    if (filePath) {
-      try {
-        const stat = require('fs').statSync(filePath);
-        if (stat.isFile()) {
-          loadedSource.path = filePath;
-        }
-      } catch {}
-    }
-    if (!loadedSource.path) {
+    if (filePath && await fileExistsCache.existsAsync(filePath)) {
+      loadedSource.path = filePath;
+    } else {
       const ref = this.nextSourceRef++;
       this.sourceRefToScriptId.set(ref, params.scriptId);
       loadedSource.sourceReference = ref;
@@ -923,6 +960,9 @@ export class ViteDebugSession extends LoggingDebugSession {
   }
 
   private async onPaused(params: PausedEvent): Promise<void> {
+    const pauseTopScriptId = params.callFrames[0]?.location.scriptId ?? '?';
+    logger.debug(`onPaused entered: reason=${params.reason} frames=${params.callFrames.length} topScript=${pauseTopScriptId} hitBps=${params.hitBreakpoints?.length ?? 0}`);
+
     // Clean up any temporary breakpoint from stepInTargets
     if (this.tempBreakpointId && this.cdp) {
       try { await this.cdp.removeBreakpoint(this.tempBreakpointId); } catch {}
@@ -943,7 +983,9 @@ export class ViteDebugSession extends LoggingDebugSession {
     // wait briefly so the user sees the resolved original position (not a
     // minified line/column). If the script has no map and isn't synced to
     // disk, blackbox it so subsequent stepping skips through.
+    logger.debug('onPaused: awaiting ensureTopFrameSourceMap');
     await this.ensureTopFrameSourceMap(params);
+    logger.debug('onPaused: ensureTopFrameSourceMap done');
 
     if (!isException && !isManualPause && this.cdp && this.sourceMapResolver) {
       const shouldSkip = await this.shouldSmartStep(params, isExplicitBreakpoint);
@@ -960,8 +1002,13 @@ export class ViteDebugSession extends LoggingDebugSession {
           return;
         }
 
-        const topLoc = params.callFrames[0]?.location;
-        logger.debug(`Smart step #${this.smartStepCount}: skipping injected code (script ${topLoc?.scriptId}, line ${(topLoc?.lineNumber ?? 0) + 1})`);
+        // Log only at boundaries — 1st step, every 5th, and the bailout handled
+        // above. Previously logged every iteration, which spammed the output
+        // channel during React internal loops.
+        if (this.smartStepCount === 1 || this.smartStepCount % 5 === 0) {
+          const topLoc = params.callFrames[0]?.location;
+          logger.debug(`Smart step #${this.smartStepCount}: skipping injected code (script ${topLoc?.scriptId}, line ${(topLoc?.lineNumber ?? 0) + 1})`);
+        }
         await this.cdp.stepOver();
         return;
       }
@@ -984,13 +1031,30 @@ export class ViteDebugSession extends LoggingDebugSession {
 
     // Resolve call frames
     if (this.callStackManager) {
-      this.resolvedFrames = await this.callStackManager.resolveCallFrames(
-        params.callFrames, registerSourceRef
-      );
+      logger.debug(`onPaused: awaiting resolveCallFrames (${params.callFrames.length} frames)`);
+      const rcfStart = Date.now();
+      try {
+        this.resolvedFrames = await this.callStackManager.resolveCallFrames(
+          params.callFrames, registerSourceRef
+        );
+        logger.debug(`onPaused: resolveCallFrames done in ${Date.now() - rcfStart}ms (${this.resolvedFrames.length} resolved)`);
+      } catch (e) {
+        logger.warn(`resolveCallFrames failed after ${Date.now() - rcfStart}ms, stopping with empty stack: ${e}`);
+        this.resolvedFrames = [];
+      }
 
-      // Enhance top frame with React component info
+      // Enhance top frame with React component info. Bounded — Runtime.evaluate
+      // can hang while the debugger is paused (awaitPromise + microtask
+      // starvation), and React info is a nice-to-have. A stall here must not
+      // block StoppedEvent or VS Code's debug UI will never activate.
       if (this.resolvedFrames.length > 0 && this.cdp) {
-        await this.detectReactComponent(params.callFrames[0]);
+        const drcStart = Date.now();
+        try {
+          await this.withTimeout(this.detectReactComponent(params.callFrames[0]), 800);
+          logger.debug(`onPaused: detectReactComponent done in ${Date.now() - drcStart}ms`);
+        } catch (e) {
+          logger.warn(`detectReactComponent skipped after ${Date.now() - drcStart}ms: ${e}`);
+        }
       }
     }
 
@@ -1012,6 +1076,11 @@ export class ViteDebugSession extends LoggingDebugSession {
         reason = 'step';
     }
 
+    const top = this.resolvedFrames[0]?.dapFrame;
+    logger.debug(
+      `Sending StoppedEvent: reason=${reason} threadId=${THREAD_ID} frames=${this.resolvedFrames.length} ` +
+      `top=${top ? `${top.source?.path ?? top.source?.name ?? '?'}:${top.line}` : 'none'}`
+    );
     this.sendEvent(new StoppedEvent(reason, THREAD_ID));
   }
 
@@ -1101,12 +1170,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     // Pre-bundled / third-party artifact — unreadable without a source map.
     if (local.includes('/node_modules/')) return true;
 
-    try {
-      const fs = require('fs');
-      return !fs.statSync(local).isFile();
-    } catch {
-      return true;
-    }
+    return !fileExistsCache.existsSync(local);
   }
 
   /**
@@ -1190,38 +1254,26 @@ export class ViteDebugSession extends LoggingDebugSession {
 
   /**
    * Check if a source file path matches any of the user-configured skipFiles patterns.
-   * Supports glob-like patterns: "*" matches any segment, "**" matches multiple segments.
+   * Patterns are precompiled to regex in launch/attachRequest via compileGlob().
    */
   private shouldSkipFile(filePath: string): boolean {
-    if (this.skipFilePatterns.length === 0) return false;
-
+    if (this.skipFileRegexes.length === 0) return false;
     const normalized = filePath.replace(/\\/g, '/');
-    for (const pattern of this.skipFilePatterns) {
-      if (this.globMatch(normalized, pattern)) return true;
+    for (const re of this.skipFileRegexes) {
+      if (re.test(normalized)) return true;
     }
     return false;
-  }
-
-  private globMatch(filePath: string, pattern: string): boolean {
-    // Simple glob matching: convert glob to regex
-    // Support: *, **, ?
-    const regexStr = pattern
-      .replace(/\\/g, '/')
-      .replace(/[.+^${}()|[\]]/g, '\\$&')  // Escape regex special chars (except * and ?)
-      .replace(/\*\*/g, '\u0000')            // Placeholder for **
-      .replace(/\*/g, '[^/]*')               // * matches within a segment
-      .replace(/\u0000/g, '.*')              // ** matches across segments
-      .replace(/\?/g, '[^/]');               // ? matches single char
-
-    return new RegExp(regexStr).test(filePath);
   }
 
 
   /**
    * Detect React component info when paused.
-   * For function components: look at the call stack for React render frames,
-   * then evaluate to get the component's props/state.
-   * For class components: check `this.props` and `this.state`.
+   *
+   * A naive implementation runs three strategies (class → fiber → funcName)
+   * sequentially, each doing an `evaluateOnCallFrame`, then more calls to
+   * fetch props/hooks — 3-5 round-trips per pause. We collapse the detection
+   * into ONE evaluate that reports which strategy won, then fetch props and
+   * hooks in parallel. Worst case: 1 detect + 2 parallel fetches ≈ 2 RTTs.
    */
   private async detectReactComponent(topFrame: import('../cdp/CdpTypes').CallFrame): Promise<void> {
     this.reactComponentName = null;
@@ -1229,129 +1281,89 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.reactHooksObjectId = null;
 
     if (!this.cdp) return;
+    const cdp = this.cdp;
 
     try {
-      // Strategy 1: Class component — check if `this` has props/state
-      const classResult = await this.cdp.evaluateOnCallFrame(
+      // Single detection call: try class → fiber → funcName in-page, report winner.
+      // Must use evaluateOnCallFrame (not Runtime.evaluate) — the latter with
+      // `awaitPromise: true` can hang indefinitely while the debugger is
+      // paused, preventing StoppedEvent from ever being sent.
+      const funcName = topFrame.functionName;
+      const detectResult = await cdp.evaluateOnCallFrameForValue<{ kind: 'class' | 'fiber' | 'funcName' | null; name: string | null }>(
         topFrame.callFrameId,
         `(() => {
-          if (this && this.props && this.constructor && this.constructor.name) {
-            return { type: 'class', name: this.constructor.name };
-          }
-          return null;
-        })()`,
-        true
-      );
-
-      if (classResult.type === 'object' && classResult.subtype !== 'null' && classResult.preview?.properties) {
-        const typeProp = classResult.preview.properties.find((p: { name: string }) => p.name === 'type');
-        const nameProp = classResult.preview.properties.find((p: { name: string }) => p.name === 'name');
-        if (typeProp?.value === 'class' && nameProp?.value) {
-          this.reactComponentName = nameProp.value;
-          // Get `this` as an object we can explore (props, state, etc.)
-          const thisObj = await this.cdp.evaluateOnCallFrame(
-            topFrame.callFrameId,
-            `({ props: this.props, state: this.state })`,
-            true
-          );
-          if (thisObj.objectId) {
-            this.reactComponentObjectId = thisObj.objectId;
-          }
-          return;
-        }
-      }
-
-      // Strategy 2: Function component — use React DevTools hook to find current fiber
-      const fiberResult = await this.cdp.evaluateOnCallFrame(
-        topFrame.callFrameId,
-        `(() => {
-          const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-          if (!hook || !hook.renderers) return null;
-          for (const [, renderer] of hook.renderers) {
-            const fiber = renderer.getCurrentFiber ? renderer.getCurrentFiber() : null;
-            if (fiber) {
-              const name = fiber.type?.displayName || fiber.type?.name || null;
-              const props = fiber.memoizedProps;
-              const state = fiber.memoizedState;
-              if (name || props) {
-                return { name, hasProps: !!props, hasState: !!state };
+          try {
+            if (this && this.props && this.constructor && this.constructor.name) {
+              return { kind: 'class', name: this.constructor.name };
+            }
+          } catch {}
+          try {
+            const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+            if (hook && hook.renderers) {
+              for (const [, renderer] of hook.renderers) {
+                const fiber = renderer.getCurrentFiber ? renderer.getCurrentFiber() : null;
+                if (fiber) {
+                  const name = fiber.type && (fiber.type.displayName || fiber.type.name);
+                  if (name || fiber.memoizedProps) {
+                    return { kind: 'fiber', name: name || null };
+                  }
+                }
               }
             }
-          }
-          return null;
-        })()`,
-        true
+          } catch {}
+          ${funcName && /^[A-Z]/.test(funcName)
+            ? `return { kind: 'funcName', name: ${JSON.stringify(funcName)} };`
+            : `return { kind: null, name: null };`}
+        })()`
       );
 
-      if (fiberResult.type === 'object' && fiberResult.subtype !== 'null' && fiberResult.preview?.properties) {
-        const nameProp = fiberResult.preview.properties.find((p: { name: string }) => p.name === 'name');
-        if (nameProp?.value && nameProp.value !== 'null') {
-          this.reactComponentName = nameProp.value;
-          // Fetch props as explorable object
-          const propsObj = await this.cdp.evaluateOnCallFrame(
-            topFrame.callFrameId,
-            `(() => {
+      const kind = detectResult?.kind ?? null;
+      if (!kind) return;
+      this.reactComponentName = detectResult?.name ?? null;
+
+      // Fetch the component scope + hooks in parallel. Each uses a distinct
+      // evaluate so we get back objectIds (for UI exploration).
+      const scopeExpr = kind === 'class'
+        ? `({ props: this.props, state: this.state })`
+        : kind === 'fiber'
+          ? `(() => {
               const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
               if (!hook || !hook.renderers) return {};
               for (const [, renderer] of hook.renderers) {
                 const fiber = renderer.getCurrentFiber ? renderer.getCurrentFiber() : null;
-                if (fiber && fiber.memoizedProps) {
-                  return fiber.memoizedProps;
-                }
+                if (fiber && fiber.memoizedProps) return fiber.memoizedProps;
               }
               return {};
-            })()`,
-            true
-          );
-          if (propsObj.objectId) {
-            this.reactComponentObjectId = propsObj.objectId;
-          }
+            })()`
+          : `(() => {
+              try {
+                const args = typeof arguments !== 'undefined' ? arguments : null;
+                if (args && args[0] && typeof args[0] === 'object') return args[0];
+              } catch {}
+              return null;
+            })()`;
 
-          // Fetch hooks as a named object (without returnByValue so we get objectIds)
-          await this.extractReactHooks(topFrame.callFrameId);
-          return;
-        }
+      const scopePromise = cdp.evaluateOnCallFrame(topFrame.callFrameId, scopeExpr, true);
+      const hooksPromise = kind === 'class'
+        ? Promise.resolve(null)
+        : this.extractReactHooksObject(topFrame.callFrameId);
+
+      const [scopeObj, hooksObjectId] = await Promise.all([scopePromise, hooksPromise]);
+      if (scopeObj.type === 'object' && scopeObj.subtype !== 'null' && scopeObj.objectId) {
+        this.reactComponentObjectId = scopeObj.objectId;
       }
-
-      // Strategy 3: Infer from function name — many function components
-      // are named (const MyComponent = () => ...) and V8 infers the name
-      const funcName = topFrame.functionName;
-      if (funcName && /^[A-Z]/.test(funcName)) {
-        this.reactComponentName = funcName;
-        // Try to get first argument (props) for function components
-        const propsObj = await this.cdp.evaluateOnCallFrame(
-          topFrame.callFrameId,
-          `(() => {
-            try {
-              const args = typeof arguments !== 'undefined' ? arguments : null;
-              if (args && args[0] && typeof args[0] === 'object') {
-                return args[0];
-              }
-            } catch {}
-            return null;
-          })()`,
-          true
-        );
-        if (propsObj.type === 'object' && propsObj.subtype !== 'null' && propsObj.objectId) {
-          this.reactComponentObjectId = propsObj.objectId;
-        }
-
-        // Also try to extract hooks even when detected via function name
-        await this.extractReactHooks(topFrame.callFrameId);
-      }
+      if (hooksObjectId) this.reactHooksObjectId = hooksObjectId;
     } catch (e) {
-      // Non-critical — just skip React detection
       logger.debug(`React component detection failed: ${e}`);
     }
   }
 
   /**
-   * Extract individual React hook values from the current fiber and store them
-   * as an explorable object in the Hooks scope.
+   * Build an explorable Hooks object from the current fiber and return its
+   * objectId. Returns null if hooks are unavailable or the eval fails.
    */
-  private async extractReactHooks(callFrameId: string): Promise<void> {
-    if (!this.cdp) return;
-
+  private async extractReactHooksObject(callFrameId: string): Promise<string | null> {
+    if (!this.cdp) return null;
     try {
       const hooksObj = await this.cdp.evaluateOnCallFrame(
         callFrameId,
@@ -1384,13 +1396,13 @@ export class ViteDebugSession extends LoggingDebugSession {
         })()`,
         true
       );
-
       if (hooksObj.type === 'object' && hooksObj.subtype !== 'null' && hooksObj.objectId) {
-        this.reactHooksObjectId = hooksObj.objectId;
+        return hooksObj.objectId;
       }
     } catch (e) {
       logger.debug(`React hooks extraction failed: ${e}`);
     }
+    return null;
   }
 
   private onConsoleAPICalled(params: ConsoleAPICalledEvent): void {
@@ -1421,7 +1433,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     if (params.stackTrace && params.stackTrace.callFrames.length > 0) {
       const topFrame = params.stackTrace.callFrames[0];
       if (topFrame.url && this.sourceMapResolver) {
-        const scriptId = this.knownScriptUrls.get(topFrame.url);
+        const scriptId = this.knownScriptUrls.get(normalizeViteUrl(topFrame.url));
         if (scriptId) {
           this.sourceMapResolver.generatedToOriginal(
             scriptId, topFrame.lineNumber, topFrame.columnNumber
@@ -1495,6 +1507,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.scopeManager?.clear();
     this.variableManager?.clear();
     this.unmappableScripts.clear();
+    this.compiledScripts.clear();
 
     if (this.cdp) {
       await this.cdp.disconnect();

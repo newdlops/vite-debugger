@@ -196,11 +196,14 @@ export function activate(context: vscode.ExtensionContext): void {
         statusBarItem.show();
 
         // Use the custom DAP request so values come back by value (not as
-        // formatted preview strings from the Variables converter).
-        reactTreeProvider.setEvaluator(async (expr) => {
+        // formatted preview strings from the Variables converter). `cacheKey`
+        // lets the session persistently compile big expressions (React walker)
+        // so we don't re-parse 6 KB on every refresh.
+        reactTreeProvider.setEvaluator(async (expr, cacheKey) => {
           try {
             const result = await session.customRequest('viteDebugger.evalForValue', {
               expression: expr,
+              cacheKey,
             });
             return result?.value ?? null;
           } catch {
