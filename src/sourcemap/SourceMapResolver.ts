@@ -105,6 +105,19 @@ export function normalizeViteUrl(url: string): string {
   return qIdx >= 0 ? url.slice(0, qIdx) : url;
 }
 
+function getLine(content: string, line: number): string | null {
+  if (line < 1) return null;
+  let start = 0;
+  for (let i = 1; i < line; i++) {
+    const nl = content.indexOf('\n', start);
+    if (nl === -1) return null;
+    start = nl + 1;
+  }
+  const end = content.indexOf('\n', start);
+  const raw = end === -1 ? content.slice(start) : content.slice(start, end);
+  return raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+}
+
 export class SourceMapResolver {
   private cache = new SourceMapCache();
   private scripts = new Map<string, ScriptEntry>();
@@ -116,6 +129,19 @@ export class SourceMapResolver {
   private pendingSourceMisses = new Set<string>();  // Tracks already-logged "no scripts" sources
   private loadingPromises = new Map<string, Promise<void>>();  // Prevent duplicate loads
   private failedScripts = new Set<string>();  // scriptIds whose source map failed to load
+  /** Absolute source path -> last-seen sourcesContent. Survives unregisterScript
+   *  so HMR reloads can tell which sources were actually edited (content
+   *  changed) vs. merely re-bundled (content identical). */
+  private sourceContentByPath = new Map<string, string>();
+  /** Snapshots of the PRIOR sourcesContent for sources whose content changed
+   *  during the most recent source map load. Used by `isLineContentStable`
+   *  to check whether a specific line's text survived the edit. Populated
+   *  in loadSourceMap, drained by clearPriorSnapshots after HMR handling. */
+  private priorSourceContentByPath = new Map<string, string>();
+  /** Sources whose sourcesContent changed during a recent source map load.
+   *  Populated in loadSourceMap, drained by consumeChangedSources — used to
+   *  tell the breakpoint manager which files to treat as user-edited. */
+  private recentlyChangedSources = new Set<string>();
   /** Callback invoked after a source map is successfully loaded (for resolving pending breakpoints) */
   onSourceMapLoaded: ((scriptId: string) => void) | null = null;
 
@@ -230,6 +256,26 @@ export class SourceMapResolver {
           this.sourceToScripts.set(resolved, new Set());
         }
         this.sourceToScripts.get(resolved)!.add(scriptId);
+
+        // Detect user-edit: compare the new sourcesContent against the
+        // last-seen one for this source path. If different (and we had a
+        // prior version), snapshot the old text so isLineContentStable can
+        // later tell the breakpoint manager which specific bp lines are
+        // still valid and which were shifted by the edit.
+        let content: string | null = null;
+        try { content = consumer.sourceContentFor(sourceName, true); } catch { /* missing content */ }
+        if (content !== null) {
+          const prev = this.sourceContentByPath.get(resolved);
+          if (prev !== undefined && prev !== content) {
+            this.recentlyChangedSources.add(resolved);
+            // Don't clobber an earlier prior snapshot from this same HMR
+            // cycle — the caller drains after handleHmrReload.
+            if (!this.priorSourceContentByPath.has(resolved)) {
+              this.priorSourceContentByPath.set(resolved, prev);
+            }
+          }
+          this.sourceContentByPath.set(resolved, content);
+        }
       }
 
       this.scripts.set(scriptId, {
@@ -554,6 +600,44 @@ export class SourceMapResolver {
   }
 
   /**
+   * Return (and clear) the set of source paths whose sourcesContent changed
+   * since the last call. Intended for the HMR breakpoint flow: these are
+   * files the user actually edited. A bp's specific line may still be valid
+   * (see isLineContentStable) even when the file as a whole changed.
+   */
+  consumeChangedSources(): Set<string> {
+    const changed = this.recentlyChangedSources;
+    this.recentlyChangedSources = new Set();
+    return changed;
+  }
+
+  /**
+   * Return true if the text at 1-based `line` is identical in the prior and
+   * current sourcesContent for `sourcePath`. Used after a detected edit to
+   * decide whether a stored bp.line still points at the same code.
+   *
+   * Returns true when there's no prior snapshot (either source not tracked
+   * or content unchanged) — callers should treat "unknown" as "stable" so
+   * unchanged files hit the normal re-resolve path.
+   */
+  isLineContentStable(sourcePath: string, line: number): boolean {
+    const normalized = sourcePath.replace(/\\/g, '/');
+    const prior = this.priorSourceContentByPath.get(normalized);
+    if (prior === undefined) return true;
+    const current = this.sourceContentByPath.get(normalized);
+    if (current === undefined) return true;
+    return getLine(prior, line) === getLine(current, line);
+  }
+
+  /**
+   * Drop prior-content snapshots. Call after handleHmrReload finishes —
+   * isLineContentStable returns "stable" outside an HMR cycle.
+   */
+  clearPriorSnapshots(): void {
+    this.priorSourceContentByPath.clear();
+  }
+
+  /**
    * Compute blackbox positions for Vite-injected preamble/epilogue in a script.
    *
    * Handles both multi-line and single-line (minified) scripts:
@@ -625,6 +709,9 @@ export class SourceMapResolver {
     this.failedScripts.clear();
     this.registeredScriptCount = 0;
     this.pendingSourceMisses.clear();
+    this.sourceContentByPath.clear();
+    this.priorSourceContentByPath.clear();
+    this.recentlyChangedSources.clear();
   }
 
   // --- Private ---

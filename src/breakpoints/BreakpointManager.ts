@@ -1,6 +1,7 @@
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { CdpClient } from '../cdp/CdpClient';
 import { SourceMapResolver } from '../sourcemap/SourceMapResolver';
+import { fileChecksumCache } from '../util/FileChecksum';
 import { logger } from '../util/Logger';
 
 interface ManagedBreakpoint {
@@ -13,6 +14,11 @@ interface ManagedBreakpoint {
   hitCondition?: string;
   logMessage?: string;
   verified: boolean;
+  /** True when the source was user-edited during HMR and the stored line is
+   *  pre-edit. Prevents resolveBreakpointsForScript from re-resolving at the
+   *  stale line; cleared implicitly when VSCode sends a fresh setBreakpoints
+   *  (that call removes the bp and creates a new one). */
+  awaitingFreshLine?: boolean;
 }
 
 export class BreakpointManager {
@@ -115,16 +121,26 @@ export class BreakpointManager {
           bp.verified = true;
 
           // Map CDP's actual resolved position back to original source
-          // to report the real breakpoint location to VSCode
+          // to report the real breakpoint location to VSCode. CDP may snap
+          // the breakpoint to a nearby generated position that maps to a
+          // DIFFERENT original source (e.g., inlined @react-refresh preamble
+          // mapping to react-dom.development.js); if we took that line, the
+          // bp would be reported at a weird row in the user's file. Only
+          // trust the remap when the source matches the user's file.
           if (result.locations.length > 0) {
             const actualLoc = result.locations[0];
             const actualOriginal = await this.sourceMapResolver.generatedToOriginal(
               actualLoc.scriptId, actualLoc.lineNumber, actualLoc.columnNumber
             );
-            if (actualOriginal) {
+            if (actualOriginal && samePath(actualOriginal.source, sourcePath)) {
               resolvedLine = actualOriginal.line;
               resolvedColumn = actualOriginal.column + 1;  // DAP is 1-based
               bp.line = resolvedLine;
+            } else if (actualOriginal) {
+              logger.debug(
+                `CDP snapped bp at ${sourcePath}:${sbp.line} into a different ` +
+                `source (${actualOriginal.source}); keeping user line`
+              );
             }
           }
 
@@ -140,12 +156,22 @@ export class BreakpointManager {
       }
 
       managed.push(bp);
+      const bpSource: DebugProtocol.Source = { path: sourcePath };
+      if (!sourcePath.includes('/node_modules/')) {
+        // Record the current file hash so VSCode has a baseline to compare
+        // against later. When the user saves (HMR), LoadedSourceEvent will
+        // push the new hash; frames that still match stay trusted.
+        const sha = await fileChecksumCache.sha256(sourcePath);
+        if (sha) {
+          bpSource.checksums = [{ algorithm: 'SHA256', checksum: sha }];
+        }
+      }
       results.push({
         id: dapId,
         verified: bp.verified,
         line: resolvedLine,
         column: resolvedColumn,
-        source: { path: sourcePath },
+        source: bpSource,
       });
     }
 
@@ -185,6 +211,10 @@ export class BreakpointManager {
     for (const [sourcePath, bps] of this.breakpoints) {
       if (!relevantSources.has(sourcePath)) continue;
       for (const bp of bps) {
+        // Deferred-after-edit bps carry a stale pre-edit line; resolving them
+        // here would land the CDP breakpoint on the wrong code. Skip until
+        // VSCode re-sends setBreakpoints with the fresh line.
+        if (bp.awaitingFreshLine) continue;
         if (!bp.verified) candidates.push({ sourcePath, bp });
       }
     }
@@ -199,18 +229,28 @@ export class BreakpointManager {
       if (!generated || generated.scriptId !== scriptId) return null;
 
       try {
+        // Same refinement as the initial set / HMR re-resolve paths: pick
+        // a getPossibleBreakpoints candidate that round-trips back to
+        // sourcePath, so we don't place the bp inside an inlined
+        // react-refresh / JSX runtime helper that happens to share the
+        // same generated line.
+        const refined = await this.refineBreakpointPosition(generated, sourcePath);
+        const targetLine = refined?.lineNumber ?? generated.lineNumber;
+        const targetColumn = refined?.columnNumber ?? generated.columnNumber;
+
         const result = await this.cdp.setBreakpointByUrl(
-          generated.lineNumber,
+          targetLine,
           {
             urlRegex: this.buildUrlRegex(sourcePath),
-            columnNumber: generated.columnNumber,
+            columnNumber: targetColumn,
             condition: this.buildCdpCondition(bp),
           }
         );
         bp.cdpBreakpointId = result.breakpointId;
         bp.verified = true;
         logger.info(
-          `Pending breakpoint resolved: ${sourcePath}:${bp.line} -> ${result.breakpointId}`
+          `Pending breakpoint resolved: ${sourcePath}:${bp.line} -> ${result.breakpointId} ` +
+          `at generated ${targetLine}:${targetColumn}`
         );
         return bp;
       } catch (e) {
@@ -230,14 +270,27 @@ export class BreakpointManager {
 
   /**
    * Handle HMR reload for a set of affected source paths.
-   * Only processes breakpoints whose source files are in the affected set,
-   * skipping non-browser files (e.g., .py) that can never resolve to browser scripts.
+   *
+   * `editedSourcePaths` is the subset whose sourcesContent actually changed
+   * in this HMR cycle (i.e., the user saved an edit to those files). For
+   * those, stored `bp.line` refers to pre-edit line numbers and cannot be
+   * safely re-mapped — we drop the stale CDP breakpoint and mark the bp
+   * unverified, then let VSCode's follow-up `setBreakpoints` call (with
+   * fresh line numbers) re-establish it. The remaining affected sources
+   * were only re-bundled (deps changed); their line numbers are still
+   * valid, so we re-resolve as before.
    */
-  async handleHmrReload(affectedSourcePaths: Set<string>): Promise<{ resolved: ManagedBreakpoint[]; unresolved: ManagedBreakpoint[] }> {
-    return this.serialize(() => this.handleHmrReloadInternal(affectedSourcePaths));
+  async handleHmrReload(
+    affectedSourcePaths: Set<string>,
+    editedSourcePaths: Set<string> = new Set(),
+  ): Promise<{ resolved: ManagedBreakpoint[]; unresolved: ManagedBreakpoint[]; deferred: ManagedBreakpoint[] }> {
+    return this.serialize(() => this.handleHmrReloadInternal(affectedSourcePaths, editedSourcePaths));
   }
 
-  private async handleHmrReloadInternal(affectedSourcePaths: Set<string>): Promise<{ resolved: ManagedBreakpoint[]; unresolved: ManagedBreakpoint[] }> {
+  private async handleHmrReloadInternal(
+    affectedSourcePaths: Set<string>,
+    editedSourcePaths: Set<string>,
+  ): Promise<{ resolved: ManagedBreakpoint[]; unresolved: ManagedBreakpoint[]; deferred: ManagedBreakpoint[] }> {
     // Collect all bps affected by this HMR cycle so we can pipeline the
     // remove/resolve/set per-bp — each step was previously a hard await that
     // serialized ~3N CDP round-trips for N breakpoints.
@@ -246,10 +299,11 @@ export class BreakpointManager {
       if (!affectedSourcePaths.has(sourcePath)) continue;
       for (const bp of bps) targets.push({ sourcePath, bp });
     }
-    if (targets.length === 0) return { resolved: [], unresolved: [] };
+    if (targets.length === 0) return { resolved: [], unresolved: [], deferred: [] };
 
     const resolved: ManagedBreakpoint[] = [];
     const unresolved: ManagedBreakpoint[] = [];
+    const deferred: ManagedBreakpoint[] = [];
 
     const perBp = targets.map(async ({ sourcePath, bp }) => {
       // Old CDP breakpoint is stale after the script replaced — remove it.
@@ -258,6 +312,26 @@ export class BreakpointManager {
         catch (e) { logger.debug(`Failed to remove old breakpoint during HMR: ${e}`); }
         bp.cdpBreakpointId = undefined;
       }
+
+      // User-edited source: bp.line is pre-edit. If the specific line the
+      // bp lives on has different text now, the stored line refers to
+      // different code and re-resolving from it would land on the wrong
+      // spot — defer and wait for VSCode to send the refreshed
+      // setBreakpoints. If the line's text is unchanged (e.g., the edit
+      // only added content below the bp or was purely cosmetic), the
+      // stored line is still valid and we can re-resolve normally.
+      if (
+        editedSourcePaths.has(sourcePath)
+        && !this.sourceMapResolver.isLineContentStable(sourcePath, bp.line)
+      ) {
+        bp.verified = false;
+        bp.awaitingFreshLine = true;
+        deferred.push(bp);
+        return;
+      }
+      // If we're re-resolving (line content stable or source unchanged),
+      // clear any stale awaiting flag from a previous cycle.
+      bp.awaitingFreshLine = false;
 
       const generated = await this.sourceMapResolver.originalToGenerated(
         sourcePath, bp.line, bp.column ?? 0
@@ -286,7 +360,12 @@ export class BreakpointManager {
           const actualOriginal = await this.sourceMapResolver.generatedToOriginal(
             actualLoc.scriptId, actualLoc.lineNumber, actualLoc.columnNumber
           );
-          if (actualOriginal) bp.line = actualOriginal.line;
+          // Same guard as setBreakpointsInternal — never overwrite bp.line
+          // with a row number from a different original source (e.g., an
+          // inlined react-dom/react-refresh position).
+          if (actualOriginal && samePath(actualOriginal.source, sourcePath)) {
+            bp.line = actualOriginal.line;
+          }
         }
 
         resolved.push(bp);
@@ -307,7 +386,7 @@ export class BreakpointManager {
     });
 
     await Promise.all(perBp);
-    return { resolved, unresolved };
+    return { resolved, unresolved, deferred };
   }
 
   getAllBreakpoints(): Map<string, ManagedBreakpoint[]> {
@@ -351,18 +430,54 @@ export class BreakpointManager {
     for (const scriptId of scriptIds) {
       try {
         // Search on the same line first
-        let locations = await this.cdp.getPossibleBreakpoints(
+        const locations = await this.cdp.getPossibleBreakpoints(
           { scriptId, lineNumber: generated.lineNumber, columnNumber: 0 },
           { scriptId, lineNumber: generated.lineNumber + 1, columnNumber: 0 }
         );
 
         if (locations.length === 0) continue;
 
+        // A Vite-generated script can interleave user code with injected
+        // helpers (react-refresh preamble, JSX runtime calls, HMR hooks).
+        // getPossibleBreakpoints returns positions for ALL of those, and
+        // picking the nearest column blindly can land inside an injection
+        // that maps to a DIFFERENT original source (react-refresh, or
+        // nothing at all). When that bp fires at runtime, Chrome pauses
+        // deep in React internals like updateFunctionComponent.
+        //
+        // Filter candidates to only those whose round-trip back to the
+        // original source lands in `sourcePath`. If none qualify, fall
+        // back to the raw generated position (skip refinement) rather
+        // than snap to an injected region.
+        let candidates = locations;
+        if (sourcePath) {
+          const roundTripped = await Promise.all(
+            locations.map(async (loc) => {
+              const original = await this.sourceMapResolver.generatedToOriginal(
+                scriptId, loc.lineNumber, loc.columnNumber ?? 0,
+              );
+              return original && samePath(original.source, sourcePath) ? loc : null;
+            }),
+          );
+          const filtered = roundTripped.filter(
+            (loc): loc is typeof locations[number] => loc !== null,
+          );
+          if (filtered.length === 0) {
+            logger.debug(
+              `refineBreakpointPosition: no positions on generated line ` +
+              `${generated.lineNumber} round-trip to ${sourcePath} — ` +
+              `skipping refinement to avoid snapping into injected code`,
+            );
+            return null;
+          }
+          candidates = filtered;
+        }
+
         // Find the location closest to the requested column
-        let best = locations[0];
+        let best = candidates[0];
         let bestDist = Math.abs((best.columnNumber ?? 0) - generated.columnNumber);
 
-        for (const loc of locations) {
+        for (const loc of candidates) {
           const dist = Math.abs((loc.columnNumber ?? 0) - generated.columnNumber);
           if (dist < bestDist) {
             best = loc;
@@ -448,4 +563,8 @@ export class BreakpointManager {
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function samePath(a: string, b: string): boolean {
+  return a.replace(/\\/g, '/') === b.replace(/\\/g, '/');
 }

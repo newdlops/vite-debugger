@@ -3,6 +3,7 @@ import { CallFrame } from '../cdp/CdpTypes';
 import { SourceMapResolver } from '../sourcemap/SourceMapResolver';
 import { ViteUrlMapper } from '../vite/ViteUrlMapper';
 import { fileExistsCache } from '../util/FileExists';
+import { fileChecksumCache } from '../util/FileChecksum';
 import { logger } from '../util/Logger';
 
 export interface ResolvedCallFrame {
@@ -96,6 +97,24 @@ export class CallStackManager {
       const resolvedInNodeModules = source.path?.includes('/node_modules/') ?? isNodeModules;
       if (resolvedInNodeModules || isInternal) {
         presentationHint = 'subtle';
+        // Also mark the Source as deemphasized. VSCode uses this hint when
+        // deciding which frame to auto-reveal on a StoppedEvent — without it,
+        // node_modules frames with a valid on-disk path (e.g.,
+        // react-dom.development.js) are treated as equally navigable as the
+        // user frame and can steal focus, especially after HMR where the
+        // user's file was just touched on disk.
+        source.presentationHint = 'deemphasize';
+      } else if (source.path) {
+        // User code: attach a current SHA256 checksum so VSCode can confirm
+        // the disk content hasn't drifted from what the debugger is running.
+        // Without this, saving the file during debugging makes VSCode dim
+        // all frames pointing at it and auto-focus the next (library) frame
+        // on the next StoppedEvent — which appeared to the user as the
+        // yellow arrow jumping into react-dom.
+        const sha = await fileChecksumCache.sha256(source.path);
+        if (sha) {
+          source.checksums = [{ algorithm: 'SHA256', checksum: sha }];
+        }
       }
 
       const dapFrame: DebugProtocol.StackFrame = {

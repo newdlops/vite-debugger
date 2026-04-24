@@ -23,6 +23,7 @@ import { detectFirstViteServer, ViteServerInfo } from '../vite/ViteServerDetecto
 import { ViteUrlMapper } from '../vite/ViteUrlMapper';
 import { SourceMapResolver, normalizeViteUrl } from '../sourcemap/SourceMapResolver';
 import { fileExistsCache } from '../util/FileExists';
+import { fileChecksumCache } from '../util/FileChecksum';
 import { BreakpointManager } from '../breakpoints/BreakpointManager';
 import { CallStackManager, ResolvedCallFrame, SourceRefRegistrar } from '../inspection/CallStackManager';
 import { ScopeManager } from '../inspection/ScopeManager';
@@ -89,6 +90,17 @@ export class ViteDebugSession extends LoggingDebugSession {
   private smartStepCount = 0;
   private static readonly MAX_SMART_STEPS = 20;
   private lastStepAction: 'stepOver' | 'stepInto' | 'stepOut' | null = null;
+  /** scriptId of the most recent user-visible pause that landed in user code
+   *  (i.e., top frame path is set and not inside node_modules). Null after any
+   *  pause that didn't land in user code. Used to detect frame transitions:
+   *  if `lastUserPauseScriptId !== null` and the next pause's scriptId differs,
+   *  we just crossed out of a user frame — likely returning from a user
+   *  component into React's reconciler. In that case smart-step pauses once
+   *  at the first non-user landing point (even when the source map has no
+   *  entry for the position, as happens inside pre-bundled react-dom chunks).
+   *  Covers stepOver (JSX-return case), stepInto (e.g., stepping into a JSX
+   *  element and hitting the reconciler first), and stepOut. */
+  private lastUserPauseScriptId: string | null = null;
   private stepInTargetLocations = new Map<number, BreakLocation>();
   private tempBreakpointId: string | null = null;
   private sourceMapRetryTimer: NodeJS.Timeout | null = null;
@@ -532,6 +544,14 @@ export class ViteDebugSession extends LoggingDebugSession {
       `returning=${frames.length}/${this.resolvedFrames.length} ` +
       `top=${frames[0] ? `${frames[0].source?.path ?? frames[0].source?.name ?? '?'}:${frames[0].line}` : 'none'}`
     );
+
+    // Dump the exact DAP StackFrame objects for the top 3 frames so we can
+    // diagnose why VSCode may be auto-focusing a non-top frame after HMR.
+    // Looking for: sourceReference unexpectedly set, presentationHint on the
+    // top frame, missing source.path, odd column values.
+    for (let i = 0; i < Math.min(3, frames.length); i++) {
+      logger.debug(`stackTraceRequest frame[${i}]: ${JSON.stringify(frames[i])}`);
+    }
 
     response.body = {
       stackFrames: frames,
@@ -1017,6 +1037,16 @@ export class ViteDebugSession extends LoggingDebugSession {
     const filePath = this.urlMapper?.viteUrlToFilePath(params.url);
     if (filePath && await fileExistsCache.existsAsync(filePath)) {
       loadedSource.path = filePath;
+      // Include a current checksum so VSCode treats the file as in-sync with
+      // what the debugger is executing — especially important for HMR, where
+      // a save has just bumped the file's mtime and VSCode would otherwise
+      // flag all frames pointing at this source as stale/dimmed.
+      if (!filePath.includes('/node_modules/')) {
+        const sha = await fileChecksumCache.sha256(filePath);
+        if (sha) {
+          loadedSource.checksums = [{ algorithm: 'SHA256', checksum: sha }];
+        }
+      }
     } else {
       const ref = this.nextSourceRef++;
       this.sourceRefToScriptId.set(ref, params.scriptId);
@@ -1044,9 +1074,27 @@ export class ViteDebugSession extends LoggingDebugSession {
       }
     }
 
-    if (affectedSourcePaths.size === 0) return;
+    if (affectedSourcePaths.size === 0) {
+      // Still drain the changed-source set and prior snapshots so they
+      // don't leak into a later batch where those paths aren't affected.
+      this.sourceMapResolver.consumeChangedSources();
+      this.sourceMapResolver.clearPriorSnapshots();
+      return;
+    }
 
-    const { resolved, unresolved } = await this.breakpointManager.handleHmrReload(affectedSourcePaths);
+    // User-edited sources need special handling: their stored bp.line is
+    // pre-edit and cannot be re-mapped through the new source map without
+    // landing on the wrong code. Defer re-resolving those until VSCode
+    // sends an updated setBreakpoints.
+    const changedSources = this.sourceMapResolver.consumeChangedSources();
+    const editedSourcePaths = new Set<string>();
+    for (const s of affectedSourcePaths) {
+      if (changedSources.has(s)) editedSourcePaths.add(s);
+    }
+
+    const { resolved, unresolved, deferred } = await this.breakpointManager.handleHmrReload(
+      affectedSourcePaths, editedSourcePaths,
+    );
     for (const bp of resolved) {
       this.sendEvent(new BreakpointEvent('changed', {
         id: bp.dapId,
@@ -1062,14 +1110,65 @@ export class ViteDebugSession extends LoggingDebugSession {
         message: 'Breakpoint not resolved after HMR — source map position changed',
       } as DebugProtocol.Breakpoint));
     }
-    if (resolved.length > 0 || unresolved.length > 0) {
-      logger.info(`HMR reload: ${scriptIds.length} scripts, ${resolved.length} breakpoints re-set, ${unresolved.length} unresolved`);
+    for (const bp of deferred) {
+      // Do NOT include `line` — the stored bp.line is the pre-edit snapshot
+      // and emitting it would yank VSCode's marker back to the wrong row.
+      // Omitting `line` signals verified:false without moving the marker;
+      // the next setBreakpoints from VSCode carries the true new line.
+      this.sendEvent(new BreakpointEvent('changed', {
+        id: bp.dapId,
+        verified: false,
+        message: 'Breakpoint pending — waiting for editor to send updated line',
+      } as DebugProtocol.Breakpoint));
     }
+    if (resolved.length > 0 || unresolved.length > 0 || deferred.length > 0) {
+      logger.info(
+        `HMR reload: ${scriptIds.length} scripts, ${resolved.length} re-set, ` +
+        `${unresolved.length} unresolved, ${deferred.length} deferred (edited)`,
+      );
+    }
+
+    // Prior-content snapshots are only meaningful for THIS HMR cycle.
+    // Drop them so subsequent non-HMR operations (or the next HMR cycle)
+    // don't see stale "edited" state.
+    this.sourceMapResolver.clearPriorSnapshots();
   }
 
   private async onPaused(params: PausedEvent): Promise<void> {
     const pauseTopScriptId = params.callFrames[0]?.location.scriptId ?? '?';
+    const topLoc = params.callFrames[0]?.location;
     logger.debug(`onPaused entered: reason=${params.reason} frames=${params.callFrames.length} topScript=${pauseTopScriptId} hitBps=${params.hitBreakpoints?.length ?? 0}`);
+
+    // Diagnostic: map the pause position back to original source and
+    // correlate any hitBreakpoints with our managed bps. When the user
+    // reports "pause landed in react-dom", this log reveals whether (a)
+    // CDP snapped our bp into an injected region whose source-map entry
+    // points into a vendor file, or (b) the pause isn't from our bp at
+    // all (exception, debugger stmt, etc.).
+    if (topLoc && this.sourceMapResolver) {
+      try {
+        const mapped = await this.sourceMapResolver.generatedToOriginal(
+          topLoc.scriptId, topLoc.lineNumber, topLoc.columnNumber ?? 0,
+        );
+        const hit = params.hitBreakpoints ?? [];
+        const managed = this.breakpointManager?.getAllBreakpoints();
+        const hitMatch: string[] = [];
+        if (managed) {
+          for (const [src, bps] of managed) {
+            for (const b of bps) {
+              if (b.cdpBreakpointId && hit.includes(b.cdpBreakpointId)) {
+                hitMatch.push(`${src}:${b.line}(cdp=${b.cdpBreakpointId})`);
+              }
+            }
+          }
+        }
+        logger.debug(
+          `onPaused diag: genPos=${topLoc.scriptId}:${topLoc.lineNumber}:${topLoc.columnNumber ?? 0} ` +
+          `mapsTo=${mapped ? `${mapped.source}:${mapped.line}:${mapped.column}` : 'null'} ` +
+          `hitBps=[${hit.join(',')}] hitMatch=[${hitMatch.join(',')}]`
+        );
+      } catch (e) { logger.debug(`onPaused diag failed: ${e}`); }
+    }
 
     // Clean up any temporary breakpoint from stepInTargets
     if (this.tempBreakpointId && this.cdp) {
@@ -1100,8 +1199,15 @@ export class ViteDebugSession extends LoggingDebugSession {
       if (shouldSkip) {
         this.smartStepCount++;
 
-        // If we've been smart-stepping too long, we're stuck in library code
-        // (e.g., React's workLoopSync, _jsxDEV calls).
+        // If we've been smart-stepping too long, we're stuck in a library
+        // loop (e.g., a minified bundle with sparse mappings, or React's
+        // workLoopSync). Resume so the user reaches the next breakpoint
+        // instead of being stranded at an arbitrary column inside minified
+        // code. The user→library boundary stop inside shouldSmartStep
+        // usually prevents this bailout from being reached for the common
+        // JSX-return case — a stepOver out of a user component now pauses
+        // at the first react-dom frame rather than burning through 20
+        // library steps.
         if (this.smartStepCount > ViteDebugSession.MAX_SMART_STEPS) {
           logger.debug('Smart step limit reached, resuming to next breakpoint');
           this.smartStepCount = 0;
@@ -1200,6 +1306,16 @@ export class ViteDebugSession extends LoggingDebugSession {
       `Sending StoppedEvent: reason=${reason} threadId=${THREAD_ID} frames=${this.resolvedFrames.length} ` +
       `top=${top ? `${top.source?.path ?? top.source?.name ?? '?'}:${top.line}` : 'none'}`
     );
+    // Snapshot the scriptId if this pause is in user code so the next
+    // smart-step decision can detect a user→library frame transition (see
+    // shouldSmartStep). Clear it on any non-user pause so that subsequent
+    // smart-steps inside library code don't keep tripping the boundary.
+    const topPath = top?.source?.path;
+    const topScriptId = params.callFrames[0]?.location.scriptId ?? null;
+    this.lastUserPauseScriptId =
+      topPath && !topPath.includes('/node_modules/') && topScriptId
+        ? topScriptId
+        : null;
     this.sendEvent(new StoppedEvent(reason, THREAD_ID));
   }
 
@@ -1322,12 +1438,20 @@ export class ViteDebugSession extends LoggingDebugSession {
    *
    * Decision table (in order):
    *   1. Explicit breakpoint hit → never auto-skip.
-   *   2. No source map AND script already marked unmappable → skip (getting out of it).
+   *   2. No source map AND script already marked unmappable → skip.
    *   3. Source map resolves to user code → stop (unless skipFiles matches).
-   *   4. Source map resolves to node_modules → skip by default, BUT respect
-   *      a prior `stepInto` so the user can descend into library code.
-   *   5. Source map exists but this position has no mapping → Vite-injected
-   *      preamble (e.g. `_s()`, `$RefreshSig$`). Skip.
+   *   4. Cross-cutting rule — frame transition out of user code: if the last
+   *      user-visible pause was in user code and its scriptId differs from
+   *      the current one, we just crossed a frame boundary (e.g., returning
+   *      from a user component into React's reconciler, or stepping into a
+   *      JSX element). Pause once at the first landing point — whether it's
+   *      mapped to node_modules or has no mapping at all. Applies to
+   *      stepOver/stepInto/stepOut. Subsequent steps from the library frame
+   *      don't retrigger because the pause at library sets
+   *      lastUserPauseScriptId to null.
+   *   5. Source map resolves to node_modules → skip (unless rule 4 fired).
+   *   6. Source map exists but this position has no mapping → injected
+   *      preamble (e.g. `_s()`) or sparse-map library internal. Skip.
    */
   private async shouldSmartStep(params: PausedEvent, isExplicitBreakpoint: boolean = false): Promise<boolean> {
     if (isExplicitBreakpoint) return false;
@@ -1339,20 +1463,24 @@ export class ViteDebugSession extends LoggingDebugSession {
     // Already-blackboxed unmappable script — get out of it.
     if (this.unmappableScripts.has(scriptId)) return true;
 
+    // A step that crosses out of a user frame — regardless of whether the
+    // landing position maps to node_modules or has no mapping at all (as
+    // happens inside pre-bundled react-dom chunks) — should pause once so
+    // the user sees where they ended up instead of silently running through
+    // React internals (step budget exhaustion) or resurfacing in an unrelated
+    // component's render (what looked like the debugger "jumping" for
+    // JSX-return stepOver).
+    const isFrameTransitionFromUserCode =
+      this.lastUserPauseScriptId !== null &&
+      this.lastUserPauseScriptId !== scriptId;
+
     if (this.sourceMapResolver && this.sourceMapResolver.hasSourceMap(scriptId)) {
       const original = await this.sourceMapResolver.generatedToOriginal(
         scriptId, lineNumber, columnNumber ?? 0
       );
       if (original) {
         if (original.source.includes('/node_modules/')) {
-          // Always skip library code. The step command used to skip adapts
-          // to the user's intent: stepInto keeps descending (so a user
-          // callback invoked from inside a library — React reconciler
-          // calling a Component, a useMemo factory, etc. — is still
-          // reached), while stepOver/stepOut stay at the caller-level.
-          // The previous "respect stepInto by stopping in node_modules"
-          // left users stranded in React internals whenever they tried to
-          // step into a JSX element or a hook.
+          if (isFrameTransitionFromUserCode) return false;
           return true;
         }
 
@@ -1366,7 +1494,11 @@ export class ViteDebugSession extends LoggingDebugSession {
         return false;
       }
 
-      // Has source map but no mapping at this position → injected preamble
+      // Has source map but no mapping at this position → injected preamble,
+      // OR we've landed deep inside a pre-bundled library chunk whose map is
+      // sparse. If we just came out of user code, treat this as the library
+      // boundary and pause.
+      if (isFrameTransitionFromUserCode) return false;
       return true;
     }
 

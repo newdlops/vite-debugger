@@ -10,3 +10,5 @@ vitest.config.ts
 **/*.map
 *.log
 log.txt
+.zoek-rs
+.lh

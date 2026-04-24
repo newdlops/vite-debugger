@@ -3,3 +3,5 @@ dist/
 *.vsix
 .vscode-test/
 test/fixtures/*/node_modules/
+.zoek-rs
+.lh
