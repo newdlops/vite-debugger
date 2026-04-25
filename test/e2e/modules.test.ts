@@ -40,6 +40,29 @@ describe('ViteUrlMapper (pure)', () => {
   });
 });
 
+describe('ViteUrlMapper (monorepo: webRoot != viteRoot)', () => {
+  // Workspace root above the Vite sub-package — mirrors a pnpm/yarn workspace
+  // layout where vite.config lives in apps/web while the editor opened the
+  // outer repo.
+  const mapper = new ViteUrlMapper(
+    'http://127.0.0.1:5173',
+    '/Users/test/workspace',
+    '/Users/test/workspace/apps/web',
+  );
+
+  it('maps a sub-package source to a Vite-relative URL (no /apps/web prefix)', () => {
+    // Bug fix: previously this used webRoot, producing /apps/web/src/App.tsx
+    // which Vite returns 404 on — Vite serves files relative to viteRoot.
+    expect(mapper.filePathToViteUrl('/Users/test/workspace/apps/web/src/App.tsx'))
+      .toBe('http://127.0.0.1:5173/src/App.tsx');
+  });
+
+  it('maps a workspace-sibling file (outside viteRoot) through /@fs', () => {
+    expect(mapper.filePathToViteUrl('/Users/test/workspace/packages/shared/util.ts'))
+      .toBe('http://127.0.0.1:5173/@fs/Users/test/workspace/packages/shared/util.ts');
+  });
+});
+
 describe('normalizeViteUrl', () => {
   it('strips ?v=<hash> versioning', () => {
     expect(normalizeViteUrl('http://127.0.0.1:5173/src/App.tsx?v=abc123'))

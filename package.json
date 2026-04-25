@@ -83,6 +83,11 @@
                 },
                 "description": "Glob patterns for files to skip during stepping (e.g., [\"**/styled-components/**\", \"**/index.tsx\"]). Matched files are stepped over automatically.",
                 "default": []
+              },
+              "reloadOnAttach": {
+                "type": "boolean",
+                "description": "If true, reload the page once after attach so breakpoints on already-executed code (mounted component bodies, top-level module code) hit on the fresh execution. Default false — bps still hit naturally when the relevant code runs again (event handlers, React re-renders triggered by interaction).",
+                "default": false
               }
             }
           },
@@ -115,6 +120,11 @@
                 },
                 "description": "Glob patterns for files to skip during stepping (e.g., [\"**/styled-components/**\", \"**/index.tsx\"]). Matched files are stepped over automatically.",
                 "default": []
+              },
+              "reloadOnAttach": {
+                "type": "boolean",
+                "description": "If true, reload the page once after attach so breakpoints on already-executed code (mounted component bodies, top-level module code) hit on the fresh execution. Default false — bps still hit naturally when the relevant code runs again (event handlers, React re-renders triggered by interaction).",
+                "default": false
               }
             }
           }

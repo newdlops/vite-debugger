@@ -56,6 +56,7 @@ interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
   webRoot?: string;
   sourceMapPathOverrides?: Record<string, string>;
   skipFiles?: string[];
+  reloadOnAttach?: boolean;
 }
 
 interface AttachRequestArguments extends DebugProtocol.AttachRequestArguments {
@@ -64,6 +65,7 @@ interface AttachRequestArguments extends DebugProtocol.AttachRequestArguments {
   webRoot?: string;
   sourceMapPathOverrides?: Record<string, string>;
   skipFiles?: string[];
+  reloadOnAttach?: boolean;
 }
 
 export class ViteDebugSession extends LoggingDebugSession {
@@ -106,6 +108,19 @@ export class ViteDebugSession extends LoggingDebugSession {
   private sourceMapRetryTimer: NodeJS.Timeout | null = null;
   /** Precompiled regexes for user-configured skipFiles globs */
   private skipFileRegexes: RegExp[] = [];
+  /** Opt-in: when true, Page.reload is invoked once after configurationDone
+   *  so breakpoints set on already-executed code (mounted component bodies,
+   *  top-level module code) hit on the fresh execution. Default false —
+   *  most users prefer to keep their page state and let bps hit naturally
+   *  when the relevant code runs again (event handlers, React re-renders
+   *  triggered by interaction). Same constraint applies to Chrome DevTools:
+   *  CDP can't replay execution that already completed. */
+  private reloadOnAttach = false;
+  /** Vite URLs we've already triggered a proactive `import()` for, so a
+   *  second setBreakpoints request on the same source doesn't fire another
+   *  import. Once the module is fetched its scriptParsed event drives the
+   *  pending-bp resolution path; we just need to nudge it once. */
+  private proactivelyImportedUrls = new Set<string>();
   /** Pending HMR script IDs to batch-process */
   private pendingHmrScriptIds: string[] = [];
   private hmrBatchTimer: NodeJS.Timeout | null = null;
@@ -166,6 +181,7 @@ export class ViteDebugSession extends LoggingDebugSession {
       const webRoot = args.webRoot || process.cwd();
       const chromePort = args.chromePort || 9222;
       this.skipFileRegexes = (args.skipFiles ?? []).map(compileGlob);
+      this.reloadOnAttach = args.reloadOnAttach ?? false;
 
       // Step 1: Detect Vite server
       this.viteServer = await detectFirstViteServer(args.viteUrl);
@@ -198,6 +214,7 @@ export class ViteDebugSession extends LoggingDebugSession {
       const webRoot = args.webRoot || process.cwd();
       const chromePort = args.chromePort || 9222;
       this.skipFileRegexes = (args.skipFiles ?? []).map(compileGlob);
+      this.reloadOnAttach = args.reloadOnAttach ?? false;
 
       // Detect Vite server
       this.viteServer = await detectFirstViteServer(args.viteUrl);
@@ -257,7 +274,11 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.urlMapper = new ViteUrlMapper(this.viteServer!.url, webRoot, viteRoot);
     this.sourceMapResolver = new SourceMapResolver(webRoot, viteRoot);
 
-    // Connect to Chrome
+    // Connect to Chrome WITHOUT enabling domains yet. Listeners must be in
+    // place before enable so the scriptParsed replay (and other replay-prone
+    // events) fans out into our handlers — registering them after enable
+    // would silently drop the replay, which is what made re-attach against
+    // an already-loaded page require a manual page reload to start working.
     this.cdp = await CdpClient.connect(chromePort, this.viteServer!.url);
 
     // Initialize managers (depends on cdp)
@@ -273,20 +294,6 @@ export class ViteDebugSession extends LoggingDebugSession {
       // Pause JS execution when a network breakpoint matches
       this.cdp?.pause();
     });
-
-    // Blackbox Vite-generated runtime code that has no source-map equivalent.
-    // We deliberately do NOT blanket-blackbox /node_modules/ — the user may
-    // want to step into library code, and when a source map is available the
-    // original source (e.g., react-dom.development.js) is readable. For
-    // unmappable dep scripts we apply a per-script blackbox range on-demand
-    // via markScriptUnmappable().
-    await this.cdp.setBlackboxPatterns([
-      '/@vite/',               // Vite client internals
-      '/@react-refresh',       // React refresh runtime
-      '__vite_',               // Vite HMR helpers
-      '@vite-plugin-checker',  // Vite plugins
-    ]);
-    logger.info('Blackbox patterns set for Vite runtime code');
 
     // Wire up source map loaded callback. Three responsibilities:
     //  (1) Resolve pending breakpoints against the newly mapped source.
@@ -317,13 +324,32 @@ export class ViteDebugSession extends LoggingDebugSession {
       }
     };
 
-    // Set up CDP event handlers
+    // Set up CDP event handlers BEFORE enabling domains. Debugger.enable
+    // immediately replays every already-parsed script via scriptParsed —
+    // we need our handler attached or those replays vanish.
     this.cdp.on('scriptParsed', (params: ScriptParsedEvent) => this.onScriptParsed(params));
     this.cdp.on('paused', (params: PausedEvent) => this.onPaused(params));
     this.cdp.on('resumed', () => this.onResumed());
     this.cdp.on('disconnected', () => this.onDisconnected());
     this.cdp.on('consoleAPICalled', (params: ConsoleAPICalledEvent) => this.onConsoleAPICalled(params));
     this.cdp.on('requestPaused', (params: FetchRequestPausedEvent) => this.networkBreakpointManager?.handleRequest(params));
+
+    // Now enable domains — replay events flow into the handlers above.
+    await this.cdp.enableDomains();
+
+    // Blackbox Vite-generated runtime code that has no source-map equivalent.
+    // We deliberately do NOT blanket-blackbox /node_modules/ — the user may
+    // want to step into library code, and when a source map is available the
+    // original source (e.g., react-dom.development.js) is readable. For
+    // unmappable dep scripts we apply a per-script blackbox range on-demand
+    // via markScriptUnmappable().
+    await this.cdp.setBlackboxPatterns([
+      '/@vite/',               // Vite client internals
+      '/@react-refresh',       // React refresh runtime
+      '__vite_',               // Vite HMR helpers
+      '@vite-plugin-checker',  // Vite plugins
+    ]);
+    logger.info('Blackbox patterns set for Vite runtime code');
 
     // Set exception breakpoint state
     await this.cdp.setPauseOnExceptions(this.exceptionBreakMode);
@@ -339,6 +365,18 @@ export class ViteDebugSession extends LoggingDebugSession {
     _args: DebugProtocol.ConfigurationDoneArguments
   ): void {
     this.sendResponse(response);
+
+    // Opt-in reload — only when user explicitly sets reloadOnAttach=true.
+    // Default off so the user keeps their page state on attach. CDP can't
+    // replay execution that already finished, so bps on already-mounted
+    // component bodies / top-level module code only hit if (a) the user
+    // triggers a re-render via interaction or (b) reloadOnAttach is on.
+    if (this.reloadOnAttach && this.cdp) {
+      logger.info('reloadOnAttach=true: reloading page so initial breakpoints catch the next execution');
+      this.cdp.reload(false).catch((e) => {
+        logger.warn(`Page.reload after attach failed: ${e}`);
+      });
+    }
   }
 
   // --- Breakpoints ---
@@ -361,6 +399,67 @@ export class ViteDebugSession extends LoggingDebugSession {
 
     response.body = { breakpoints };
     this.sendResponse(response);
+
+    // If any returned bp is unverified the source map for this file isn't
+    // loaded yet — typically because the module is lazy-routed and hasn't
+    // been imported by the running page yet. Nudge the browser to import
+    // it so its scriptParsed event fires, the source map loads, and the
+    // pending bp is resolved automatically (via onSourceMapLoaded). Without
+    // this the user has to navigate to the page that uses the module before
+    // any bp on it can hit.
+    const hasUnverified = breakpoints.some((bp) => !bp.verified);
+    if (hasUnverified && (args.breakpoints?.length ?? 0) > 0) {
+      this.tryProactiveModuleLoad(sourcePath).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Trigger `import('<viteUrl>')` in the running page so a lazy-loaded
+   * module is fetched and parsed, even if the user hasn't navigated to
+   * the route that imports it. This unblocks pending breakpoints on
+   * code-split files: once the module is imported, its scriptParsed +
+   * source-map-loaded path resolves the bp automatically.
+   *
+   * The import is fire-and-forget — failures (e.g. 404, syntax error,
+   * non-importable file like a `.css`) are swallowed because they're
+   * expected for many of the paths VSCode sends bps for (git: URIs,
+   * non-JS files, files that aren't actually under the Vite root).
+   */
+  private async tryProactiveModuleLoad(sourcePath: string): Promise<void> {
+    if (!this.cdp || !this.urlMapper) return;
+
+    // VSCode sometimes sends bps for git: / untitled: virtual sources during
+    // diff views. Those have no on-server URL — skip.
+    if (sourcePath.startsWith('git:') || sourcePath.startsWith('untitled:')) return;
+
+    // Only nudge for source files Vite will serve as ES modules. CSS / JSON /
+    // SVG bps are unusual and Vite returns these with non-module MIME, which
+    // would just throw a SyntaxError on import. Skip noisily-failing kinds.
+    if (!/\.(tsx?|jsx?|m?js|svelte|vue)$/i.test(sourcePath)) return;
+
+    const viteUrl = this.urlMapper.filePathToViteUrl(sourcePath);
+    if (this.proactivelyImportedUrls.has(viteUrl)) return;
+    this.proactivelyImportedUrls.add(viteUrl);
+
+    // Resolve to "ok" / error string inside the page so awaitPromise gives us
+    // the import outcome via returnByValue. Without awaitPromise we'd just
+    // see a pending promise and have no idea whether the page-side import
+    // actually completed (or failed silently with a 404 / CORS / MIME).
+    const expression = `
+      import(${JSON.stringify(viteUrl)})
+        .then(() => "__vdbg_ok__")
+        .catch((e) => "__vdbg_err__:" + (e && (e.message || e.toString()) || "unknown"))
+    `;
+    try {
+      const result = await this.cdp.evaluateForValue<string>(expression);
+      if (typeof result === 'string' && result.startsWith('__vdbg_err__:')) {
+        logger.warn(`Proactive import failed for ${viteUrl}: ${result.slice('__vdbg_err__:'.length)}`);
+      } else {
+        logger.debug(`Proactive import succeeded for ${viteUrl}`);
+      }
+    } catch (e) {
+      logger.warn(`Proactive import threw for ${viteUrl}: ${e}`);
+    }
   }
 
   /**
@@ -1764,6 +1863,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.variableManager?.clear();
     this.unmappableScripts.clear();
     this.compiledScripts.clear();
+    this.proactivelyImportedUrls.clear();
 
     if (this.cdp) {
       await this.cdp.disconnect();

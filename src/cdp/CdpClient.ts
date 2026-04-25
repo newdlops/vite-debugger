@@ -44,6 +44,17 @@ export class CdpClient extends EventEmitter {
     super();
   }
 
+  /**
+   * Open a CDP session and wire up the bridge from raw CDP events to this
+   * EventEmitter, but DO NOT enable any domain. Domain enable triggers
+   * replay (e.g. Debugger.enable replays every already-parsed script via
+   * Debugger.scriptParsed) — those replay events fan out through this
+   * EventEmitter, so the caller MUST attach its `.on('scriptParsed', …)` /
+   * `.on('paused', …)` / etc. listeners before calling `enableDomains()`.
+   * Otherwise the replay fires into a no-listener emitter and is silently
+   * dropped, which manifests as "re-attach against an already-loaded page
+   * shows no scripts and breakpoints never bind without a manual reload."
+   */
   static async connect(port: number, targetUrl?: string): Promise<CdpClient> {
     const cdpClient = new CdpClient();
 
@@ -67,15 +78,12 @@ export class CdpClient extends EventEmitter {
     const client = await CDP(options);
     cdpClient.client = client;
 
-    // Enable required domains
-    await Promise.all([
-      client.Debugger.enable({}),
-      client.Runtime.enable(),
-      client.Page.enable(),
-      client.Fetch.enable({ patterns: [{ requestStage: 'Request' }] }),
-    ]);
-
-    // Route CDP events
+    // Bridge CDP events to this EventEmitter. Registering the bridge here
+    // (before any domain is enabled) is necessary but not sufficient — see
+    // the class-level comment on `connect()`: the *consumer's* `.on(…)`
+    // listeners must also be in place before `enableDomains()` runs, since
+    // domain enable triggers immediate event replay that fan-outs through
+    // this same emitter.
     client.Debugger.scriptParsed((params: ScriptParsedEvent) => {
       cdpClient.emit('scriptParsed', params);
     });
@@ -108,6 +116,23 @@ export class CdpClient extends EventEmitter {
     return cdpClient;
   }
 
+  /**
+   * Enable the CDP domains we use. Must be called after the consumer has
+   * attached its event listeners — `Debugger.enable` immediately replays
+   * every already-parsed script, and those replay events go through this
+   * EventEmitter to the consumer's `.on('scriptParsed', …)`. Without that
+   * listener in place, re-attach to an existing page sees no scripts and
+   * breakpoints never bind until something causes a fresh parse.
+   */
+  async enableDomains(): Promise<void> {
+    await Promise.all([
+      this.client!.Debugger.enable({}),
+      this.client!.Runtime.enable(),
+      this.client!.Page.enable(),
+      this.client!.Fetch.enable({ patterns: [{ requestStage: 'Request' }] }),
+    ]);
+  }
+
   // --- Debugger Domain ---
 
   async setBreakpointByUrl(
@@ -121,6 +146,25 @@ export class CdpClient extends EventEmitter {
       columnNumber: options.columnNumber,
       condition: options.condition,
     });
+    // Surface whether Chrome actually bound the bp to a real script. If
+    // `locations` is empty the regex didn't match anything currently loaded,
+    // so the bp won't fire until a future scriptParsed (e.g., HMR or
+    // navigation) brings in a matching script. This is the diagnostic for
+    // "bp set but never hits without refresh" reports.
+    if (result.locations.length === 0) {
+      logger.warn(
+        `setBreakpointByUrl returned 0 bound locations: line=${lineNumber} ` +
+        `col=${options.columnNumber} urlRegex=${options.urlRegex} — bp will ` +
+        `wait for a matching script to be parsed`
+      );
+    } else {
+      logger.debug(
+        `setBreakpointByUrl bound to ${result.locations.length} location(s): ` +
+        result.locations.map((l: { scriptId: string; lineNumber: number; columnNumber?: number }) =>
+          `${l.scriptId}:${l.lineNumber}:${l.columnNumber ?? 0}`
+        ).join(', ')
+      );
+    }
     return {
       breakpointId: result.breakpointId,
       locations: result.locations.map((loc: { scriptId: string; lineNumber: number; columnNumber?: number }) => ({

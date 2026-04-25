@@ -17,13 +17,18 @@ export class ViteUrlMapper {
   filePathToViteUrl(filePath: string): string {
     const normalized = filePath.replace(/\\/g, '/');
 
-    // If the file is within the project root, use relative path
-    if (normalized.startsWith(this.webRoot)) {
-      const relative = normalized.slice(this.webRoot.length);
+    // Vite serves files relative to its project root (where vite.config lives),
+    // not webRoot. For monorepos webRoot may be the outer workspace folder
+    // (e.g. /Users/x/project) while viteRoot is a sub-package
+    // (e.g. /Users/x/project/client) — using webRoot here would produce
+    // /sub/src/foo.tsx which Vite returns 404 on.
+    if (normalized.startsWith(this.viteRoot)) {
+      const relative = normalized.slice(this.viteRoot.length);
       return `${this.viteUrl}${relative}`;
     }
 
-    // Files outside project root use /@fs/ prefix
+    // Files outside the Vite project root use the /@fs/ prefix Vite reserves
+    // for absolute filesystem paths (e.g. linked workspace deps).
     return `${this.viteUrl}/@fs${normalized}`;
   }
 
