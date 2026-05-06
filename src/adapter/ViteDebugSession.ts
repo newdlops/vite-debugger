@@ -157,6 +157,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     response.body.supportsExceptionOptions = true;
     response.body.supportsLoadedSourcesRequest = true;
     response.body.supportsBreakpointLocationsRequest = true;
+    response.body.supportedChecksumAlgorithms = ['SHA256'];
     response.body.exceptionBreakpointFilters = [
       {
         filter: 'uncaught',
@@ -971,23 +972,9 @@ export class ViteDebugSession extends LoggingDebugSession {
     const entries = [...this.knownScriptUrls]
       .filter(([url]) => !(url.includes('/@vite/') || url.includes('/@react-refresh') || url.includes('__vite_')));
 
-    const sources: DebugProtocol.Source[] = await Promise.all(entries.map(async ([url, scriptId]) => {
-      const filePath = this.urlMapper?.viteUrlToFilePath(url);
-      const source: DebugProtocol.Source = { name: url.split('/').pop() ?? url };
-
-      if (filePath && await fileExistsCache.existsAsync(filePath)) {
-        source.path = filePath;
-      } else {
-        const ref = this.nextSourceRef++;
-        this.sourceRefToScriptId.set(ref, scriptId);
-        source.sourceReference = ref;
-      }
-
-      if (url.includes('/node_modules/')) {
-        source.presentationHint = 'deemphasize';
-      }
-      return source;
-    }));
+    const sources: DebugProtocol.Source[] = await Promise.all(
+      entries.map(([url, scriptId]) => this.createSourceForScript(url, scriptId))
+    );
 
     response.body = { sources };
     this.sendResponse(response);
@@ -1131,27 +1118,37 @@ export class ViteDebugSession extends LoggingDebugSession {
       }
     }
 
-    // Notify VSCode's Loaded Sources panel
-    const loadedSource: DebugProtocol.Source = { name: params.url.split('/').pop() ?? params.url };
-    const filePath = this.urlMapper?.viteUrlToFilePath(params.url);
+    // Notify VSCode's Loaded Sources panel. Keep this shape identical to the
+    // loadedSourcesRequest response so VSCode does not drop checksum state
+    // after HMR and mark the top stack frame as modified/disabled.
+    const loadedSource = await this.createSourceForScript(params.url, params.scriptId);
+    this.sendEvent(new LoadedSourceEvent(isHmrReload ? 'changed' : 'new', loadedSource));
+  }
+
+  private async createSourceForScript(url: string, scriptId: string): Promise<DebugProtocol.Source> {
+    const normalizedUrl = normalizeViteUrl(url);
+    const source: DebugProtocol.Source = {
+      name: normalizedUrl.split('/').pop() ?? normalizedUrl,
+    };
+    const filePath = this.urlMapper?.viteUrlToFilePath(url);
+
     if (filePath && await fileExistsCache.existsAsync(filePath)) {
-      loadedSource.path = filePath;
-      // Include a current checksum so VSCode treats the file as in-sync with
-      // what the debugger is executing — especially important for HMR, where
-      // a save has just bumped the file's mtime and VSCode would otherwise
-      // flag all frames pointing at this source as stale/dimmed.
-      if (!filePath.includes('/node_modules/')) {
+      source.path = filePath;
+      if (filePath.includes('/node_modules/')) {
+        source.presentationHint = 'deemphasize';
+      } else {
         const sha = await fileChecksumCache.sha256(filePath);
         if (sha) {
-          loadedSource.checksums = [{ algorithm: 'SHA256', checksum: sha }];
+          source.checksums = [{ algorithm: 'SHA256', checksum: sha }];
         }
       }
     } else {
       const ref = this.nextSourceRef++;
-      this.sourceRefToScriptId.set(ref, params.scriptId);
-      loadedSource.sourceReference = ref;
+      this.sourceRefToScriptId.set(ref, scriptId);
+      source.sourceReference = ref;
     }
-    this.sendEvent(new LoadedSourceEvent(isHmrReload ? 'changed' : 'new', loadedSource));
+
+    return source;
   }
 
   /**

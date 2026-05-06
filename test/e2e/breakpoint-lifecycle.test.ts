@@ -243,6 +243,8 @@ describe('Breakpoint lifecycle regression (HMR + clear)', () => {
     const top = await getStackTopFrame();
     expect(top?.source?.path).toBe(mathPath);
     expect(top?.line).toBe(3);
+    expect(top?.source?.checksums?.[0]?.algorithm).toBe('SHA256');
+    expect(top?.source?.checksums?.[0]?.checksum).toMatch(/^[a-f0-9]{64}$/);
 
     await resumeIfPaused();
   }, 30_000);

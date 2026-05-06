@@ -56,6 +56,7 @@ describe('ViteDebugSession — full DAP flow', () => {
     expect(body.supportsConditionalBreakpoints).toBe(true);
     expect(body.supportsLogPoints).toBe(true);
     expect(body.supportsLoadedSourcesRequest).toBe(true);
+    expect(body.supportedChecksumAlgorithms).toContain('SHA256');
   });
 
   it('launch resolves the fixture Vite server and emits InitializedEvent', async () => {
@@ -121,6 +122,17 @@ describe('ViteDebugSession — full DAP flow', () => {
     expect(top.source?.path).toBe(mathPath);
     expect(top.line).toBe(2);
     expect(top.name.length).toBeGreaterThan(0);
+  });
+
+  it('loadedSources includes checksums for user files', async () => {
+    const resp = await session.dap.request<
+      DebugProtocol.LoadedSourcesRequest,
+      DebugProtocol.LoadedSourcesResponse
+    >('loadedSources', {});
+    const source = resp.body!.sources.find((s) => s.path === mathPath);
+    expect(source).toBeDefined();
+    expect(source?.checksums?.[0]?.algorithm).toBe('SHA256');
+    expect(source?.checksums?.[0]?.checksum).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it('scopes includes a Local scope with a and b defined', async () => {
