@@ -11,20 +11,14 @@ export interface BrowserSession {
    */
   triggerClick(selector: string): Promise<void>;
   textContent(selector: string): Promise<string | null>;
+  /** Poll until `selector` exists in the DOM (e.g. after React hydration). */
+  waitForSelector(selector: string, timeoutMs?: number): Promise<void>;
   close(): Promise<void>;
 }
 
-/**
- * Thin CDP-based page driver used by tests to trigger actions in the fixture
- * page (navigate, click a button). The debug-adapter under test uses its own
- * CDP connection on the same port — this test-side connection is separate so
- * the two can coexist.
- */
-export async function connectTestBrowser(chromePort: number): Promise<BrowserSession> {
-  const client = await CDP({ host: '127.0.0.1', port: chromePort });
-  const { Page, Runtime, DOM } = client;
-  await Promise.all([Page.enable(), Runtime.enable(), DOM.enable()]);
-
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function makeDriver(client: any): BrowserSession {
+  const { Page, Runtime } = client;
   return {
     async navigate(url: string) {
       await Page.navigate({ url });
@@ -68,8 +62,48 @@ export async function connectTestBrowser(chromePort: number): Promise<BrowserSes
       const { result } = await Runtime.evaluate({ expression: expr, returnByValue: true });
       return (result.value as string | null) ?? null;
     },
+    async waitForSelector(selector: string, timeoutMs = 10_000) {
+      const deadline = Date.now() + timeoutMs;
+      const expr = `!!document.querySelector(${JSON.stringify(selector)})`;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { result } = await Runtime.evaluate({ expression: expr, returnByValue: true });
+        if (result.value === true) return;
+        if (Date.now() > deadline) {
+          throw new Error(`waitForSelector timed out: ${selector}`);
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    },
     async close() {
       await client.close();
     },
   };
+}
+
+/**
+ * Thin CDP-based page driver used by tests to trigger actions in the fixture
+ * page (navigate, click a button). The debug-adapter under test uses its own
+ * CDP connection on the same port — this test-side connection is separate so
+ * the two can coexist.
+ */
+export async function connectTestBrowser(chromePort: number): Promise<BrowserSession> {
+  const client = await CDP({ host: '127.0.0.1', port: chromePort });
+  const { Page, Runtime, DOM } = client;
+  await Promise.all([Page.enable(), Runtime.enable(), DOM.enable()]);
+  return makeDriver(client);
+}
+
+/**
+ * Open a SECOND (or Nth) browser tab pointed at `url` and return a driver for
+ * it. Used by the multi-tab breakpoint test: each tab is a separate CDP target,
+ * and the adapter must auto-attach to it so breakpoints fire there too.
+ */
+export async function openTab(chromePort: number, url: string): Promise<BrowserSession> {
+  // CDP.New creates a fresh tab already navigated to `url`.
+  const target = await CDP.New({ host: '127.0.0.1', port: chromePort, url });
+  const client = await CDP({ host: '127.0.0.1', port: chromePort, target: target.id });
+  const { Page, Runtime, DOM } = client;
+  await Promise.all([Page.enable(), Runtime.enable(), DOM.enable()]);
+  return makeDriver(client);
 }

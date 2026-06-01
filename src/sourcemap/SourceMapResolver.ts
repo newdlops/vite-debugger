@@ -153,9 +153,6 @@ export class SourceMapResolver {
   /**
    * Track a script for lazy source map loading. Called immediately on scriptParsed.
    * Only stores metadata — does NOT fetch or parse the source map.
-   *
-   * URLs are normalized (Vite's ?v=/?t= cache-busters stripped) so HMR reloads
-   * of the same file are recognized and the old scriptId is cleaned up.
    */
   trackScript(scriptId: string, url: string, sourceMapUrl?: string): void {
     if (!sourceMapUrl || !url) return;
@@ -163,16 +160,12 @@ export class SourceMapResolver {
     const resolvedSmUrl = resolveSourceMapUrl(url, sourceMapUrl);
     this.scriptMetas.set(scriptId, { scriptId, url: normalizedUrl, sourceMapUrl: resolvedSmUrl });
 
-    // Clean up old entry for same URL (HMR reload). Comparing normalized URLs
-    // so `/src/App.tsx?v=old` and `/src/App.tsx?v=new` are recognized as the
-    // same logical file.
-    for (const [existingId, meta] of this.scriptMetas) {
-      if (meta.url === normalizedUrl && existingId !== scriptId) {
-        this.unregisterScript(existingId);
-        this.scriptMetas.delete(existingId);
-        break;
-      }
-    }
+    // Do NOT dedupe by URL here. The same file is parsed under a DIFFERENT
+    // scriptId in every browser tab (CDP numbers scripts per session, and we
+    // namespace scriptIds by session), so a URL-based purge would drop another
+    // tab's still-live mapping and break source resolution there. HMR cleanup
+    // of the previous scriptId for a URL is the caller's job: ViteDebugSession
+    // tracks the prior scriptId PER TAB and calls unregisterScript() on reload.
   }
 
   /**
@@ -341,20 +334,25 @@ export class SourceMapResolver {
 
   unregisterScript(scriptId: string): void {
     const entry = this.scripts.get(scriptId);
-    if (!entry) return;
-
-    for (const source of entry.sources) {
-      const scripts = this.sourceToScripts.get(source);
-      if (scripts) {
-        scripts.delete(scriptId);
-        if (scripts.size === 0) {
-          this.sourceToScripts.delete(source);
+    if (entry) {
+      for (const source of entry.sources) {
+        const scripts = this.sourceToScripts.get(source);
+        if (scripts) {
+          scripts.delete(scriptId);
+          if (scripts.size === 0) {
+            this.sourceToScripts.delete(source);
+          }
         }
       }
     }
 
+    // Always drop all per-scriptId state, even if the source map never loaded
+    // (entry is undefined) — this is the only cleanup now that trackScript no
+    // longer purges by URL, so it must be thorough.
     this.cache.delete(scriptId);
     this.scripts.delete(scriptId);
+    this.scriptMetas.delete(scriptId);
+    this.failedScripts.delete(scriptId);
   }
 
   async originalToGenerated(filePath: string, line: number, column: number = 0): Promise<GeneratedLocation | null> {

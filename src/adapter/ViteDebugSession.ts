@@ -81,7 +81,11 @@ export class ViteDebugSession extends LoggingDebugSession {
   private networkBreakpointManager: NetworkBreakpointManager | null = null;
 
   private resolvedFrames: ResolvedCallFrame[] = [];
-  private knownScriptUrls = new Map<string, string>();  // url -> latest scriptId
+  private knownScriptUrls = new Map<string, string>();  // url -> latest scriptId (any tab)
+  // HMR detection is per-tab (session): the SAME url is parsed with a different
+  // scriptId in every tab, so a global url->scriptId map would mistake a second
+  // tab's first parse for an HMR replacement. Keyed by sessionId -> (url -> scriptId).
+  private hmrScriptUrlsBySession = new Map<string, Map<string, string>>();
   private scriptIdToUrl = new Map<string, string>();     // scriptId -> url (for sourceRequest)
   private sourceRefToScriptId = new Map<number, string>(); // sourceReference -> scriptId
   private nextSourceRef = 1;
@@ -328,12 +332,27 @@ export class ViteDebugSession extends LoggingDebugSession {
     // Set up CDP event handlers BEFORE enabling domains. Debugger.enable
     // immediately replays every already-parsed script via scriptParsed —
     // we need our handler attached or those replays vanish.
-    this.cdp.on('scriptParsed', (params: ScriptParsedEvent) => this.onScriptParsed(params));
+    this.cdp.on('scriptParsed', (params: ScriptParsedEvent, sessionId?: string) => this.onScriptParsed(params, sessionId));
     this.cdp.on('paused', (params: PausedEvent) => this.onPaused(params));
     this.cdp.on('resumed', () => this.onResumed());
     this.cdp.on('disconnected', () => this.onDisconnected());
     this.cdp.on('consoleAPICalled', (params: ConsoleAPICalledEvent) => this.onConsoleAPICalled(params));
     this.cdp.on('requestPaused', (params: FetchRequestPausedEvent) => this.networkBreakpointManager?.handleRequest(params));
+
+    // A Vite app is often open in several tabs; each is a separate CDP target.
+    // We attach to all of them so breakpoints fire no matter which tab runs the
+    // code (and tabs opened later attach automatically).
+    this.cdp.on('targetAttached', (_sessionId: string, info: { url: string }) => {
+      this.sendEvent(new OutputEvent(
+        `Debugging tab: ${info.url} (${this.cdp?.attachedTabCount ?? 1} tab(s) attached)\n`, 'console'
+      ));
+    });
+    this.cdp.on('targetDetached', (sessionId: string) => {
+      this.hmrScriptUrlsBySession.delete(sessionId);
+      this.sendEvent(new OutputEvent(
+        `Tab closed (${this.cdp?.attachedTabCount ?? 0} tab(s) attached)\n`, 'console'
+      ));
+    });
 
     // Now enable domains — replay events flow into the handlers above.
     await this.cdp.enableDomains();
@@ -1060,13 +1079,29 @@ export class ViteDebugSession extends LoggingDebugSession {
 
   // --- CDP Event Handlers ---
 
-  private async onScriptParsed(params: ScriptParsedEvent): Promise<void> {
+  private async onScriptParsed(params: ScriptParsedEvent, sessionId?: string): Promise<void> {
     if (!params.url || !params.sourceMapURL) return;
 
     // Normalize for HMR detection — Vite's ?v=/?t= change on every reload.
     const normalizedUrl = normalizeViteUrl(params.url);
-    const previousScriptId = this.knownScriptUrls.get(normalizedUrl);
+
+    // HMR is detected per-tab (session): within ONE tab, the same url getting a
+    // new scriptId means the module was hot-replaced. Across tabs the same url
+    // naturally parses under different scriptIds — that is NOT an HMR event, and
+    // a global url->scriptId map would misfire a full breakpoint re-resolution
+    // every time a second tab loads.
+    const sessionKey = sessionId ?? '';
+    let perSession = this.hmrScriptUrlsBySession.get(sessionKey);
+    if (!perSession) {
+      perSession = new Map();
+      this.hmrScriptUrlsBySession.set(sessionKey, perSession);
+    }
+    const previousScriptId = perSession.get(normalizedUrl);
     const isHmrReload = previousScriptId !== undefined && previousScriptId !== params.scriptId;
+    perSession.set(normalizedUrl, params.scriptId);
+
+    // Global url -> latest scriptId (deduped by url across tabs), used by
+    // loadedSourcesRequest and console-message source resolution.
     this.knownScriptUrls.set(normalizedUrl, params.scriptId);
     this.scriptIdToUrl.set(params.scriptId, normalizedUrl);
     if (isHmrReload && previousScriptId) {
@@ -1861,6 +1896,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.unmappableScripts.clear();
     this.compiledScripts.clear();
     this.proactivelyImportedUrls.clear();
+    this.hmrScriptUrlsBySession.clear();
 
     if (this.cdp) {
       await this.cdp.disconnect();
