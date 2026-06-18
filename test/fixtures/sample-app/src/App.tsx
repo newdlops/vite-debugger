@@ -27,6 +27,46 @@ export function App(): JSX.Element {
       >
         multi-line-lambda
       </button>
+      <CallbackRunner
+        onRun={() => {
+          const n = add(state.version, 1000);
+          bump();
+          void n;
+        }}
+      />
+      <button
+        data-testid="callback-arg"
+        onClick={() => {
+          runCallback(() => {
+            const n = add(state.version, 2000);
+            bump();
+            void n;
+          });
+        }}
+      >
+        callback-arg
+      </button>
+      <button
+        data-testid="function-expression"
+        onClick={() => {
+          const run = function () {
+            const n = add(state.version, 3000);
+            bump();
+            void n;
+          };
+          run();
+        }}
+      >
+        function-expression
+      </button>
     </div>
   );
+}
+
+function CallbackRunner(props: { onRun: () => void }): JSX.Element {
+  return <button data-testid="component-prop" onClick={props.onRun}>component-prop</button>;
+}
+
+function runCallback(callback: () => void): void {
+  callback();
 }

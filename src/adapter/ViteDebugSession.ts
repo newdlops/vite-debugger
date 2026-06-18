@@ -1393,6 +1393,7 @@ export class ViteDebugSession extends LoggingDebugSession {
         this.resolvedFrames = await this.callStackManager.resolveCallFrames(
           params.callFrames, registerSourceRef
         );
+        await this.applyBreakpointSourceFallback(params);
         logger.debug(`onPaused: resolveCallFrames done in ${Date.now() - rcfStart}ms (${this.resolvedFrames.length} resolved)`);
       } catch (e) {
         logger.warn(`resolveCallFrames failed after ${Date.now() - rcfStart}ms, stopping with empty stack: ${e}`);
@@ -1448,6 +1449,35 @@ export class ViteDebugSession extends LoggingDebugSession {
         ? topScriptId
         : null;
     this.sendEvent(new StoppedEvent(reason, THREAD_ID));
+  }
+
+  private async applyBreakpointSourceFallback(params: PausedEvent): Promise<void> {
+    if (this.resolvedFrames.length === 0 || !this.breakpointManager) return;
+    const hit = this.breakpointManager.getBreakpointForCdpHit(params.hitBreakpoints);
+    if (!hit) return;
+
+    const top = this.resolvedFrames[0].dapFrame;
+    if (top.source?.path) return;
+
+    const source: DebugProtocol.Source = {
+      name: hit.sourcePath.split(/[\\/]/).pop() ?? hit.sourcePath,
+      path: hit.sourcePath,
+    };
+    if (!hit.sourcePath.includes('/node_modules/')) {
+      const sha = await fileChecksumCache.sha256(hit.sourcePath);
+      if (sha) {
+        source.checksums = [{ algorithm: 'SHA256', checksum: sha }];
+      }
+    }
+
+    top.source = source;
+    top.line = hit.line;
+    top.column = hit.column ?? top.column;
+    top.presentationHint = undefined;
+    logger.debug(
+      `Applied breakpoint source fallback for source-less pause: ` +
+      `${hit.sourcePath}:${hit.line}:${hit.column ?? top.column}`,
+    );
   }
 
   /**

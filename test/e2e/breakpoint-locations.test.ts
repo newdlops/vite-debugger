@@ -69,6 +69,12 @@ describe('Breakpoint locations + JSX/lambda column accuracy', () => {
     await session.browser.triggerClick(selector);
   }
 
+  function lineOf(needle: string): number {
+    const idx = appSource.split('\n').findIndex((line) => line.includes(needle));
+    if (idx < 0) throw new Error(`needle not found in App.tsx: ${needle}`);
+    return idx + 1;
+  }
+
   it('advertises supportsBreakpointLocationsRequest', async () => {
     // Capability is asserted once in the adapter suite; here we only depend
     // on breakpointLocations actually responding (VSCode would drop the
@@ -136,6 +142,117 @@ describe('Breakpoint locations + JSX/lambda column accuracy', () => {
     await resumeIfPaused();
   }, 30_000);
 
+  it('setting a breakpoint inside a component prop anonymous function pauses there', async () => {
+    const bpLine = lineOf('add(state.version, 1000)');
+    const set = await session.dap.request<
+      DebugProtocol.SetBreakpointsRequest,
+      DebugProtocol.SetBreakpointsResponse
+    >('setBreakpoints', {
+      source: { path: appPath },
+      breakpoints: [{ line: bpLine }],
+    });
+    expect(set.body!.breakpoints[0].verified).toBe(true);
+
+    session.dap.clearQueue('stopped');
+    const stopped = session.dap.waitForEvent('stopped', 6000);
+    await triggerClick('[data-testid="component-prop"]');
+    await stopped;
+
+    const stResp = await session.dap.request<
+      DebugProtocol.StackTraceRequest,
+      DebugProtocol.StackTraceResponse
+    >('stackTrace', { threadId: 1, startFrame: 0, levels: 1 });
+    const top = stResp.body!.stackFrames[0];
+    expect(top.source?.path).toBe(appPath);
+    expect(top.line).toBe(bpLine);
+
+    await resumeIfPaused();
+  }, 30_000);
+
+  it('line bp on a multi-line component prop anonymous function header pauses in its body', async () => {
+    const headerLine = lineOf('onRun={() => {');
+    const bodyLine = lineOf('add(state.version, 1000)');
+    const set = await session.dap.request<
+      DebugProtocol.SetBreakpointsRequest,
+      DebugProtocol.SetBreakpointsResponse
+    >('setBreakpoints', {
+      source: { path: appPath },
+      breakpoints: [{ line: headerLine }],
+    });
+    expect(set.body!.breakpoints[0].verified).toBe(true);
+
+    session.dap.clearQueue('stopped');
+    const stopped = session.dap.waitForEvent('stopped', 6000);
+    await triggerClick('[data-testid="component-prop"]');
+    await stopped;
+
+    const stResp = await session.dap.request<
+      DebugProtocol.StackTraceRequest,
+      DebugProtocol.StackTraceResponse
+    >('stackTrace', { threadId: 1, startFrame: 0, levels: 1 });
+    const top = stResp.body!.stackFrames[0];
+    expect(top.source?.path).toBe(appPath);
+    expect(top.line).toBe(bodyLine);
+
+    await resumeIfPaused();
+  }, 30_000);
+
+  it('line bp on an anonymous callback argument pauses in its body', async () => {
+    const headerLine = lineOf('runCallback(() => {');
+    const bodyLine = lineOf('add(state.version, 2000)');
+    const set = await session.dap.request<
+      DebugProtocol.SetBreakpointsRequest,
+      DebugProtocol.SetBreakpointsResponse
+    >('setBreakpoints', {
+      source: { path: appPath },
+      breakpoints: [{ line: headerLine }],
+    });
+    expect(set.body!.breakpoints[0].verified).toBe(true);
+
+    session.dap.clearQueue('stopped');
+    const stopped = session.dap.waitForEvent('stopped', 6000);
+    await triggerClick('[data-testid="callback-arg"]');
+    await stopped;
+
+    const stResp = await session.dap.request<
+      DebugProtocol.StackTraceRequest,
+      DebugProtocol.StackTraceResponse
+    >('stackTrace', { threadId: 1, startFrame: 0, levels: 1 });
+    const top = stResp.body!.stackFrames[0];
+    expect(top.source?.path).toBe(appPath);
+    expect(top.line).toBe(bodyLine);
+
+    await resumeIfPaused();
+  }, 30_000);
+
+  it('line bp on an anonymous function expression pauses in its body', async () => {
+    const headerLine = lineOf('const run = function () {');
+    const bodyLine = lineOf('add(state.version, 3000)');
+    const set = await session.dap.request<
+      DebugProtocol.SetBreakpointsRequest,
+      DebugProtocol.SetBreakpointsResponse
+    >('setBreakpoints', {
+      source: { path: appPath },
+      breakpoints: [{ line: headerLine }],
+    });
+    expect(set.body!.breakpoints[0].verified).toBe(true);
+
+    session.dap.clearQueue('stopped');
+    const stopped = session.dap.waitForEvent('stopped', 6000);
+    await triggerClick('[data-testid="function-expression"]');
+    await stopped;
+
+    const stResp = await session.dap.request<
+      DebugProtocol.StackTraceRequest,
+      DebugProtocol.StackTraceResponse
+    >('stackTrace', { threadId: 1, startFrame: 0, levels: 1 });
+    const top = stResp.body!.stackFrames[0];
+    expect(top.source?.path).toBe(appPath);
+    expect(top.line).toBe(bodyLine);
+
+    await resumeIfPaused();
+  }, 30_000);
+
   it('single-line lambda: column-specific bp pauses inside the arrow body', async () => {
     // Put the bp at the exact column of `add(` inside the arrow body on
     // line 19 — that position is well inside the lambda and cannot be
@@ -174,6 +291,42 @@ describe('Breakpoint locations + JSX/lambda column accuracy', () => {
     expect(top.line).toBe(19);
     // The pause must be inside the lambda — column should be at or after
     // where `add(` begins on that line.
+    expect(top.column ?? 0).toBeGreaterThanOrEqual(colAdd0);
+
+    await resumeIfPaused();
+  }, 30_000);
+
+  it('single-line lambda: line-only bp pauses inside the arrow body, not the JSX call site', async () => {
+    // This is the gutter-click path VSCode sends for a line breakpoint:
+    // no column, just the original source line. For JSX prop callbacks,
+    // the same original line contains both the outer JSX/createElement
+    // expression and the anonymous function body. The adapter must prefer
+    // the function body so the breakpoint hits when the handler runs.
+    const line19 = appSource.split('\n')[18]; // 0-based index
+    const colAdd0 = line19.indexOf('add(');
+    expect(colAdd0).toBeGreaterThan(0);
+
+    const set = await session.dap.request<
+      DebugProtocol.SetBreakpointsRequest,
+      DebugProtocol.SetBreakpointsResponse
+    >('setBreakpoints', {
+      source: { path: appPath },
+      breakpoints: [{ line: 19 }],
+    });
+    expect(set.body!.breakpoints[0].verified).toBe(true);
+
+    session.dap.clearQueue('stopped');
+    const stopped = session.dap.waitForEvent('stopped', 6000);
+    await triggerClick('[data-testid="lambda-one"]');
+    await stopped;
+
+    const stResp = await session.dap.request<
+      DebugProtocol.StackTraceRequest,
+      DebugProtocol.StackTraceResponse
+    >('stackTrace', { threadId: 1, startFrame: 0, levels: 1 });
+    const top = stResp.body!.stackFrames[0];
+    expect(top.source?.path).toBe(appPath);
+    expect(top.line).toBe(19);
     expect(top.column ?? 0).toBeGreaterThanOrEqual(colAdd0);
 
     await resumeIfPaused();

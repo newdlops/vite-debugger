@@ -201,7 +201,7 @@ export class CdpClient extends EventEmitter {
       // The paused tab becomes the active session: its call frames, scopes and
       // object ids are only valid against this session.
       if (sessionId) this.activeSessionId = sessionId;
-      this.emit('paused', this.globalizePausedScriptIds(params, sessionId), sessionId);
+      this.emit('paused', this.globalizePausedEvent(params, sessionId), sessionId);
     });
 
     client.Debugger.resumed((_params: unknown, sessionId?: string) => {
@@ -437,11 +437,14 @@ export class CdpClient extends EventEmitter {
     return { sessionId: sessionId ?? this.requireActiveSession(), rawScriptId };
   }
 
-  /** Rewrite the scriptId of every call frame location to its global form. */
-  private globalizePausedScriptIds(params: PausedEvent, sessionId?: string): PausedEvent {
+  /** Rewrite script ids and URL-breakpoint ids to adapter-level ids. */
+  private globalizePausedEvent(params: PausedEvent, sessionId?: string): PausedEvent {
     if (!sessionId) return params;
     return {
       ...params,
+      hitBreakpoints: params.hitBreakpoints?.map((breakpointId) =>
+        this.toUrlBreakpointHandle(breakpointId, sessionId) ?? breakpointId
+      ),
       callFrames: params.callFrames.map((frame) => ({
         ...frame,
         location: {
@@ -450,6 +453,13 @@ export class CdpClient extends EventEmitter {
         },
       })),
     };
+  }
+
+  private toUrlBreakpointHandle(cdpBreakpointId: string, sessionId: string): string | undefined {
+    for (const [handle, ids] of this.urlBreakpointIds) {
+      if (ids.get(sessionId) === cdpBreakpointId) return handle;
+    }
+    return undefined;
   }
 
   private recordBreakpointId(handle: string, sessionId: string, cdpBreakpointId: string): void {
