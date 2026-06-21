@@ -59,6 +59,19 @@ export function App(): JSX.Element {
       >
         function-expression
       </button>
+      <button
+        data-testid="arrow-variable"
+        onClick={() => {
+          const run = () => {
+            const n = add(state.version, 4000);
+            bump();
+            void n;
+          };
+          run();
+        }}
+      >
+        arrow-variable
+      </button>
     </div>
   );
 }

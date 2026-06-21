@@ -225,15 +225,14 @@ describe('Breakpoint locations + JSX/lambda column accuracy', () => {
     await resumeIfPaused();
   }, 30_000);
 
-  it('line bp on an anonymous function expression pauses in its body', async () => {
-    const headerLine = lineOf('const run = function () {');
-    const bodyLine = lineOf('add(state.version, 3000)');
+  it('line bp on a function-expression variable declaration pauses at the definition', async () => {
+    const definitionLine = lineOf('const run = function () {');
     const set = await session.dap.request<
       DebugProtocol.SetBreakpointsRequest,
       DebugProtocol.SetBreakpointsResponse
     >('setBreakpoints', {
       source: { path: appPath },
-      breakpoints: [{ line: headerLine }],
+      breakpoints: [{ line: definitionLine }],
     });
     expect(set.body!.breakpoints[0].verified).toBe(true);
 
@@ -248,7 +247,34 @@ describe('Breakpoint locations + JSX/lambda column accuracy', () => {
     >('stackTrace', { threadId: 1, startFrame: 0, levels: 1 });
     const top = stResp.body!.stackFrames[0];
     expect(top.source?.path).toBe(appPath);
-    expect(top.line).toBe(bodyLine);
+    expect(top.line).toBe(definitionLine);
+
+    await resumeIfPaused();
+  }, 30_000);
+
+  it('line bp on an arrow-function variable declaration pauses at the definition', async () => {
+    const definitionLine = lineOf('const run = () => {');
+    const set = await session.dap.request<
+      DebugProtocol.SetBreakpointsRequest,
+      DebugProtocol.SetBreakpointsResponse
+    >('setBreakpoints', {
+      source: { path: appPath },
+      breakpoints: [{ line: definitionLine }],
+    });
+    expect(set.body!.breakpoints[0].verified).toBe(true);
+
+    session.dap.clearQueue('stopped');
+    const stopped = session.dap.waitForEvent('stopped', 6000);
+    await triggerClick('[data-testid="arrow-variable"]');
+    await stopped;
+
+    const stResp = await session.dap.request<
+      DebugProtocol.StackTraceRequest,
+      DebugProtocol.StackTraceResponse
+    >('stackTrace', { threadId: 1, startFrame: 0, levels: 1 });
+    const top = stResp.body!.stackFrames[0];
+    expect(top.source?.path).toBe(appPath);
+    expect(top.line).toBe(definitionLine);
 
     await resumeIfPaused();
   }, 30_000);

@@ -745,11 +745,13 @@ function anonymousFunctionBodyStart(
   const functionMatch = /(?:^|[^\w$])(?:async\s+)?function\s*\*?\s*\(/.exec(lineText);
 
   if (arrowIndex >= 0 && (functionMatch === null || arrowIndex < functionMatch.index)) {
+    if (isVariableFunctionInitializer(lineText, arrowIndex)) return null;
     return arrowFunctionBodyStart(lines, line, arrowIndex + 2);
   }
 
   if (functionMatch) {
     const functionIndex = functionMatch.index + functionMatch[0].lastIndexOf('function');
+    if (isVariableFunctionInitializer(lineText, functionIndex)) return null;
     const openBrace = lineText.indexOf('{', functionIndex);
     if (openBrace >= 0) {
       return blockBodyFirstExecutableLocation(lines, line, openBrace + 1);
@@ -757,6 +759,12 @@ function anonymousFunctionBodyStart(
   }
 
   return null;
+}
+
+function isVariableFunctionInitializer(lineText: string, functionStartIndex: number): boolean {
+  const prefix = lineText.slice(0, functionStartIndex);
+  return /^\s*(?:export\s+)?(?:declare\s+)?(?:const|let|var)\s+/.test(prefix)
+    && prefix.includes('=');
 }
 
 function arrowFunctionBodyStart(
