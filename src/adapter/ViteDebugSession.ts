@@ -19,7 +19,7 @@ import {
   findExistingChromeDebugPort,
   launchDebugChrome,
 } from '../cdp/ChromeDiscovery';
-import { detectFirstViteServer, ViteServerInfo } from '../vite/ViteServerDetector';
+import { detectFirstViteServer, formatViteServerInfo, ViteServerInfo } from '../vite/ViteServerDetector';
 import { ViteUrlMapper } from '../vite/ViteUrlMapper';
 import { SourceMapResolver, normalizeViteUrl } from '../sourcemap/SourceMapResolver';
 import { fileExistsCache } from '../util/FileExists';
@@ -194,8 +194,8 @@ export class ViteDebugSession extends LoggingDebugSession {
         this.sendErrorResponse(response, 1001, 'No running Vite dev server found. Start Vite first with `npm run dev`.');
         return;
       }
-      logger.info(`Vite server found: ${this.viteServer.url}`);
-      this.sendEvent(new OutputEvent(`Vite server: ${this.viteServer.url}\n`, 'console'));
+      logger.info(`Vite server found: ${formatViteServerInfo(this.viteServer)}`);
+      this.sendEvent(new OutputEvent(`Vite server: ${formatViteServerInfo(this.viteServer)}\n`, 'console'));
 
       // Step 2: Find Chrome with debug port
       const activeChromePort = await this.ensureChromeDebugPort(chromePort);
@@ -227,7 +227,7 @@ export class ViteDebugSession extends LoggingDebugSession {
         this.sendErrorResponse(response, 1001, 'No running Vite dev server found.');
         return;
       }
-      logger.info(`Vite server found: ${this.viteServer.url}`);
+      logger.info(`Vite server found: ${formatViteServerInfo(this.viteServer)}`);
 
       // Find Chrome debug port (attach mode: won't launch new Chrome, but will restart if needed)
       const activeChromePort = await this.ensureChromeDebugPort(chromePort);

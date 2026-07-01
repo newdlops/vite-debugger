@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { ViteDebugSession } from './adapter/ViteDebugSession';
-import { detectViteServers } from './vite/ViteServerDetector';
+import { detectViteServers, formatViteServerDescription, formatViteServerInfo } from './vite/ViteServerDetector';
 import { isChromeDebuggable } from './cdp/ChromeDiscovery';
 import { initLogger, LogLevel } from './util/Logger';
 import { ViteInlineValuesProvider } from './providers/InlineValuesProvider';
@@ -144,7 +144,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const picked = await vscode.window.showQuickPick(
           servers.map(s => ({
             label: s.url,
-            description: s.version ? `Vite ${s.version}` : undefined,
+            description: formatViteServerDescription(s),
           })),
           { placeHolder: 'Select Vite server to debug' }
         );
@@ -171,9 +171,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (servers.length === 0) {
         vscode.window.showInformationMessage('No Vite dev servers detected.');
       } else {
-        const items = servers.map(s =>
-          `${s.url}${s.version ? ` (Vite ${s.version})` : ''}`
-        );
+        const items = servers.map(formatViteServerInfo);
         vscode.window.showInformationMessage(
           `Found ${servers.length} Vite server(s): ${items.join(', ')}`
         );

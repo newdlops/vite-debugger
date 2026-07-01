@@ -1,5 +1,7 @@
 import * as http from 'http';
 import * as childProcess from 'child_process';
+import * as dns from 'dns';
+import * as net from 'net';
 import * as os from 'os';
 import { logger } from '../util/Logger';
 import { isLoopbackHost, isWildcardHost, normalizeHost } from '../util/LocalHosts';
@@ -7,6 +9,7 @@ import { isLoopbackHost, isWildcardHost, normalizeHost } from '../util/LocalHost
 export interface ViteServerInfo {
   url: string;
   version?: string;
+  dnsHostnames?: string[];
   root?: string;  // Absolute path of the Vite project root (e.g., /Users/.../zuzu/client)
 }
 
@@ -14,6 +17,8 @@ interface ListeningEndpoint {
   host?: string;
   port: number;
 }
+
+const DNS_LOOKUP_TIMEOUT_MS = 500;
 
 function httpGet(url: string, timeout: number = 3000): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
@@ -30,6 +35,28 @@ function httpGet(url: string, timeout: number = 3000): Promise<{ status: number;
       reject(new Error('Request timeout'));
     });
   });
+}
+
+function formatDnsHostnames(server: ViteServerInfo): string | undefined {
+  return server.dnsHostnames && server.dnsHostnames.length > 0
+    ? server.dnsHostnames.join(', ')
+    : undefined;
+}
+
+export function formatViteServerInfo(server: ViteServerInfo): string {
+  const details: string[] = [];
+  const dnsHostnames = formatDnsHostnames(server);
+  if (dnsHostnames) details.push(`DNS: ${dnsHostnames}`);
+  if (server.version) details.push(`Vite ${server.version}`);
+  return `${server.url}${details.length > 0 ? ` (${details.join(', ')})` : ''}`;
+}
+
+export function formatViteServerDescription(server: ViteServerInfo): string | undefined {
+  const details: string[] = [];
+  const dnsHostnames = formatDnsHostnames(server);
+  if (dnsHostnames) details.push(dnsHostnames);
+  if (server.version) details.push(`Vite ${server.version}`);
+  return details.length > 0 ? details.join(' | ') : undefined;
 }
 
 /**
@@ -105,6 +132,59 @@ function validEndpoint(host: string | undefined, portText: string): ListeningEnd
   };
 }
 
+async function withTimeout<T>(promise: Promise<T>, fallback: T, timeoutMs: number): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(fallback);
+      },
+    );
+  });
+}
+
+function normalizeDnsHostname(hostname: string): string {
+  return hostname.replace(/\.$/, '');
+}
+
+async function reverseDnsHostnamesForUrl(baseUrl: string): Promise<string[]> {
+  let host: string;
+  try {
+    host = normalizeHost(new URL(baseUrl).hostname);
+  } catch {
+    return [];
+  }
+
+  if (net.isIP(host) === 0) return [];
+
+  const resolved = await withTimeout(
+    dns.promises.reverse(host),
+    [],
+    DNS_LOOKUP_TIMEOUT_MS,
+  );
+  const seen = new Set<string>();
+  return resolved
+    .map(normalizeDnsHostname)
+    .filter((hostname) => {
+      const key = hostname.toLowerCase();
+      if (!hostname || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+async function addDnsHostnames(server: ViteServerInfo): Promise<ViteServerInfo> {
+  const dnsHostnames = await reverseDnsHostnamesForUrl(server.url);
+  if (dnsHostnames.length === 0) return server;
+  logger.debug(`Reverse DNS for ${server.url}: ${dnsHostnames.join(', ')}`);
+  return { ...server, dnsHostnames };
+}
+
 async function probeViteHost(baseUrl: string): Promise<ViteServerInfo | null> {
   try {
     // Primary check: /@vite/client endpoint — unique to Vite
@@ -119,7 +199,7 @@ async function probeViteHost(baseUrl: string): Promise<ViteServerInfo | null> {
       if (isJs || bodyHasVite) {
         logger.info(`Vite server detected at ${baseUrl} via /@vite/client`);
         const versionMatch = clientRes.body.match(/vite\/dist\/client|vite\/([\d.]+)/i);
-        return { url: baseUrl, version: versionMatch?.[1] };
+        return addDnsHostnames({ url: baseUrl, version: versionMatch?.[1] });
       }
     }
   } catch { /* try fallback */ }
@@ -129,7 +209,7 @@ async function probeViteHost(baseUrl: string): Promise<ViteServerInfo | null> {
     const htmlRes = await httpGet(baseUrl);
     if (htmlRes.status === 200 && htmlRes.body.includes('/@vite/client')) {
       logger.info(`Vite server detected at ${baseUrl} via HTML content`);
-      return { url: baseUrl };
+      return addDnsHostnames({ url: baseUrl });
     }
   } catch { /* not a vite server on this host */ }
 

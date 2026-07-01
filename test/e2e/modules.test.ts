@@ -3,7 +3,7 @@ import * as path from 'path';
 import { ViteUrlMapper } from '../../src/vite/ViteUrlMapper';
 import { normalizeViteUrl, SourceMapResolver } from '../../src/sourcemap/SourceMapResolver';
 import { hostsEquivalent, isLoopbackHost, urlHostPatternForHost } from '../../src/util/LocalHosts';
-import { detectFirstViteServer } from '../../src/vite/ViteServerDetector';
+import { detectFirstViteServer, formatViteServerDescription, formatViteServerInfo } from '../../src/vite/ViteServerDetector';
 import { isChromeDebuggable } from '../../src/cdp/ChromeDiscovery';
 import { FixtureViteServer, startFixtureVite } from '../helpers/viteServer';
 import { LaunchedChrome, launchTestChrome } from '../helpers/chrome';
@@ -101,6 +101,28 @@ describe('local host helpers', () => {
     expect(pattern.test('http://127.112.252.216:3004/src/App.tsx')).toBe(true);
     expect(pattern.test('http://127.0.0.1:3004/src/App.tsx')).toBe(true);
     expect(pattern.test('http://localhost:3004/src/App.tsx')).toBe(true);
+  });
+});
+
+describe('Vite server display helpers', () => {
+  it('includes reverse DNS hostnames when available', () => {
+    const server = {
+      url: 'http://127.112.252.216:3004',
+      version: '5.4.0',
+      dnsHostnames: ['captain.local'],
+    };
+
+    expect(formatViteServerInfo(server))
+      .toBe('http://127.112.252.216:3004 (DNS: captain.local, Vite 5.4.0)');
+    expect(formatViteServerDescription(server))
+      .toBe('captain.local | Vite 5.4.0');
+  });
+
+  it('keeps the old display shape when no DNS hostname exists', () => {
+    expect(formatViteServerInfo({ url: 'http://127.0.0.1:5173' }))
+      .toBe('http://127.0.0.1:5173');
+    expect(formatViteServerDescription({ url: 'http://127.0.0.1:5173' }))
+      .toBeUndefined();
   });
 });
 
