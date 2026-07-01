@@ -2,11 +2,17 @@ import * as http from 'http';
 import * as childProcess from 'child_process';
 import * as os from 'os';
 import { logger } from '../util/Logger';
+import { isLoopbackHost, isWildcardHost, normalizeHost } from '../util/LocalHosts';
 
 export interface ViteServerInfo {
   url: string;
   version?: string;
   root?: string;  // Absolute path of the Vite project root (e.g., /Users/.../zuzu/client)
+}
+
+interface ListeningEndpoint {
+  host?: string;
+  port: number;
 }
 
 function httpGet(url: string, timeout: number = 3000): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
@@ -27,20 +33,20 @@ function httpGet(url: string, timeout: number = 3000): Promise<{ status: number;
 }
 
 /**
- * Find all TCP ports that node processes are listening on,
+ * Find TCP endpoints that node/Vite-like processes are listening on,
  * by querying the OS directly. Works on macOS, Linux, and Windows.
  */
-function getNodeListeningPorts(): Promise<number[]> {
+function getNodeListeningEndpoints(): Promise<ListeningEndpoint[]> {
   return new Promise((resolve) => {
     const platform = os.platform();
     let cmd: string;
 
     if (platform === 'darwin') {
       // macOS: lsof is the most reliable
-      cmd = `lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null | awk '/node|vite|tsx|ts-node|esbuild|bun|deno/{print $9}'`;
+      cmd = `lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null | awk '/node|vite|tsx|ts-node|esbuild|bun|deno|portmanager/{print $9}'`;
     } else if (platform === 'linux') {
       // Linux: ss is faster and more widely available than lsof
-      cmd = `ss -tlnp 2>/dev/null | awk '/node|vite/{match($4, /:([0-9]+)$/, a); print a[1]}'`;
+      cmd = `ss -tlnp 2>/dev/null | awk '/node|vite|tsx|ts-node|esbuild|bun|deno|portmanager/{print $4}'`;
     } else if (platform === 'win32') {
       // Windows: netstat + tasklist combo
       cmd = `powershell -Command "Get-NetTCPConnection -State Listen | Where-Object { (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName -match 'node|vite' } | Select-Object -ExpandProperty LocalPort"`;
@@ -56,23 +62,47 @@ function getNodeListeningPorts(): Promise<number[]> {
         return;
       }
 
-      const ports = new Set<number>();
+      const endpoints = new Map<string, ListeningEndpoint>();
       const lines = stdout.trim().split('\n').filter(Boolean);
 
       for (const line of lines) {
-        // Extract port number — handle formats like "*:3004", "127.0.0.1:5173", "3004"
-        const match = line.match(/:(\d+)$/) || line.match(/^(\d+)$/);
-        if (match) {
-          const port = parseInt(match[1], 10);
-          if (port > 0 && port <= 65535) {
-            ports.add(port);
-          }
-        }
+        const endpoint = parseListeningEndpoint(line);
+        if (!endpoint) continue;
+        const hostKey = endpoint.host ? normalizeHost(endpoint.host) : '*';
+        endpoints.set(`${hostKey}:${endpoint.port}`, endpoint);
       }
 
-      resolve([...ports].sort((a, b) => a - b));
+      resolve([...endpoints.values()].sort((a, b) => {
+        if (a.port !== b.port) return a.port - b.port;
+        return (a.host ?? '').localeCompare(b.host ?? '');
+      }));
     });
   });
+}
+
+function parseListeningEndpoint(line: string): ListeningEndpoint | null {
+  const raw = line.trim();
+  const portOnly = raw.match(/^(\d+)$/);
+  if (portOnly) return validEndpoint(undefined, portOnly[1]);
+
+  const bracketed = raw.match(/^\[([^\]]+)\]:(\d+)$/);
+  if (bracketed) return validEndpoint(bracketed[1], bracketed[2]);
+
+  const colon = raw.lastIndexOf(':');
+  if (colon < 0) return null;
+
+  const host = raw.slice(0, colon);
+  const port = raw.slice(colon + 1);
+  return validEndpoint(host, port);
+}
+
+function validEndpoint(host: string | undefined, portText: string): ListeningEndpoint | null {
+  const port = parseInt(portText, 10);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  return {
+    host: isWildcardHost(host) ? undefined : host,
+    port,
+  };
 }
 
 async function probeViteHost(baseUrl: string): Promise<ViteServerInfo | null> {
@@ -106,10 +136,30 @@ async function probeViteHost(baseUrl: string): Promise<ViteServerInfo | null> {
   return null;
 }
 
-async function isViteServer(port: number): Promise<ViteServerInfo | null> {
-  // Probe both hostnames in parallel — `localhost` and `127.0.0.1` resolve to
-  // the same socket on most setups, so one request should succeed fast.
-  const probes = ['localhost', '127.0.0.1'].map(h => probeViteHost(`http://${h}:${port}`));
+function probeHostsForEndpoint(endpoint: ListeningEndpoint): string[] {
+  const hosts: string[] = [];
+  if (endpoint.host && !isWildcardHost(endpoint.host)) {
+    hosts.push(endpoint.host);
+    if (isLoopbackHost(endpoint.host)) {
+      hosts.push('localhost', '127.0.0.1');
+    }
+  } else {
+    hosts.push('localhost', '127.0.0.1');
+  }
+
+  const seen = new Set<string>();
+  return hosts.filter((host) => {
+    const key = normalizeHost(host);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function isViteServer(endpoint: ListeningEndpoint): Promise<ViteServerInfo | null> {
+  // Probe the host reported by the OS first. This matters when tools bind Vite
+  // to a virtual 127.x.x.x loopback address instead of 127.0.0.1.
+  const probes = probeHostsForEndpoint(endpoint).map(h => probeViteHost(`http://${h}:${endpoint.port}`));
   const results = await Promise.all(probes);
   return results.find(r => r !== null) ?? null;
 }
@@ -119,28 +169,32 @@ export async function detectViteServers(preferredUrl?: string): Promise<ViteServ
   if (preferredUrl) {
     try {
       const url = new URL(preferredUrl);
-      const port = parseInt(url.port) || 80;
-      const result = await isViteServer(port);
+      const result = await probeViteHost(url.origin);
       if (result) return [result];
     } catch {
       logger.warn(`Invalid preferred URL: ${preferredUrl}`);
     }
   }
 
-  // Discover ports from running node processes (covers ALL ports)
-  const ports = await getNodeListeningPorts();
-  logger.debug(`Node listening ports: ${ports.join(', ') || '(none)'}`);
+  // Discover endpoints from running node/Vite-like processes.
+  const endpoints = await getNodeListeningEndpoints();
+  logger.debug(
+    `Node listening endpoints: ${endpoints.map(e => `${e.host ?? '*'}:${e.port}`).join(', ') || '(none)'}`,
+  );
 
-  if (ports.length === 0) {
+  if (endpoints.length === 0) {
     logger.info('No node processes listening on any port');
     return [];
   }
 
-  // Check each port for Vite in parallel
+  // Check each endpoint for Vite in parallel
   const servers: ViteServerInfo[] = [];
-  const results = await Promise.all(ports.map(port => isViteServer(port)));
+  const seenUrls = new Set<string>();
+  const results = await Promise.all(endpoints.map(endpoint => isViteServer(endpoint)));
   for (const result of results) {
-    if (result) servers.push(result);
+    if (!result || seenUrls.has(result.url)) continue;
+    seenUrls.add(result.url);
+    servers.push(result);
   }
 
   logger.info(`Detected ${servers.length} Vite server(s)`);

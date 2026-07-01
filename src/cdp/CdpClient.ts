@@ -13,6 +13,7 @@ import {
   RequestPattern,
 } from './CdpTypes';
 import { logger } from '../util/Logger';
+import { hostsEquivalent } from '../util/LocalHosts';
 
 export interface ScriptParsedEvent {
   scriptId: string;
@@ -394,8 +395,7 @@ export class CdpClient extends EventEmitter {
     try {
       const a = new URL(url);
       const b = new URL(filter);
-      const host = (h: string) => (h === 'localhost' ? '127.0.0.1' : h);
-      return host(a.hostname) === host(b.hostname) && a.port === b.port;
+      return hostsEquivalent(a.hostname, b.hostname) && a.port === b.port;
     } catch {
       return false;
     }

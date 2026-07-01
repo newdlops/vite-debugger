@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import * as path from 'path';
 import { ViteUrlMapper } from '../../src/vite/ViteUrlMapper';
 import { normalizeViteUrl, SourceMapResolver } from '../../src/sourcemap/SourceMapResolver';
+import { hostsEquivalent, isLoopbackHost, urlHostPatternForHost } from '../../src/util/LocalHosts';
 import { detectFirstViteServer } from '../../src/vite/ViteServerDetector';
 import { isChromeDebuggable } from '../../src/cdp/ChromeDiscovery';
 import { FixtureViteServer, startFixtureVite } from '../helpers/viteServer';
@@ -79,6 +80,27 @@ describe('normalizeViteUrl', () => {
   it('is a no-op for URLs without a query string', () => {
     expect(normalizeViteUrl('http://127.0.0.1:5173/src/App.tsx'))
       .toBe('http://127.0.0.1:5173/src/App.tsx');
+  });
+});
+
+describe('local host helpers', () => {
+  it('treats the full 127/8 range as loopback', () => {
+    expect(isLoopbackHost('127.0.0.1')).toBe(true);
+    expect(isLoopbackHost('127.126.242.66')).toBe(true);
+    expect(isLoopbackHost('192.168.0.1')).toBe(false);
+  });
+
+  it('matches localhost and virtual 127/8 hosts as equivalent', () => {
+    expect(hostsEquivalent('localhost', '127.112.252.216')).toBe(true);
+    expect(hostsEquivalent('127.0.0.1', '127.130.195.13')).toBe(true);
+    expect(hostsEquivalent('localhost', '10.0.0.5')).toBe(false);
+  });
+
+  it('builds URL host patterns that include virtual 127/8 hosts', () => {
+    const pattern = new RegExp(`^https?://${urlHostPatternForHost('127.112.252.216')}:3004/src/App\\.tsx$`);
+    expect(pattern.test('http://127.112.252.216:3004/src/App.tsx')).toBe(true);
+    expect(pattern.test('http://127.0.0.1:3004/src/App.tsx')).toBe(true);
+    expect(pattern.test('http://localhost:3004/src/App.tsx')).toBe(true);
   });
 });
 

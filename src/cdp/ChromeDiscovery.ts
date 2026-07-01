@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as fs from 'fs';
 import { logger } from '../util/Logger';
 import { isPortOpen } from '../util/PortScanner';
+import { hostsEquivalent } from '../util/LocalHosts';
 
 export interface ChromeTarget {
   id: string;
@@ -73,11 +74,11 @@ export async function findViteTab(chromePort: number, viteUrl: string): Promise<
   });
   if (target) return target;
 
-  // Localhost variations (localhost ↔ 127.0.0.1, same port)
+  // Localhost variations (localhost ↔ 127/8 loopback aliases, same port)
   target = targets.find(t => {
     try {
       const tUrl = new URL(t.url);
-      return (tUrl.hostname === 'localhost' || tUrl.hostname === '127.0.0.1') &&
+      return hostsEquivalent(tUrl.hostname, new URL(viteUrl).hostname) &&
              tUrl.port === vitePort;
     } catch { return false; }
   });

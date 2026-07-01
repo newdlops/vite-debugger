@@ -4,6 +4,7 @@ import { CdpClient } from '../cdp/CdpClient';
 import { SourceMapResolver } from '../sourcemap/SourceMapResolver';
 import { fileChecksumCache } from '../util/FileChecksum';
 import { logger } from '../util/Logger';
+import { escapeRegexLiteral, urlHostPatternForHost } from '../util/LocalHosts';
 
 interface ManagedBreakpoint {
   dapId: number;
@@ -711,25 +712,23 @@ export class BreakpointManager {
     // Build a URL regex that matches the Vite-served version of this file
     // e.g., /src/App.tsx -> matches http://localhost:5173/src/App.tsx
     const normalizedPath = sourcePath.replace(/\\/g, '/');
-    const port = new URL(this.viteUrl).port;
+    const vite = new URL(this.viteUrl);
+    const port = vite.port;
+    const hostPattern = urlHostPatternForHost(vite.hostname);
 
     let regex: string;
     const srcIndex = normalizedPath.lastIndexOf('/src/');
     if (srcIndex !== -1) {
       const relative = normalizedPath.slice(srcIndex);
-      regex = `https?://(?:localhost|127\\.0\\.0\\.1):${port}${escapeRegex(relative)}`;
+      regex = `https?://${hostPattern}:${port}${escapeRegexLiteral(relative)}`;
     } else {
       const basename = normalizedPath.split('/').pop() ?? '';
-      regex = `https?://(?:localhost|127\\.0\\.0\\.1):${port}/.*${escapeRegex(basename)}`;
+      regex = `https?://${hostPattern}:${port}/.*${escapeRegexLiteral(basename)}`;
     }
 
     this.urlRegexCache.set(sourcePath, regex);
     return regex;
   }
-}
-
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function anonymousFunctionBodyStart(
