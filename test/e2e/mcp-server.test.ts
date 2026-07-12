@@ -16,6 +16,7 @@ describe('MCP protocol surface', () => {
     primary: true,
     paused: false,
   }];
+  let paused = false;
   const fakeBridge = {
     workspace: '/fixture/project',
     async listSessions(): Promise<unknown> {
@@ -40,8 +41,9 @@ describe('MCP protocol surface', () => {
           connected: true,
           viteUrl: 'http://localhost:5173/',
           chromePort: 9222,
-          paused: false,
+          paused,
           pauseEpoch: 4,
+          pauseTargetId: paused ? 'target-1' : null,
           activeTargetId: 'target-1',
           targets,
         };
@@ -49,7 +51,7 @@ describe('MCP protocol surface', () => {
       if (method === 'snapshot') {
         return { paused: false, pauseEpoch: 4, ready: false, frames: [], scopes: [] };
       }
-      if (method === 'control' || method === 'replaceBreakpoints') {
+      if (method === 'control' || method === 'replaceBreakpoints' || method === 'evaluate') {
         return { accepted: true, method, params };
       }
       throw new Error(`Unexpected fake bridge method: ${method}`);
@@ -74,16 +76,23 @@ describe('MCP protocol surface', () => {
   it('advertises the debugger and Playwright tool set', async () => {
     const response = await client.listTools();
     expect(response.tools.map((tool) => tool.name).sort()).toEqual([
+      'browser_check',
       'browser_click',
       'browser_console_messages',
       'browser_fill',
+      'browser_hover',
       'browser_navigate',
       'browser_network_requests',
       'browser_press',
       'browser_screenshot',
+      'browser_select',
       'browser_snapshot',
       'browser_tabs',
+      'browser_trace',
+      'browser_upload',
+      'browser_wait_for',
       'debug_control',
+      'debug_evaluate',
       'debug_replace_breakpoints',
       'debug_snapshot',
       'debug_status',
@@ -172,5 +181,33 @@ describe('MCP protocol surface', () => {
     const tools = await client.listTools();
     const breakpointTool = tools.tools.find((tool) => tool.name === 'debug_replace_breakpoints');
     expect(breakpointTool?.inputSchema.properties).not.toHaveProperty('targetId');
+  });
+
+  it('routes bounded paused-frame evaluation parameters', async () => {
+    paused = true;
+    targets = [{ ...targets[0], targetId: 'target-1', active: true, paused: true }];
+    const evaluated = await client.callTool({
+      name: 'debug_evaluate',
+      arguments: {
+        expression: 'a + b',
+        frameIndex: 2,
+        pauseEpoch: 4,
+        allowSideEffects: false,
+      },
+    }) as CallToolResult;
+    expect(evaluated.isError).not.toBe(true);
+    expect(calls.at(-1)).toEqual({
+      sessionId: 'vite-session-1',
+      method: 'evaluate',
+      params: {
+        expression: 'a + b',
+        frameIndex: 2,
+        pauseEpoch: 4,
+        allowSideEffects: false,
+        targetId: 'target-1',
+      },
+    });
+    paused = false;
+    targets = [{ ...targets[0], paused: false }];
   });
 });

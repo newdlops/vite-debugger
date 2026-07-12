@@ -105,6 +105,7 @@ const MCP_MAX_SCOPES = 4;
 const MCP_MAX_VARIABLES_PER_SCOPE = 20;
 const MCP_MAX_VALUE_LENGTH = 300;
 const MCP_MAX_BREAKPOINTS = 200;
+const MCP_MAX_EVALUATION_EXPRESSION_LENGTH = 10_000;
 
 export class ViteDebugSession extends LoggingDebugSession {
   private cdp: CdpClient | null = null;
@@ -1161,6 +1162,8 @@ export class ViteDebugSession extends LoggingDebugSession {
         return this.buildMcpSnapshot(params);
       case 'control':
         return this.handleMcpControl(params);
+      case 'evaluate':
+        return this.handleMcpEvaluate(params);
       case 'replaceBreakpoints':
         return this.handleMcpReplaceBreakpoints(params);
       default:
@@ -1400,6 +1403,72 @@ export class ViteDebugSession extends LoggingDebugSession {
       action,
       targetId: action === 'reload' ? requestedTargetId ?? null : targetId ?? null,
       pauseEpoch: this.pauseEpoch,
+    };
+  }
+
+  /** Evaluate in one paused frame without exposing CDP object or session ids. */
+  private async handleMcpEvaluate(params: unknown): Promise<object> {
+    if (!this.cdp?.isConnected) throw new Error('Debug session not connected');
+    const input = this.asMcpRecord(params);
+    const expression = this.requiredMcpString(
+      input.expression,
+      'expression',
+      MCP_MAX_EVALUATION_EXPRESSION_LENGTH,
+    );
+    const requestedTargetId = this.optionalMcpString(input.targetId, 'targetId', 200);
+    const frameIndex = input.frameIndex === undefined ? 0 : input.frameIndex;
+    if (!Number.isInteger(frameIndex) || (frameIndex as number) < 0 || (frameIndex as number) >= MCP_MAX_FRAMES) {
+      throw new Error(`frameIndex must be an integer between 0 and ${MCP_MAX_FRAMES - 1}`);
+    }
+    const requestedPauseEpoch = input.pauseEpoch;
+    if (requestedPauseEpoch !== undefined &&
+        (!Number.isInteger(requestedPauseEpoch) || (requestedPauseEpoch as number) < 0)) {
+      throw new Error('pauseEpoch must be a non-negative integer');
+    }
+    const allowSideEffects = input.allowSideEffects ?? false;
+    if (typeof allowSideEffects !== 'boolean') {
+      throw new Error('allowSideEffects must be a boolean');
+    }
+    const pauseState = requestedTargetId
+      ? this.mcpPausedTargets.get(requestedTargetId)
+      : this.selectMcpPausedTarget();
+    if (!pauseState) {
+      throw new Error(
+        requestedTargetId
+          ? `Chrome target is not paused: ${requestedTargetId}`
+          : 'No paused Chrome target is available for evaluation',
+      );
+    }
+    if (requestedPauseEpoch !== undefined && requestedPauseEpoch !== pauseState.pauseEpoch) {
+      throw new Error(
+        `Stale pauseEpoch ${requestedPauseEpoch}; current pauseEpoch is ${pauseState.pauseEpoch}`,
+      );
+    }
+    const frame = pauseState.resolvedFrames[frameIndex as number]?.cdpCallFrame;
+    if (!frame) {
+      throw new Error(
+        `Paused frame ${frameIndex} is unavailable; the snapshot has ${pauseState.resolvedFrames.length} frame(s)`,
+      );
+    }
+
+    const result = await this.withTimeout(
+      this.cdp.evaluateOnCallFrame(
+        frame.callFrameId,
+        expression,
+        false,
+        pauseState.targetId,
+        { throwOnSideEffect: !allowSideEffects, timeoutMs: 1_000 },
+      ),
+      2_000,
+    );
+    if (this.mcpPausedTargets.get(pauseState.targetId) !== pauseState) {
+      throw new Error('Debugger pause changed while the expression was being evaluated');
+    }
+    return {
+      targetId: pauseState.targetId,
+      pauseEpoch: pauseState.pauseEpoch,
+      frameIndex: frameIndex as number,
+      result: this.summarizeMcpVariable('result', result),
     };
   }
 

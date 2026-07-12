@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.7008 (2026-07-13)
+
+### Added
+
+- **20 MCP tools** — adds paused-frame `debug_evaluate`, condition-aware `browser_wait_for`, hover, select, check/uncheck, workspace-bounded file upload, and explicit Playwright trace recording to the existing debugger and browser toolset.
+- **MCP diagnostics** — a Command Palette action launches the exact configured stdio server and checks its handshake, complete tool surface, project bridge, debugger status, and agent configuration with bounded PASS/WARN/FAIL output.
+- **Co-located remote execution** — Remote SSH, Dev Container, and WSL project folders can be configured when the agent-launched MCP sidecar, Vite Debugger Extension Host, and debug Chrome all run in that same environment.
+
+### Security
+
+- Passes the exact private bridge directory to the sidecar, restricts uploads to bounded regular non-symlink project files, blocks side-effecting evaluation unless explicitly allowed, and rejects trace recording when the Chrome context includes an unmanaged page.
+- Invalidates and deletes an in-progress trace if its context opens a new page or navigates outside the managed Vite app.
+- Bounds traces to five minutes and 100 MiB, stores them with private permissions in a workspace-hashed temporary directory on the sidecar host, and prunes older artifacts.
+- MCP diagnostics use a shell-free child process, a shared deadline, bounded/redacted stderr, and guaranteed transport cleanup.
+
+### Remote execution notes
+
+- Automatic setup does not configure a desktop-local agent to enter an SSH host, container, or WSL distribution. Such agents require a separately configured remote stdio executor.
+- `playwright-core` does not include Chrome. Remote environments must provide a debuggable Chrome/Chromium in the same environment; trace paths returned from remote MCP processes also remain remote and may contain sensitive DOM, network, screenshot, or source data.
+
 ## 0.1.7007 (2026-07-13)
 
 ### Added

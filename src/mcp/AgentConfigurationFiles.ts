@@ -30,6 +30,7 @@ export interface StableMcpLauncherOptions {
   storagePath: string;
   bundledServerPath: string;
   version: string;
+  bridgeDirectoryPath?: string;
 }
 
 function isFileNotFound(error: unknown): boolean {
@@ -309,12 +310,22 @@ function compareVersions(left: string, right: string): number {
   return 0;
 }
 
-function renderLauncherSource(bundledServerPath: string, version: string): string {
+function renderLauncherSource(
+  bundledServerPath: string,
+  version: string,
+  bridgeDirectoryPath?: string,
+): string {
   return [
     `// vite-debugger-version: ${version}`,
     "'use strict';",
     `const { runMcpServer } = require(${JSON.stringify(bundledServerPath)});`,
-    'runMcpServer().catch((error) => {',
+    'const args = process.argv.slice(2);',
+    ...(bridgeDirectoryPath ? [
+      "if (!args.some((value) => value === '--bridge-dir' || value.startsWith('--bridge-dir='))) {",
+      `  args.push('--bridge-dir', ${JSON.stringify(bridgeDirectoryPath)});`,
+      '}',
+    ] : []),
+    'runMcpServer(args).catch((error) => {',
     "  const message = error instanceof Error ? (error.stack || error.message) : String(error);",
     "  process.stderr.write('[vite-debugger-mcp] Startup failed: ' + message + '\\n');",
     '  process.exitCode = 1;',
@@ -332,7 +343,11 @@ export async function prepareStableMcpLauncher(options: StableMcpLauncherOptions
   }
 
   const launcherPath = path.join(options.storagePath, 'vite-debugger-mcp.cjs');
-  const source = renderLauncherSource(options.bundledServerPath, options.version);
+  const source = renderLauncherSource(
+    options.bundledServerPath,
+    options.version,
+    options.bridgeDirectoryPath,
+  );
   await withFileLock(`${launcherPath}.lock`, async () => {
     const existing = await readConfiguration(launcherPath);
     const existingVersion = existing.content?.match(/^\/\/ vite-debugger-version: ([^\r\n]+)/)?.[1];

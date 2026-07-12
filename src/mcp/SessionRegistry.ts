@@ -14,6 +14,11 @@ interface SessionEntry extends RegisteredSession {
   readonly session: vscode.DebugSession;
 }
 
+function isHostFileWorkspace(folder: vscode.WorkspaceFolder): boolean {
+  return (folder.uri.scheme === 'file' || folder.uri.scheme === 'vscode-remote') &&
+    path.isAbsolute(folder.uri.fsPath);
+}
+
 /**
  * Resolve workspace paths once at the bridge boundary.  Both the manifest
  * lookup performed by the stdio process and session filtering use this same
@@ -43,7 +48,7 @@ export class SessionRegistry implements vscode.Disposable {
     if (session.type !== 'vite') return;
 
     const previous = this.sessions.get(session.id);
-    const workspaceRoot = session.workspaceFolder?.uri.scheme === 'file'
+    const workspaceRoot = session.workspaceFolder && isHostFileWorkspace(session.workspaceFolder)
       ? canonicalizeWorkspaceRoot(session.workspaceFolder.uri.fsPath)
       : undefined;
 

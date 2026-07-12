@@ -3,7 +3,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 
-const MANIFEST_DIRECTORY = path.join(os.tmpdir(), 'vite-debugger-mcp');
+const DEFAULT_MANIFEST_DIRECTORY = path.join(os.tmpdir(), 'vite-debugger-mcp');
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -74,16 +74,22 @@ export class BridgeClient {
   private nextRequestId = 1;
   private readonly pending = new Map<number, PendingRequest>();
 
-  private constructor(workspace: string) {
+  private constructor(
+    workspace: string,
+    private readonly manifestDirectory: string,
+  ) {
     this.workspace = workspace;
   }
 
-  static async forWorkspace(workspace: string): Promise<BridgeClient> {
+  static async forWorkspace(
+    workspace: string,
+    manifestDirectory: string = DEFAULT_MANIFEST_DIRECTORY,
+  ): Promise<BridgeClient> {
     const canonicalWorkspace = await canonicalPath(workspace);
     // Keep bridge discovery lazy. This lets the MCP server finish its stdio
     // handshake even when an agent starts before VS Code has activated the
     // extension; the next tool call can discover the newly-created bridge.
-    return new BridgeClient(canonicalWorkspace);
+    return new BridgeClient(canonicalWorkspace, path.resolve(manifestDirectory));
   }
 
   /** Exact manifest root matched during discovery (not a nested process cwd). */
@@ -112,6 +118,22 @@ export class BridgeClient {
       }
     }
     return path.resolve(cwd, workspace ?? '.');
+  }
+
+  static bridgeDirectoryFromArgv(argv: readonly string[], cwd = process.cwd()): string {
+    let directory: string | undefined;
+    for (let index = 0; index < argv.length; index += 1) {
+      const argument = argv[index];
+      if (argument === '--bridge-dir') {
+        directory = argv[index + 1];
+        if (!directory) throw new Error('--bridge-dir requires a directory path');
+        index += 1;
+      } else if (argument.startsWith('--bridge-dir=')) {
+        directory = argument.slice('--bridge-dir='.length);
+        if (!directory) throw new Error('--bridge-dir requires a directory path');
+      }
+    }
+    return path.resolve(cwd, directory ?? DEFAULT_MANIFEST_DIRECTORY);
   }
 
   async listSessions<T = unknown>(): Promise<T> {
@@ -152,7 +174,7 @@ export class BridgeClient {
       // Extension Host reloads rotate both port and token. Rediscover once on
       // transport failure so a long-running MCP process follows that rotation.
       this.resetTransport(toError(error));
-      const discovered = await discoverManifest(this.workspace);
+      const discovered = await discoverManifest(this.workspace, this.manifestDirectory);
       this.manifest = discovered.manifest;
       this.matchedWorkspaceRoot = discovered.workspaceRoot;
       return this.request<T>(method, params, false);
@@ -176,7 +198,7 @@ export class BridgeClient {
   private async connect(): Promise<void> {
     let manifest = this.manifest;
     if (!manifest) {
-      const discovered = await discoverManifest(this.workspace);
+      const discovered = await discoverManifest(this.workspace, this.manifestDirectory);
       manifest = discovered.manifest;
       this.manifest = manifest;
       this.matchedWorkspaceRoot = discovered.workspaceRoot;
@@ -309,10 +331,10 @@ export class BridgeClient {
   }
 }
 
-async function discoverManifest(workspace: string): Promise<DiscoveredBridge> {
+async function discoverManifest(workspace: string, manifestDirectory: string): Promise<DiscoveredBridge> {
   let names: string[];
   try {
-    names = await fs.readdir(MANIFEST_DIRECTORY);
+    names = await fs.readdir(manifestDirectory);
   } catch (error) {
     if (isNodeError(error) && error.code === 'ENOENT') {
       throw new Error(
@@ -326,7 +348,7 @@ async function discoverManifest(workspace: string): Promise<DiscoveredBridge> {
   const candidates: Array<{ manifest: BridgeManifest; workspaceRoot: string; score: number }> = [];
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
-    const manifestPath = path.join(MANIFEST_DIRECTORY, name);
+    const manifestPath = path.join(manifestDirectory, name);
     try {
       const stat = await fs.lstat(manifestPath);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_MANIFEST_BYTES) continue;

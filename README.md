@@ -101,6 +101,8 @@ Codex / Claude <--stdio MCP--> project sidecar <--private bridge--> VS Code debu
 
 Playwright runs in the sidecar, not in the VS Code Extension Host. The VSIX includes `playwright-core`, but does not download or launch another browser; it controls the Chrome already owned by the Vite debug session.
 
+The private bridge and Chrome CDP connection both use loopback. Consequently, the agent-launched MCP sidecar, the Vite Debugger Extension Host, and the debug Chrome must run in the same operating-system environment (the same local host, SSH host, container, or WSL distribution).
+
 ### Set up an agent
 
 1. Open the project in its own VS Code window.
@@ -111,7 +113,9 @@ Playwright runs in the sidecar, not in the VS Code Extension Host. The VSIX incl
 
 Running setup again is safe and refreshes only the Vite Debugger entry. In a multi-root window, setup asks which project to bind; the generated `--workspace` argument routes that agent to the matching VS Code window and debug session. The older **Copy Agent MCP Configuration** command remains available as a manual fallback.
 
-The generated launcher and workspace paths are local to your machine. Review the files before committing them to source control.
+Use **Vite Debugger: Diagnose Agent MCP** at any time (or choose **Diagnose MCP** after setup) to launch the exact stable stdio command and verify the agent configuration, MCP handshake, all 20 tools, private VS Code bridge, and `debug_status` path. The bounded PASS/WARN/FAIL report appears in the Vite Debugger output channel; having no active debug session is reported as a warning rather than a broken MCP installation.
+
+The generated launcher, bridge, and workspace paths are specific to the machine or remote environment in which the Vite Debugger Extension Host is running. Review the files before committing them to source control.
 
 When developing this repository itself, `npm run build` produces `dist/mcp-server.js`, and the checked-in local Codex/Claude configurations already point to it.
 
@@ -120,10 +124,61 @@ The normal agent workflow is:
 1. `debug_status`
 2. `browser_tabs` if a target must be selected
 3. `browser_snapshot`
-4. `browser_click`, `browser_fill`, `browser_press`, or `browser_navigate`
+4. Use a browser action, then `browser_wait_for` when the result is asynchronous
 5. If a breakpoint is hit, `debug_snapshot`, then `debug_control`
 
-Available tools also include `debug_replace_breakpoints`, `browser_screenshot`, `browser_console_messages`, and `browser_network_requests`. Browser mutation is rejected while JavaScript is paused, and navigation is limited to the Vite app's origin.
+### MCP tools
+
+The server exposes 20 project-scoped tools:
+
+| Tool | Purpose |
+| --- | --- |
+| `debug_status` | List/select Vite debug sessions and report targets, pause state, and debugger status. |
+| `debug_snapshot` | Read the paused target's reason, bounded call stack, scopes, and variable previews. |
+| `debug_control` | Pause, continue, step over/into/out, or reload a managed target. |
+| `debug_evaluate` | Evaluate an expression in a paused frame; expressions with possible side effects require `allowSideEffects=true`. |
+| `debug_replace_breakpoints` | Atomically replace the agent-owned breakpoints for one source without changing user breakpoints. |
+| `browser_tabs` | List the Vite pages available to Playwright and their stable `targetId` values. |
+| `browser_snapshot` | Return an AI-oriented accessibility snapshot with refs for later actions. |
+| `browser_navigate` | Navigate to a relative route or same-origin URL. |
+| `browser_click` | Click an element selected by snapshot ref, selector, role, text, label, or test id. |
+| `browser_fill` | Replace the value of an input-like element. |
+| `browser_press` | Press a key or shortcut on an element. |
+| `browser_wait_for` | Wait for an element, URL, load state, console message, request, or response, while handing debugger pauses back promptly. |
+| `browser_hover` | Hover an element and surface any breakpoint reached by its handlers. |
+| `browser_select` | Select one or more values in a `<select>` element. |
+| `browser_check` | Set a checkbox or radio control to a requested checked state. |
+| `browser_upload` | Set a file input from regular, non-symlink files inside the project (10 files, 10 MiB each, 25 MiB total). |
+| `browser_trace` | Explicitly start, inspect, or stop a bounded Playwright trace. |
+| `browser_screenshot` | Return a PNG screenshot as MCP image content, up to 8 MiB. |
+| `browser_console_messages` | Read bounded console and uncaught page-error history collected by this MCP process. |
+| `browser_network_requests` | Read bounded request/response/failure metadata; bodies, cookies, and headers are not captured. |
+
+Browser mutations are rejected while JavaScript is paused, navigation is limited to the Vite app's origin, and browser pages must belong to targets managed by the selected debug session.
+
+### Remote SSH, Dev Containers, and WSL
+
+Vite Debugger is a workspace extension, so a remote VS Code window runs the debugger and bridge in its Remote Extension Host. Automatic setup supports host-backed `file:` and `vscode-remote:` project folders, but the generated command assumes that the agent also starts its MCP process in that same environment.
+
+| Project window | Automatic setup works when... |
+| --- | --- |
+| Local | The agent, MCP sidecar, Extension Host, and debug Chrome all run locally. |
+| Remote SSH | The agent/MCP sidecar and a debuggable Chrome/Chromium run on the SSH host. |
+| Dev Container | The agent/MCP sidecar and a debuggable Chrome/Chromium run inside the same container. |
+| WSL | The agent/MCP sidecar and a debuggable Chrome/Chromium run inside the same WSL distribution. |
+| Local agent with a remote project | Not configured automatically; a separately configured SSH, WSL, or container stdio executor must start the MCP sidecar remotely. |
+
+Run Codex or Claude from the remote terminal/session for the supported remote cases. A desktop-local agent cannot execute the generated remote absolute paths, read the remote bridge manifest, or reach the remote Extension Host and Chrome through its own `127.0.0.1`. Likewise, a Chrome running only on the desktop is not visible to a sidecar inside an SSH host or container. The extension does not expose its private bridge over the network.
+
+The VSIX supplies `playwright-core`, not a Chrome binary. A headless SSH host or container must provide a Chrome/Chromium instance that is reachable through a remote-debugging port in that same environment.
+
+### Playwright traces
+
+Tracing is opt-in. Use `browser_trace` with `action="start"`, `"status"`, and `"stop"`; screenshots and DOM snapshots default to enabled, while source capture defaults to disabled. Playwright traces can contain sensitive DOM contents, entered values, network activity, screenshots, and—when enabled—source files. Review a trace before sharing it.
+
+Tracing operates on the whole Chrome browser context, not just one tab. To prevent unrelated pages from being captured, recording is rejected if that context contains any page outside the managed Vite app; a recording already in progress is invalidated and deleted if a new page opens or a traced page leaves the app. Only one trace can be active in an MCP process, and an un-stopped recording is discarded after five minutes.
+
+A successful stop writes a private zip on the **MCP sidecar's filesystem** under `<system temporary directory>/vite-debugger-traces/<workspace-hash>/`. In Remote SSH, Dev Container, and WSL sessions, that is a remote path; the file is not copied to the desktop automatically. Trace directories/files use private permissions where supported, traces over 100 MiB are deleted, and older/excess traces are pruned on later saves using a ten-file/seven-day policy.
 
 ### Chrome Connection
 
@@ -144,7 +199,9 @@ The debugger finds a debuggable Chrome in this order:
 
 - Chrome must be started with a remote-debugging port and a separate debug profile. See [Chrome Debugging Limitation](docs/chrome-debugging-limitation.md) for details.
 - Source maps for dynamically imported modules load on-demand — breakpoints in lazy-loaded files become active when the module is first imported.
-- Automatic MCP setup currently supports local `file:` workspaces; Remote SSH and Dev Container workspaces still require environment-specific setup.
+- Automatic MCP setup does not create a local-to-remote executor. The agent-launched MCP sidecar, Extension Host, and debug Chrome must be co-located as described above.
+- Virtual workspaces without a host-accessible filesystem path are not supported by the debugger or MCP setup.
+- The VSIX does not include a browser; remote/headless environments must provide a debuggable Chrome or Chromium.
 
 ## Testing
 

@@ -781,16 +781,30 @@ export class CdpClient extends EventEmitter {
     return result.scriptSource;
   }
 
-  async evaluateOnCallFrame(callFrameId: string, expression: string, silent: boolean = false): Promise<RemoteObject> {
+  async evaluateOnCallFrame(
+    callFrameId: string,
+    expression: string,
+    silent: boolean = false,
+    targetId?: string,
+    options: { throwOnSideEffect?: boolean; timeoutMs?: number } = {},
+  ): Promise<RemoteObject> {
     const result = await this.client.Debugger.evaluateOnCallFrame({
       callFrameId,
       expression,
       silent,
       returnByValue: false,
       generatePreview: true,
-    }, this.requireActiveSession());
+      ...(options.throwOnSideEffect === undefined
+        ? {}
+        : { throwOnSideEffect: options.throwOnSideEffect }),
+      ...(options.timeoutMs === undefined ? {} : { timeout: options.timeoutMs }),
+    }, this.requireTargetSession(targetId));
     if (result.exceptionDetails) {
-      throw new Error(result.exceptionDetails.text || 'Evaluation failed');
+      throw new Error(
+        result.exceptionDetails.exception?.description ||
+        result.exceptionDetails.text ||
+        'Evaluation failed',
+      );
     }
     return result.result;
   }

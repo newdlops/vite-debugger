@@ -75,6 +75,13 @@ interface McpControlResult {
   pauseEpoch: number;
 }
 
+interface McpEvaluateResult {
+  targetId: string;
+  pauseEpoch: number;
+  frameIndex: number;
+  result: { name: string; type: string; value: string; expandable: boolean };
+}
+
 /**
  * Exercise the same two connections an MCP sidecar uses in production:
  *
@@ -221,6 +228,33 @@ describe('MCP debugger API with Playwright over the shared Chrome CDP port', () 
       (target) => target.targetId === snapshot.targetId,
     );
     expect(pausedTarget?.paused).toBe(true);
+
+    const evaluated = await mcp<McpEvaluateResult>('evaluate', {
+      expression: 'a + b',
+      frameIndex: 0,
+      targetId: snapshot.targetId,
+      pauseEpoch: snapshot.pauseEpoch,
+    });
+    expect(evaluated).toMatchObject({
+      targetId: snapshot.targetId,
+      pauseEpoch: snapshot.pauseEpoch,
+      frameIndex: 0,
+      result: { name: 'result', type: 'number', value: '1', expandable: false },
+    });
+
+    await expect(mcp<McpEvaluateResult>('evaluate', {
+      expression: 'a + b',
+      frameIndex: 0,
+      targetId: snapshot.targetId,
+      pauseEpoch: snapshot.pauseEpoch + 1,
+    })).rejects.toThrow(/stale pauseEpoch/i);
+
+    await expect(mcp<McpEvaluateResult>('evaluate', {
+      expression: 'globalThis.__viteDebuggerMcpMutation = true',
+      frameIndex: 0,
+      targetId: snapshot.targetId,
+      pauseEpoch: snapshot.pauseEpoch,
+    })).rejects.toThrow(/side[- ]effect|evaluation failed/i);
 
     const continued = await mcp<McpControlResult>('control', {
       action: 'continue',

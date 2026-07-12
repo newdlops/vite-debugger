@@ -121,6 +121,7 @@ describe('agent MCP configuration files', () => {
     const server1 = path.join(workspacePath, 'server-1.js');
     const server2 = path.join(workspacePath, 'server-2.js');
     const server3 = path.join(workspacePath, 'server-3.js');
+    const bridgeDirectoryPath = path.join(workspacePath, 'bridge-runtime');
     await Promise.all([
       fs.writeFile(server1, 'module.exports = {};\n'),
       fs.writeFile(server2, 'module.exports = {};\n'),
@@ -131,8 +132,12 @@ describe('agent MCP configuration files', () => {
       storagePath,
       bundledServerPath: server1,
       version: '0.1.7007',
+      bridgeDirectoryPath,
     });
-    expect(await fs.readFile(launcherPath, 'utf8')).toContain(JSON.stringify(server1));
+    const firstLauncher = await fs.readFile(launcherPath, 'utf8');
+    expect(firstLauncher).toContain(JSON.stringify(server1));
+    expect(firstLauncher).toContain(JSON.stringify(bridgeDirectoryPath));
+    expect(firstLauncher).toContain("args.push('--bridge-dir'");
 
     await Promise.all([
       prepareStableMcpLauncher({ storagePath, bundledServerPath: server2, version: '0.1.7008' }),

@@ -3,7 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { BridgeClient } from './BridgeClient';
 import { registerMcpTools } from './tools';
 
-const SERVER_VERSION = '0.1.7007';
+const SERVER_VERSION = '0.1.7008';
 
 export function createMcpServer(bridge: BridgeClient): McpServer {
   const server = new McpServer({
@@ -34,7 +34,8 @@ export function createMcpServer(bridge: BridgeClient): McpServer {
 
 export async function runMcpServer(argv = process.argv.slice(2)): Promise<void> {
   const workspace = BridgeClient.workspaceFromArgv(argv);
-  const bridge = await BridgeClient.forWorkspace(workspace);
+  const bridgeDirectory = BridgeClient.bridgeDirectoryFromArgv(argv);
+  const bridge = await BridgeClient.forWorkspace(workspace, bridgeDirectory);
   const server = createMcpServer(bridge);
   const transport = new StdioServerTransport();
 

@@ -32,6 +32,7 @@ suite('vite-debugger extension (VSCode host)', function () {
       'vite-debugger.startDebug',
       'vite-debugger.detectViteServer',
       'vite-debugger.setupMcpConfiguration',
+      'vite-debugger.diagnoseMcp',
       'vite-debugger.copyMcpConfiguration',
       'vite-debugger.refreshReactTree',
       'vite-debugger.breakOnRender',
@@ -49,5 +50,19 @@ suite('vite-debugger extension (VSCode host)', function () {
     // We expect no exception — it either reports "not detected" or shows a
     // dialog; either path is acceptable for the smoke test.
     await vscode.commands.executeCommand('vite-debugger.detectViteServer');
+  });
+
+  test('diagnoseMcp verifies the bundled stdio server and project bridge', async () => {
+    const ext = vscode.extensions.getExtension(EXTENSION_ID);
+    if (ext) await ext.activate();
+
+    const report = await vscode.commands.executeCommand('vite-debugger.diagnoseMcp');
+    assert.ok(report, `diagnostic command did not return a report; trusted=${vscode.workspace.isTrusted}; ` +
+      `folders=${(vscode.workspace.workspaceFolders || []).map((folder) => `${folder.uri.scheme}:${folder.uri.fsPath}`).join(',')}`);
+    assert.ok(!report.error, report.error);
+    assert.notStrictEqual(report.summary.status, 'fail', JSON.stringify(report.checks));
+    assert.strictEqual(report.tools.length, 20, 'unexpected MCP tool count');
+    assert.ok(report.tools.includes('debug_status'));
+    assert.ok(report.tools.includes('browser_trace'));
   });
 });

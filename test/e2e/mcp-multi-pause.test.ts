@@ -37,6 +37,12 @@ interface McpSnapshot {
   }>;
 }
 
+interface McpEvaluateResult {
+  targetId: string;
+  pauseEpoch: number;
+  result: { type: string; value: string };
+}
+
 /**
  * Regression coverage for target-scoped MCP pause state. Two page targets may
  * be paused concurrently even though DAP presents one synthetic thread. A
@@ -136,6 +142,19 @@ describe('MCP snapshots with multiple paused tabs', () => {
         .toEqual(expect.arrayContaining(['a', 'b']));
     }
     expect(new Set(snapshots.map((snapshot) => snapshot.pauseEpoch)).size).toBe(2);
+
+    const evaluations = await Promise.all(snapshots.map((snapshot) =>
+      mcp<McpEvaluateResult>('evaluate', {
+        expression: 'a + b',
+        targetId: snapshot.targetId!,
+        pauseEpoch: snapshot.pauseEpoch,
+      }),
+    ));
+    expect(evaluations.map((evaluation) => evaluation.targetId).sort())
+      .toEqual(snapshots.map((snapshot) => snapshot.targetId!).sort());
+    for (const evaluation of evaluations) {
+      expect(evaluation.result).toMatchObject({ type: 'number', value: '1' });
+    }
 
     const firstTargetId = bothPaused.pausedTargetIds[0];
     const secondTargetId = bothPaused.pausedTargetIds[1];

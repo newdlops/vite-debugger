@@ -8,7 +8,7 @@ import { isChromeDebuggable } from './cdp/ChromeDiscovery';
 import { initLogger, logger, LogLevel } from './util/Logger';
 import { ViteInlineValuesProvider } from './providers/InlineValuesProvider';
 import { ReactComponentTreeProvider } from './react/ReactComponentTreeProvider';
-import { BridgeServer } from './mcp/BridgeServer';
+import { BridgeServer, getBridgeRuntimeDirectory } from './mcp/BridgeServer';
 import { SessionRegistry } from './mcp/SessionRegistry';
 import {
   AgentConfigurationError,
@@ -28,6 +28,11 @@ import {
   withFileLock,
   writeConfigurationTransaction,
 } from './mcp/AgentConfigurationFiles';
+import {
+  diagnoseMcp,
+  McpConfigurationDiagnosticInput,
+  McpConfigurationState,
+} from './mcp/McpDiagnostics';
 
 class ViteDebugAdapterFactory implements vscode.DebugAdapterDescriptorFactory {
   constructor(private readonly sessions: SessionRegistry) {}
@@ -66,6 +71,29 @@ let statusBarItem: vscode.StatusBarItem;
 
 type AgentClient = 'codex' | 'claude';
 
+const REQUIRED_MCP_TOOLS = [
+  'debug_status',
+  'debug_snapshot',
+  'debug_control',
+  'debug_evaluate',
+  'debug_replace_breakpoints',
+  'browser_tabs',
+  'browser_snapshot',
+  'browser_navigate',
+  'browser_click',
+  'browser_fill',
+  'browser_press',
+  'browser_wait_for',
+  'browser_hover',
+  'browser_select',
+  'browser_check',
+  'browser_upload',
+  'browser_trace',
+  'browser_screenshot',
+  'browser_console_messages',
+  'browser_network_requests',
+] as const;
+
 interface PendingConfiguration extends FileConfigurationUpdate {
   client: AgentClient;
   change: ConfigurationChange;
@@ -76,10 +104,15 @@ interface WorkspaceSelectionOptions {
   placeHolder: string;
 }
 
-async function selectLocalWorkspaceFolder(
+function isHostFileWorkspace(folder: vscode.WorkspaceFolder): boolean {
+  return (folder.uri.scheme === 'file' || folder.uri.scheme === 'vscode-remote') &&
+    path.isAbsolute(folder.uri.fsPath);
+}
+
+async function selectHostWorkspaceFolder(
   options: WorkspaceSelectionOptions,
 ): Promise<vscode.WorkspaceFolder | undefined> {
-  const folders = vscode.workspace.workspaceFolders?.filter((folder) => folder.uri.scheme === 'file') ?? [];
+  const folders = vscode.workspace.workspaceFolders?.filter(isHostFileWorkspace) ?? [];
   if (folders.length === 0) {
     vscode.window.showWarningMessage(options.noFolderMessage);
     return undefined;
@@ -95,6 +128,59 @@ async function selectLocalWorkspaceFolder(
     { placeHolder: options.placeHolder },
   );
   return selected?.folder;
+}
+
+async function inspectAgentConfigurations(
+  workspacePath: string,
+  launcherPath: string,
+): Promise<McpConfigurationDiagnosticInput[]> {
+  const launch: AgentMcpLaunch = { launcherPath, workspacePath };
+  const definitions = [
+    {
+      id: 'codex',
+      label: 'Codex',
+      filePath: path.join(workspacePath, CODEX_CONFIGURATION_PATH),
+      merge: mergeCodexConfiguration,
+    },
+    {
+      id: 'claude',
+      label: 'Claude Code',
+      filePath: path.join(workspacePath, CLAUDE_CONFIGURATION_PATH),
+      merge: mergeClaudeConfiguration,
+    },
+  ] as const;
+
+  const findings = await Promise.all(definitions.map(async (definition) => {
+    let state: McpConfigurationState;
+    let message: string | undefined;
+    try {
+      const existing = await readConfiguration(definition.filePath);
+      if (existing.content === undefined) {
+        state = 'missing';
+      } else {
+        state = definition.merge(existing.content, launch).change === 'unchanged'
+          ? 'configured'
+          : 'stale';
+        if (state === 'stale') message = 'Run automatic MCP setup to refresh this entry.';
+      }
+    } catch (error) {
+      state = 'invalid';
+      message = error instanceof Error ? error.message : String(error);
+    }
+    return {
+      id: definition.id,
+      label: definition.label,
+      filePath: definition.filePath,
+      state,
+      message,
+    };
+  }));
+
+  // Codex and Claude are alternatives. A missing configuration is noteworthy
+  // only when neither agent has been configured for this project.
+  return findings.some((finding) => finding.state !== 'missing')
+    ? findings.filter((finding) => finding.state !== 'missing')
+    : findings;
 }
 
 function pathComparisonKey(filePath: string): string {
@@ -113,7 +199,7 @@ async function comparisonKeys(filePath: string): Promise<Set<string>> {
 async function assertConfigurationDocumentIsSaved(filePath: string): Promise<void> {
   const targetKeys = await comparisonKeys(filePath);
   for (const document of vscode.workspace.textDocuments) {
-    if (!document.isDirty || document.uri.scheme !== 'file') continue;
+    if (!document.isDirty || (document.uri.scheme !== 'file' && document.uri.scheme !== 'vscode-remote')) continue;
     const documentKeys = await comparisonKeys(document.uri.fsPath);
     if ([...documentKeys].some((key) => targetKeys.has(key))) {
       throw new AgentConfigurationError(`Save ${filePath} before running MCP setup.`);
@@ -128,23 +214,25 @@ function formatConfiguredClients(configurations: readonly PendingConfiguration[]
 }
 
 async function prepareMcpLauncher(context: vscode.ExtensionContext): Promise<string> {
-  if (context.globalStorageUri.scheme !== 'file') {
-    throw new AgentConfigurationError('The stable MCP launcher requires a local extension storage directory.');
+  if (!path.isAbsolute(context.globalStorageUri.fsPath)) {
+    throw new AgentConfigurationError('The stable MCP launcher requires a host-accessible extension storage directory.');
   }
   return prepareStableMcpLauncher({
     storagePath: context.globalStorageUri.fsPath,
     bundledServerPath: context.asAbsolutePath('dist/mcp-server.js'),
     version: String(context.extension.packageJSON.version ?? '0.0.0'),
+    bridgeDirectoryPath: getBridgeRuntimeDirectory(),
   });
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const outputChannel = vscode.window.createOutputChannel('Vite Debugger');
   initLogger(outputChannel, LogLevel.Debug);
+  context.subscriptions.push(outputChannel);
 
   const sessionRegistry = new SessionRegistry();
   const workspaceRoots = () => (vscode.workspace.workspaceFolders ?? [])
-    .filter((folder) => folder.uri.scheme === 'file')
+    .filter(isHostFileWorkspace)
     .map((folder) => folder.uri.fsPath);
   const bridge = new BridgeServer(sessionRegistry, workspaceRoots());
   const mcpLauncherPath = prepareMcpLauncher(context);
@@ -252,8 +340,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Commands
   context.subscriptions.push(
     vscode.commands.registerCommand('vite-debugger.startDebug', async () => {
-      const folder = await selectLocalWorkspaceFolder({
-        noFolderMessage: 'Open a local project folder before starting Vite debugging.',
+      const folder = await selectHostWorkspaceFolder({
+        noFolderMessage: 'Open a host-accessible project folder before starting Vite debugging.',
         placeHolder: 'Select the project to debug',
       });
       if (!folder) return;
@@ -312,8 +400,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
 
-      const folder = await selectLocalWorkspaceFolder({
-        noFolderMessage: 'Open a local project folder before configuring agent MCP.',
+      const folder = await selectHostWorkspaceFolder({
+        noFolderMessage: 'Open a host-accessible project folder before configuring agent MCP.',
         placeHolder: 'Select the project for this MCP server',
       });
       if (!folder) return;
@@ -395,10 +483,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         });
 
         const clients = formatConfiguredClients(configurations);
-        const message = changed.length === 0
+        const environmentNote = vscode.env.remoteName
+          ? ` Run the agent in the same ${vscode.env.remoteName} environment.`
+          : '';
+        const message = (changed.length === 0
           ? `${clients} MCP is already configured for ${folder.name}.`
-          : `${clients} MCP configured for ${folder.name}. Restart the agent session to load it.`;
-        const action = await vscode.window.showInformationMessage(message, 'Open Configuration');
+          : `${clients} MCP configured for ${folder.name}. Restart the agent session to load it.`) +
+          environmentNote;
+        const action = await vscode.window.showInformationMessage(
+          message,
+          'Diagnose MCP',
+          'Open Configuration',
+        );
+        if (action === 'Diagnose MCP') {
+          await vscode.commands.executeCommand('vite-debugger.diagnoseMcp', folder);
+          return;
+        }
         if (action === 'Open Configuration') {
           let selected = configurations[0];
           if (configurations.length > 1) {
@@ -413,7 +513,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             if (!picked) return;
             selected = picked.configuration;
           }
-          await vscode.window.showTextDocument(vscode.Uri.file(selected.filePath));
+          const relativePath = selected.client === 'codex'
+            ? CODEX_CONFIGURATION_PATH
+            : CLAUDE_CONFIGURATION_PATH;
+          await vscode.window.showTextDocument(
+            vscode.Uri.joinPath(folder.uri, ...relativePath.split('/')),
+          );
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -427,9 +532,67 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       }
     }),
+    vscode.commands.registerCommand(
+      'vite-debugger.diagnoseMcp',
+      async (requestedFolder?: vscode.WorkspaceFolder) => {
+        if (!vscode.workspace.isTrusted) {
+          vscode.window.showWarningMessage('Trust this workspace before diagnosing agent MCP.');
+          return;
+        }
+
+        const matchingFolder = requestedFolder && isHostFileWorkspace(requestedFolder)
+          ? vscode.workspace.workspaceFolders?.find(
+            (folder) => folder.uri.toString() === requestedFolder.uri.toString(),
+          )
+          : undefined;
+        const folder = matchingFolder ?? await selectHostWorkspaceFolder({
+          noFolderMessage: 'Open a host-accessible project folder before diagnosing agent MCP.',
+          placeHolder: 'Select the project whose MCP server should be diagnosed',
+        });
+        if (!folder) return;
+
+        try {
+          const launcherPath = await mcpLauncherPath;
+          const workspacePath = folder.uri.fsPath;
+          const configurations = await inspectAgentConfigurations(workspacePath, launcherPath);
+          const report = await vscode.window.withProgress(
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: `Diagnosing Vite Debugger MCP for ${folder.name}`,
+            },
+            () => diagnoseMcp({
+              launcherPath,
+              workspacePath,
+              configurations,
+              requiredTools: REQUIRED_MCP_TOOLS,
+            }),
+          );
+
+          outputChannel.appendLine('');
+          outputChannel.appendLine(report.markdown);
+          outputChannel.show(true);
+          const counts = `${report.summary.pass} pass, ${report.summary.warn} warning, ` +
+            `${report.summary.fail} failure`;
+          const message = `Vite Debugger MCP diagnosis: ${report.summary.status.toUpperCase()} (${counts}).`;
+          if (report.summary.status === 'fail') {
+            void vscode.window.showErrorMessage(message);
+          } else if (report.summary.status === 'warn') {
+            void vscode.window.showWarningMessage(message);
+          } else {
+            void vscode.window.showInformationMessage(message);
+          }
+          return report;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          logger.warn(`Could not diagnose agent MCP: ${message}`);
+          vscode.window.showErrorMessage(`Could not diagnose agent MCP: ${message}`);
+          return { error: message };
+        }
+      },
+    ),
     vscode.commands.registerCommand('vite-debugger.copyMcpConfiguration', async () => {
-      const folder = await selectLocalWorkspaceFolder({
-        noFolderMessage: 'Open a local project folder before copying agent MCP configuration.',
+      const folder = await selectHostWorkspaceFolder({
+        noFolderMessage: 'Open a host-accessible project folder before copying agent MCP configuration.',
         placeHolder: 'Select the project for this MCP server',
       });
       if (!folder) return;

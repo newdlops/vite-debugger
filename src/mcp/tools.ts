@@ -1,8 +1,13 @@
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import * as crypto from 'crypto';
+import { promises as fs } from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import {
   chromium,
   type Browser,
+  type BrowserContext,
   type ConsoleMessage,
   type Frame,
   type Locator,
@@ -23,6 +28,11 @@ const MAX_CONSOLE_TEXT_CHARS = 10_000;
 const MAX_ERROR_TEXT_CHARS = 2_000;
 const MAX_INPUT_VALUE_CHARS = 100_000;
 const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024;
+const MAX_UPLOAD_FILES = 10;
+const MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_UPLOAD_TOTAL_BYTES = 25 * 1024 * 1024;
+const MAX_TRACE_BYTES = 100 * 1024 * 1024;
+const MAX_TRACE_DURATION_MS = 5 * 60_000;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -76,6 +86,24 @@ interface PageState {
   dispose: () => void;
 }
 
+interface TraceState {
+  sessionId: string;
+  context: BrowserContext;
+  startedAt: string;
+  startedAtMs: number;
+  targetIds: string[];
+  viteUrl: string;
+  timer?: NodeJS.Timeout;
+  guards: Array<() => void>;
+  invalidReason?: string;
+}
+
+interface UploadFileDescription {
+  path: string;
+  relativePath: string;
+  bytes: number;
+}
+
 export interface McpToolsRegistration {
   dispose(): Promise<void>;
 }
@@ -106,6 +134,45 @@ const locatorShape = {
   exact: z.boolean().optional().default(false),
   index: z.number().int().nonnegative().optional().describe('Zero-based match index.'),
 };
+
+const locatorSchema = z.object(locatorShape);
+const waitConditionSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('element'),
+    locator: locatorSchema,
+    state: z.enum(['visible', 'hidden', 'attached', 'detached']).optional().default('visible'),
+  }),
+  z.object({
+    kind: z.literal('url'),
+    value: z.string().min(1).max(MAX_URL_CHARS),
+    match: z.enum(['exact', 'contains']).optional().default('contains'),
+  }),
+  z.object({
+    kind: z.literal('load'),
+    state: z.enum(['domcontentloaded', 'load', 'networkidle']).optional().default('load'),
+  }),
+  z.object({
+    kind: z.literal('console'),
+    textContains: z.string().min(1).max(2_000),
+    type: z.string().min(1).max(100).optional(),
+    includeExisting: z.boolean().optional().default(true),
+  }),
+  z.object({
+    kind: z.literal('request'),
+    urlContains: z.string().min(1).max(MAX_URL_CHARS),
+    method: z.string().min(1).max(32).optional(),
+    includeExisting: z.boolean().optional().default(true),
+  }),
+  z.object({
+    kind: z.literal('response'),
+    urlContains: z.string().min(1).max(MAX_URL_CHARS),
+    method: z.string().min(1).max(32).optional(),
+    status: z.number().int().min(100).max(599).optional(),
+    includeExisting: z.boolean().optional().default(true),
+  }),
+]);
+
+type WaitCondition = z.infer<typeof waitConditionSchema>;
 
 export function registerMcpTools(server: McpServer, bridge: BridgeClient): McpToolsRegistration {
   const browser = new BrowserController();
@@ -171,6 +238,36 @@ export function registerMcpTools(server: McpServer, bridge: BridgeClient): McpTo
     const targetId = controlTargetId(selected.status, args.targetId);
     const result = await bridge.sessionRequest(selected.sessionId, 'control', {
       action: args.action,
+      targetId,
+    });
+    return jsonResult({ sessionId: selected.sessionId, result });
+  }));
+
+  server.registerTool('debug_evaluate', {
+    title: 'Evaluate in paused frame',
+    description:
+      'Evaluates a JavaScript expression in a selected paused call frame and returns a bounded preview. ' +
+      'Expressions can have side effects; use simple reads unless mutation is intentional.',
+    inputSchema: {
+      ...pageShape,
+      expression: z.string().min(1).max(10_000),
+      frameIndex: z.number().int().min(0).max(19).optional().default(0),
+      pauseEpoch: z.number().int().nonnegative().optional().describe(
+        'Pause epoch from debug_snapshot. When provided, stale evaluations are rejected.',
+      ),
+      allowSideEffects: z.boolean().optional().default(false).describe(
+        'Allow assignments, calls, and other expressions that may mutate page state.',
+      ),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+  }, (args) => safely(async () => {
+    const selected = await selectSession(bridge, args.sessionId);
+    const targetId = snapshotTargetId(selected.status, args.targetId);
+    const result = await bridge.sessionRequest(selected.sessionId, 'evaluate', {
+      expression: args.expression,
+      frameIndex: args.frameIndex,
+      pauseEpoch: args.pauseEpoch,
+      allowSideEffects: args.allowSideEffects,
       targetId,
     });
     return jsonResult({ sessionId: selected.sessionId, result });
@@ -365,6 +462,156 @@ export function registerMcpTools(server: McpServer, bridge: BridgeClient): McpTo
     return jsonResult({ sessionId: selected.sessionId, targetId: chosen.targetId, ...outcome });
   }));
 
+  server.registerTool('browser_wait_for', {
+    title: 'Wait for browser condition',
+    description:
+      'Waits for an element, URL, load state, console message, request, or response. Existing console/network ' +
+      'history is checked first by default, and a debugger pause is returned immediately.',
+    inputSchema: {
+      ...pageShape,
+      condition: waitConditionSchema,
+      timeoutMs: z.number().int().min(100).max(60_000).optional().default(DEFAULT_ACTION_TIMEOUT_MS),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, (args) => safely(async () => {
+    const selected = await selectSession(bridge, args.sessionId);
+    assertRendererAvailable(selected.status, 'browser_wait_for');
+    const chosen = await browser.selectPage(selected.status, args.targetId);
+    const outcome = await runBrowserOperation(
+      bridge,
+      selected,
+      () => browser.waitFor(chosen.page, args.condition, args.timeoutMs),
+    );
+    return jsonResult({ sessionId: selected.sessionId, targetId: chosen.targetId, ...outcome });
+  }));
+
+  server.registerTool('browser_hover', {
+    title: 'Hover page element',
+    description: 'Moves the pointer over a selected element. Hover handlers can reach debugger breakpoints.',
+    inputSchema: {
+      ...pageShape,
+      ...locatorShape,
+      timeoutMs: z.number().int().min(100).max(60_000).optional().default(DEFAULT_ACTION_TIMEOUT_MS),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, (args) => safely(async () => {
+    const selected = await selectSession(bridge, args.sessionId);
+    assertNotPaused(selected.status, 'browser_hover');
+    const chosen = await browser.selectPage(selected.status, args.targetId);
+    const locator = makeLocator(chosen.page, args);
+    const outcome = await runBrowserMutation(bridge, selected, () =>
+      locator.hover({ timeout: args.timeoutMs }));
+    return jsonResult({ sessionId: selected.sessionId, targetId: chosen.targetId, ...outcome });
+  }));
+
+  server.registerTool('browser_select', {
+    title: 'Select options',
+    description: 'Selects one or more values in a <select> element and returns the selected values.',
+    inputSchema: {
+      ...pageShape,
+      ...locatorShape,
+      values: z.array(z.string().max(MAX_INPUT_VALUE_CHARS)).min(1).max(100),
+      timeoutMs: z.number().int().min(100).max(60_000).optional().default(DEFAULT_ACTION_TIMEOUT_MS),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, (args) => safely(async () => {
+    const selected = await selectSession(bridge, args.sessionId);
+    assertNotPaused(selected.status, 'browser_select');
+    const chosen = await browser.selectPage(selected.status, args.targetId);
+    const locator = makeLocator(chosen.page, args);
+    const outcome = await runBrowserOperation(
+      bridge,
+      selected,
+      () => locator.selectOption(args.values, { timeout: args.timeoutMs }),
+    );
+    return jsonResult({ sessionId: selected.sessionId, targetId: chosen.targetId, ...outcome });
+  }));
+
+  server.registerTool('browser_check', {
+    title: 'Check or uncheck control',
+    description: 'Sets a checkbox or radio control to the requested checked state.',
+    inputSchema: {
+      ...pageShape,
+      ...locatorShape,
+      checked: z.boolean().optional().default(true),
+      timeoutMs: z.number().int().min(100).max(60_000).optional().default(DEFAULT_ACTION_TIMEOUT_MS),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, (args) => safely(async () => {
+    const selected = await selectSession(bridge, args.sessionId);
+    assertNotPaused(selected.status, 'browser_check');
+    const chosen = await browser.selectPage(selected.status, args.targetId);
+    const locator = makeLocator(chosen.page, args);
+    const outcome = await runBrowserMutation(bridge, selected, () =>
+      locator.setChecked(args.checked, { timeout: args.timeoutMs }));
+    return jsonResult({ sessionId: selected.sessionId, targetId: chosen.targetId, ...outcome });
+  }));
+
+  server.registerTool('browser_upload', {
+    title: 'Upload project files',
+    description:
+      'Sets files on a file input. Paths must resolve to regular files inside the configured workspace; ' +
+      'an empty files array clears the input.',
+    inputSchema: {
+      ...pageShape,
+      ...locatorShape,
+      files: z.array(z.string().min(1).max(MAX_URL_CHARS)).max(MAX_UPLOAD_FILES),
+      timeoutMs: z.number().int().min(100).max(60_000).optional().default(DEFAULT_ACTION_TIMEOUT_MS),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, (args) => safely(async () => {
+    const selected = await selectSession(bridge, args.sessionId);
+    assertNotPaused(selected.status, 'browser_upload');
+    const chosen = await browser.selectPage(selected.status, args.targetId);
+    const locator = makeLocator(chosen.page, args);
+    const files = await validateUploadFiles(bridge.workspace, args.files);
+    const outcome = await runBrowserMutation(bridge, selected, () =>
+      locator.setInputFiles(files.map((file) => file.path), { timeout: args.timeoutMs }));
+    return jsonResult({
+      sessionId: selected.sessionId,
+      targetId: chosen.targetId,
+      files: files.map(({ relativePath, bytes }) => ({ relativePath, bytes })),
+      ...outcome,
+    });
+  }));
+
+  server.registerTool('browser_trace', {
+    title: 'Record Playwright trace',
+    description:
+      'Explicitly starts, stops, or reports a Playwright trace. Traces may contain DOM, network data, and screenshots. ' +
+      'Recording is rejected when the browser context contains a page outside the managed Vite app.',
+    inputSchema: {
+      ...pageShape,
+      action: z.enum(['start', 'stop', 'status']),
+      screenshots: z.boolean().optional().default(true),
+      snapshots: z.boolean().optional().default(true),
+      sources: z.boolean().optional().default(false),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, (args) => safely(async () => {
+    const selected = await selectSession(bridge, args.sessionId);
+    if (args.action === 'status') {
+      return jsonResult({
+        sessionId: selected.sessionId,
+        trace: await browser.traceStatus(selected.sessionId),
+      });
+    }
+    if (args.action === 'stop') {
+      const trace = await browser.stopTrace(selected.sessionId, bridge.workspace);
+      return jsonResult({ sessionId: selected.sessionId, trace });
+    }
+
+    assertRendererAvailable(selected.status, 'browser_trace');
+    const chosen = await browser.selectPage(selected.status, args.targetId);
+    const trace = await browser.startTrace(
+      selected.sessionId,
+      chosen,
+      selected.status,
+      { screenshots: args.screenshots, snapshots: args.snapshots, sources: args.sources },
+    );
+    return jsonResult({ sessionId: selected.sessionId, targetId: chosen.targetId, trace });
+  }));
+
   server.registerTool('browser_screenshot', {
     title: 'Take page screenshot',
     description: 'Takes a PNG screenshot of the selected Vite page and returns it as MCP image content.',
@@ -448,6 +695,7 @@ class BrowserController {
   private readonly states = new Map<Page, PageState>();
   private readonly requestIds = new WeakMap<Request, string>();
   private nextRequestId = 1;
+  private activeTrace: TraceState | undefined;
 
   async pagesForStatus(status: UnknownRecord): Promise<PageDescription[]> {
     const allowedTargetIds = managedTargetIds(status);
@@ -463,7 +711,7 @@ class BrowserController {
     const port = chromePortFromStatus(status);
     const browser = await this.ensureConnected(port);
     const pages = browser.contexts().flatMap((context) => context.pages()).filter((page) => !page.isClosed());
-    const descriptions = (await Promise.all(pages.map((page) => this.describePage(page))))
+    const descriptions = (await this.describePages(pages))
       .filter((page) =>
         allowedTargetIds.has(page.targetId) && urlMatchesVite(page.page.url(), viteUrl)
       );
@@ -511,7 +759,233 @@ class BrowserController {
     this.disposed = true;
     const pending = this.connecting;
     if (pending) await pending.catch(() => undefined);
+    await this.discardActiveTrace();
     await this.disconnectCurrent('Vite Debugger MCP server disposed');
+  }
+
+  async waitFor(page: Page, condition: WaitCondition, timeoutMs: number): Promise<UnknownRecord> {
+    const state = this.states.get(page);
+    if (!state) throw new Error('The selected page is no longer a managed Vite target');
+
+    switch (condition.kind) {
+      case 'element': {
+        const locator = makeLocator(page, condition.locator);
+        await locator.waitFor({ state: condition.state, timeout: timeoutMs });
+        return { kind: condition.kind, state: condition.state };
+      }
+      case 'url': {
+        const expected = condition.match === 'exact'
+          ? sameOriginDestination(condition.value, page.url(), { viteUrl: state.viteUrl })
+          : undefined;
+        await page.waitForURL((url) => {
+          if (!urlMatchesVite(url.href, state.viteUrl)) return false;
+          const sanitized = sanitizeBrowserUrl(url.href);
+          return condition.match === 'exact'
+            ? sanitized === sanitizeBrowserUrl(expected!)
+            : sanitized.includes(condition.value);
+        }, { timeout: timeoutMs });
+        return { kind: condition.kind, url: sanitizeBrowserUrl(page.url()) };
+      }
+      case 'load':
+        await page.waitForLoadState(condition.state, { timeout: timeoutMs });
+        return { kind: condition.kind, state: condition.state, url: sanitizeBrowserUrl(page.url()) };
+      case 'console': {
+        const matches = (entry: ConsoleEntry) =>
+          entry.text.includes(condition.textContains) &&
+          (!condition.type || entry.type === condition.type);
+        const existing = condition.includeExisting ? [...state.console].reverse().find(matches) : undefined;
+        if (existing) return { kind: condition.kind, source: 'history', message: existing };
+
+        if (condition.type === 'pageerror') {
+          const error = await page.waitForEvent('pageerror', {
+            predicate: (candidate) => candidate.message.includes(condition.textContains),
+            timeout: timeoutMs,
+          });
+          return {
+            kind: condition.kind,
+            source: 'event',
+            message: {
+              timestamp: new Date().toISOString(),
+              type: 'pageerror',
+              text: boundedText(error.message, MAX_CONSOLE_TEXT_CHARS),
+              pageUrl: sanitizeBrowserUrl(page.url()),
+            },
+          };
+        }
+        const message = await page.waitForEvent('console', {
+          predicate: (candidate) => candidate.text().includes(condition.textContains) &&
+            (!condition.type || candidate.type() === condition.type),
+          timeout: timeoutMs,
+        });
+        return {
+          kind: condition.kind,
+          source: 'event',
+          message: {
+            timestamp: new Date().toISOString(),
+            type: boundedText(message.type(), 100),
+            text: boundedText(message.text(), MAX_CONSOLE_TEXT_CHARS),
+            pageUrl: sanitizeBrowserUrl(page.url()),
+          },
+        };
+      }
+      case 'request': {
+        const method = condition.method?.toUpperCase();
+        const matches = (entry: NetworkEntry) => entry.phase === 'request' &&
+          entry.url.includes(condition.urlContains) && (!method || entry.method.toUpperCase() === method);
+        const existing = condition.includeExisting ? [...state.network].reverse().find(matches) : undefined;
+        if (existing) return { kind: condition.kind, source: 'history', request: existing };
+        const request = await page.waitForRequest((candidate) =>
+          sanitizeBrowserUrl(candidate.url()).includes(condition.urlContains) &&
+          (!method || candidate.method().toUpperCase() === method),
+        { timeout: timeoutMs });
+        return {
+          kind: condition.kind,
+          source: 'event',
+          request: {
+            method: boundedText(request.method(), 32),
+            url: sanitizeBrowserUrl(request.url()),
+            resourceType: boundedText(request.resourceType(), 100),
+          },
+        };
+      }
+      case 'response': {
+        const method = condition.method?.toUpperCase();
+        const matches = (entry: NetworkEntry) => entry.phase === 'response' &&
+          entry.url.includes(condition.urlContains) &&
+          (!method || entry.method.toUpperCase() === method) &&
+          (condition.status === undefined || entry.status === condition.status);
+        const existing = condition.includeExisting ? [...state.network].reverse().find(matches) : undefined;
+        if (existing) return { kind: condition.kind, source: 'history', response: existing };
+        const response = await page.waitForResponse((candidate) => {
+          const request = candidate.request();
+          return sanitizeBrowserUrl(candidate.url()).includes(condition.urlContains) &&
+            (!method || request.method().toUpperCase() === method) &&
+            (condition.status === undefined || candidate.status() === condition.status);
+        }, { timeout: timeoutMs });
+        return {
+          kind: condition.kind,
+          source: 'event',
+          response: {
+            method: boundedText(response.request().method(), 32),
+            url: sanitizeBrowserUrl(response.url()),
+            status: response.status(),
+            statusText: boundedText(response.statusText(), 500),
+          },
+        };
+      }
+    }
+  }
+
+  async startTrace(
+    sessionId: string,
+    selected: PageDescription,
+    status: UnknownRecord,
+    options: { screenshots: boolean; snapshots: boolean; sources: boolean },
+  ): Promise<UnknownRecord> {
+    if (this.activeTrace) {
+      throw new Error(`A browser trace is already active for session ${this.activeTrace.sessionId}`);
+    }
+    const context = selected.page.context();
+    const allowedTargetIds = managedTargetIds(status);
+    const viteUrl = readString(status, ['viteUrl'], ['config', 'viteUrl'], ['browser', 'viteUrl']);
+    if (!viteUrl) throw new Error('The selected debug session did not report its Vite application URL');
+    const descriptions = await this.describePages(
+      context.pages().filter((page) => !page.isClosed()),
+    );
+    const unmanaged = descriptions.filter((page) =>
+      !allowedTargetIds.has(page.targetId) || !urlMatchesVite(page.url, viteUrl));
+    if (unmanaged.length > 0) {
+      throw new Error(
+        'Trace recording is blocked because the Chrome context contains a page outside this managed Vite app: ' +
+        unmanaged.map((page) => `${page.targetId} (${page.url})`).join(', '),
+      );
+    }
+
+    const startedAtMs = Date.now();
+    const trace: TraceState = {
+      sessionId,
+      context,
+      startedAt: new Date(startedAtMs).toISOString(),
+      startedAtMs,
+      targetIds: descriptions.map((page) => page.targetId).sort(),
+      viteUrl,
+      guards: [],
+    };
+    this.installTraceGuards(trace, context.pages().filter((page) => !page.isClosed()));
+    try {
+      await context.tracing.start(options);
+      if (trace.invalidReason) {
+        await context.tracing.stop().catch(() => undefined);
+        throw new Error(trace.invalidReason);
+      }
+      trace.timer = setTimeout(() => {
+        if (this.activeTrace === trace) void this.discardActiveTrace();
+      }, MAX_TRACE_DURATION_MS);
+    } catch (error) {
+      this.disposeTraceGuards(trace);
+      throw error;
+    }
+    trace.timer?.unref?.();
+    this.activeTrace = trace;
+    return this.publicTraceStatus(trace);
+  }
+
+  async traceStatus(sessionId: string): Promise<UnknownRecord> {
+    const trace = this.activeTrace;
+    if (!trace) return { active: false };
+    if (trace.sessionId !== sessionId) {
+      throw new Error(`A browser trace belongs to another debug session: ${trace.sessionId}`);
+    }
+    await this.refreshTraceValidity(trace);
+    return this.publicTraceStatus(trace);
+  }
+
+  async stopTrace(sessionId: string, workspace: string): Promise<UnknownRecord> {
+    const trace = this.activeTrace;
+    if (!trace) throw new Error('No browser trace is active');
+    if (trace.sessionId !== sessionId) {
+      throw new Error(`The active browser trace belongs to another debug session: ${trace.sessionId}`);
+    }
+    this.activeTrace = undefined;
+    if (trace.timer) clearTimeout(trace.timer);
+
+    let filePath: string | undefined;
+    try {
+      await this.refreshTraceValidity(trace);
+      const directory = await prepareTraceDirectory(workspace);
+      filePath = path.join(
+        directory,
+        `vite-debugger-${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomBytes(4).toString('hex')}.zip`,
+      );
+      await trace.context.tracing.stop({ path: filePath });
+      if (trace.invalidReason) {
+        await fs.unlink(filePath).catch(() => undefined);
+        throw new Error(`Trace was discarded for privacy: ${trace.invalidReason}`);
+      }
+      await fs.chmod(filePath, 0o600);
+      const stat = await fs.stat(filePath);
+      if (!stat.isFile()) throw new Error('Playwright did not create a trace file');
+      if (stat.size > MAX_TRACE_BYTES) {
+        await fs.unlink(filePath).catch(() => undefined);
+        throw new Error(`Trace exceeded the ${MAX_TRACE_BYTES}-byte size limit and was deleted`);
+      }
+      await pruneTraceDirectory(directory, filePath);
+      return {
+        active: false,
+        startedAt: trace.startedAt,
+        stoppedAt: new Date().toISOString(),
+        durationMs: Date.now() - trace.startedAtMs,
+        path: filePath,
+        bytes: stat.size,
+        environment: process.platform,
+      };
+    } catch (error) {
+      if (filePath) await fs.unlink(filePath).catch(() => undefined);
+      await trace.context.tracing.stop().catch(() => undefined);
+      throw error;
+    } finally {
+      this.disposeTraceGuards(trace);
+    }
   }
 
   consoleHistory(page: Page, limit: number, clear: boolean): {
@@ -564,6 +1038,7 @@ class BrowserController {
           this.browser = undefined;
           this.chromePort = undefined;
           this.clearPageStates();
+          void this.discardActiveTrace();
         }
       });
       return connected;
@@ -583,6 +1058,7 @@ class BrowserController {
   }
 
   private async disconnectCurrent(reason: string): Promise<void> {
+    await this.discardActiveTrace();
     const connected = this.browser;
     this.browser = undefined;
     this.chromePort = undefined;
@@ -592,6 +1068,70 @@ class BrowserController {
       // disconnecting from the browser server. We create no contexts, so the
       // VS Code-owned Chrome and its pre-existing pages remain alive.
       await connected.close({ reason }).catch(() => undefined);
+    }
+  }
+
+  private publicTraceStatus(trace: TraceState): UnknownRecord {
+    return {
+      active: true,
+      startedAt: trace.startedAt,
+      durationMs: Date.now() - trace.startedAtMs,
+      maxDurationMs: MAX_TRACE_DURATION_MS,
+      targetIds: trace.targetIds,
+      valid: trace.invalidReason === undefined,
+      ...(trace.invalidReason ? { invalidReason: trace.invalidReason } : {}),
+    };
+  }
+
+  private async discardActiveTrace(): Promise<void> {
+    const trace = this.activeTrace;
+    if (!trace) return;
+    this.activeTrace = undefined;
+    if (trace.timer) clearTimeout(trace.timer);
+    try {
+      await trace.context.tracing.stop().catch(() => undefined);
+    } finally {
+      this.disposeTraceGuards(trace);
+    }
+  }
+
+  private installTraceGuards(trace: TraceState, pages: readonly Page[]): void {
+    const watchPage = (page: Page) => {
+      const onFrameNavigated = (frame: Frame) => {
+        if (frame !== page.mainFrame() || urlMatchesVite(frame.url(), trace.viteUrl)) return;
+        trace.invalidReason ??=
+          `a traced page navigated outside the managed Vite app (${sanitizeBrowserUrl(frame.url())})`;
+      };
+      page.on('framenavigated', onFrameNavigated);
+      trace.guards.push(() => page.off('framenavigated', onFrameNavigated));
+    };
+    const onPage = (page: Page) => {
+      trace.invalidReason ??= 'the traced browser context opened a new page';
+      watchPage(page);
+    };
+    trace.context.on('page', onPage);
+    trace.guards.push(() => trace.context.off('page', onPage));
+    for (const page of pages) watchPage(page);
+  }
+
+  private disposeTraceGuards(trace: TraceState): void {
+    for (const dispose of trace.guards.splice(0)) dispose();
+  }
+
+  private async refreshTraceValidity(trace: TraceState): Promise<void> {
+    // Target lifecycle notifications arrive independently on each CDP client.
+    // Yield briefly before inspecting the context so a page opened by the app
+    // or another attached client cannot slip into a trace artifact.
+    await delay(25);
+    const descriptions = await this.describePages(
+      trace.context.pages().filter((page) => !page.isClosed()),
+    );
+    const originalTargets = new Set(trace.targetIds);
+    const unexpected = descriptions.find((page) =>
+      !originalTargets.has(page.targetId) || !urlMatchesVite(page.url, trace.viteUrl));
+    if (unexpected) {
+      trace.invalidReason ??=
+        `the traced context contains an unexpected page (${unexpected.targetId}, ${unexpected.url})`;
     }
   }
 
@@ -748,6 +1288,16 @@ class BrowserController {
     } finally {
       await cdp.detach().catch(() => undefined);
     }
+  }
+
+  private async describePages(pages: readonly Page[]): Promise<PageDescription[]> {
+    const settled = await Promise.allSettled(pages.map((page) => this.describePage(page)));
+    return settled.flatMap((result, index) => {
+      if (result.status === 'fulfilled') return [result.value];
+      const page = pages[index];
+      if (page.isClosed() || isVanishedPlaywrightPageError(result.reason)) return [];
+      throw result.reason;
+    });
   }
 }
 
@@ -954,8 +1504,16 @@ async function runBrowserMutation(
   selected: SelectedSession,
   operation: () => Promise<void>,
 ): Promise<UnknownRecord> {
+  return runBrowserOperation(bridge, selected, operation);
+}
+
+async function runBrowserOperation<T>(
+  bridge: BridgeClient,
+  selected: SelectedSession,
+  operation: () => Promise<T>,
+): Promise<UnknownRecord> {
   const pending = operation().then(
-    () => ({ kind: 'completed' as const }),
+    (value) => ({ kind: 'completed' as const, value }),
     (error: unknown) => ({ kind: 'failed' as const, error }),
   );
 
@@ -978,13 +1536,17 @@ async function runBrowserMutation(
             outcome: 'paused',
             pendingActionMayCompleteAfterResume: false,
             debugStatus: publicDebugStatus(latestStatus),
+            ...(settled.value === undefined ? {} : { result: settled.value }),
           };
         }
       } catch {
         // The browser action itself succeeded; a transient status refresh
         // failure must not turn that success into an action failure.
       }
-      return { outcome: 'completed' };
+      return {
+        outcome: 'completed',
+        ...(settled.value === undefined ? {} : { result: settled.value }),
+      };
     }
 
     // A CDP input command can remain pending when its event handler reaches a
@@ -1007,6 +1569,126 @@ async function runBrowserMutation(
 
     if (settled.kind === 'failed') throw settled.error;
   }
+}
+
+async function validateUploadFiles(
+  workspace: string,
+  inputs: readonly string[],
+): Promise<UploadFileDescription[]> {
+  const workspaceRoot = await fs.realpath(workspace);
+  const files: UploadFileDescription[] = [];
+  let totalBytes = 0;
+
+  for (const input of inputs) {
+    if (input.includes('\0')) throw new Error('Upload path contains a null byte');
+    const candidate = path.resolve(workspace, input);
+    if (!pathIsInside(workspaceRoot, candidate)) {
+      throw new Error(`Upload path is outside the configured workspace: ${input}`);
+    }
+    const relativeCandidate = path.relative(workspaceRoot, candidate);
+    let current = workspaceRoot;
+    for (const segment of relativeCandidate.split(path.sep).filter(Boolean)) {
+      current = path.join(current, segment);
+      const component = await fs.lstat(current);
+      if (component.isSymbolicLink()) {
+        throw new Error(`Upload path must not contain a symbolic link: ${input}`);
+      }
+    }
+    const resolved = await fs.realpath(candidate);
+    if (!pathIsInside(workspaceRoot, resolved)) {
+      throw new Error(`Upload path is outside the configured workspace: ${input}`);
+    }
+    const stat = await fs.stat(resolved);
+    if (!stat.isFile()) throw new Error(`Upload path is not a regular file: ${input}`);
+    if (stat.size > MAX_UPLOAD_FILE_BYTES) {
+      throw new Error(`Upload file exceeds the ${MAX_UPLOAD_FILE_BYTES}-byte per-file limit: ${input}`);
+    }
+    totalBytes += stat.size;
+    if (totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
+      throw new Error(`Upload files exceed the ${MAX_UPLOAD_TOTAL_BYTES}-byte total limit`);
+    }
+    files.push({
+      path: resolved,
+      relativePath: path.relative(workspaceRoot, resolved).replace(/\\/g, '/'),
+      bytes: stat.size,
+    });
+  }
+  return files;
+}
+
+function pathIsInside(parent: string, child: string): boolean {
+  const normalize = (value: string) => process.platform === 'win32'
+    ? path.resolve(value).toLocaleLowerCase('en-US')
+    : path.resolve(value);
+  const relative = path.relative(normalize(parent), normalize(child));
+  return relative === '' ||
+    (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+async function prepareTraceDirectory(workspace: string): Promise<string> {
+  const hash = crypto.createHash('sha256').update(await fs.realpath(workspace)).digest('hex').slice(0, 24);
+  const parent = path.join(os.tmpdir(), 'vite-debugger-traces');
+  const directory = path.join(parent, hash);
+  await ensurePrivateTraceDirectory(parent);
+  await ensurePrivateTraceDirectory(directory);
+  return directory;
+}
+
+async function ensurePrivateTraceDirectory(directory: string): Promise<void> {
+  try {
+    const stat = await fs.lstat(directory);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Unsafe trace directory: ${directory}`);
+    }
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+      throw new Error(`Trace directory is owned by another user: ${directory}`);
+    }
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
+    try {
+      await fs.mkdir(directory, { mode: 0o700 });
+    } catch (createError) {
+      if (!isNodeError(createError) || createError.code !== 'EEXIST') throw createError;
+    }
+    const created = await fs.lstat(directory);
+    if (created.isSymbolicLink() || !created.isDirectory()) {
+      throw new Error(`Could not create a safe trace directory: ${directory}`);
+    }
+    if (typeof process.getuid === 'function' && created.uid !== process.getuid()) {
+      throw new Error(`Trace directory is owned by another user: ${directory}`);
+    }
+  }
+  await fs.chmod(directory, 0o700);
+}
+
+function isNodeError(value: unknown): value is NodeJS.ErrnoException {
+  return value instanceof Error && 'code' in value;
+}
+
+function isVanishedPlaywrightPageError(value: unknown): boolean {
+  const message = value instanceof Error ? value.message : String(value);
+  return /no object with guid|target page, context or browser has been closed|page has been closed/i.test(message);
+}
+
+async function pruneTraceDirectory(directory: string, keepPath: string): Promise<void> {
+  const entries = await fs.readdir(directory, { withFileTypes: true });
+  const traces = (await Promise.all(entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.zip'))
+    .map(async (entry) => {
+      const filePath = path.join(directory, entry.name);
+      try {
+        return { filePath, mtimeMs: (await fs.stat(filePath)).mtimeMs };
+      } catch {
+        return undefined;
+      }
+    })))
+    .filter((trace): trace is { filePath: string; mtimeMs: number } => trace !== undefined)
+    .sort((left, right) => right.mtimeMs - left.mtimeMs);
+  const cutoff = Date.now() - 7 * 24 * 60 * 60_000;
+  await Promise.all(traces.map(async (trace, index) => {
+    if (trace.filePath === keepPath || (index < 10 && trace.mtimeMs >= cutoff)) return;
+    await fs.unlink(trace.filePath).catch(() => undefined);
+  }));
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -1201,7 +1883,7 @@ async function safely(operation: () => Promise<CallToolResult>): Promise<CallToo
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return boundedText(error instanceof Error ? error.message : String(error), MAX_ERROR_TEXT_CHARS);
 }
 
 function isRecord(value: unknown): value is UnknownRecord {
