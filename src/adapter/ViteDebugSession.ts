@@ -68,9 +68,59 @@ interface AttachRequestArguments extends DebugProtocol.AttachRequestArguments {
   reloadOnAttach?: boolean;
 }
 
+interface McpCustomRequestArguments {
+  expression?: string;
+  cacheKey?: string;
+  method?: string;
+  params?: unknown;
+}
+
+type McpControlAction =
+  | 'pause'
+  | 'continue'
+  | 'step_over'
+  | 'step_into'
+  | 'step_out'
+  | 'reload';
+
+/**
+ * Pause data owned by one Chrome page target.
+ *
+ * Chrome can pause more than one tab at once. DAP exposes a single synthetic
+ * thread, but MCP callers address real page targets, so their snapshots must
+ * not share the adapter's single DAP stack buffer.
+ */
+interface McpPausedTargetState {
+  targetId: string;
+  sessionId?: string;
+  pauseEpoch: number;
+  reason: string;
+  pausedEvent: PausedEvent;
+  resolvedFrames: ResolvedCallFrame[];
+  callStackManager: CallStackManager | null;
+}
+
+const MCP_MAX_FRAMES = 20;
+const MCP_MAX_SCOPES = 4;
+const MCP_MAX_VARIABLES_PER_SCOPE = 20;
+const MCP_MAX_VALUE_LENGTH = 300;
+const MCP_MAX_BREAKPOINTS = 200;
+
 export class ViteDebugSession extends LoggingDebugSession {
   private cdp: CdpClient | null = null;
   private viteServer: ViteServerInfo | null = null;
+  /** Actual port selected after discovery/launch, not merely launch.json input. */
+  private activeChromePort: number | null = null;
+  /** MCP-visible execution state. Epoch changes on every real CDP pause. */
+  private paused = false;
+  private pauseReason: string | null = null;
+  private pauseEpoch = 0;
+  private lastPausedEvent: PausedEvent | null = null;
+  private lastPauseTargetId: string | null = null;
+  /** Targets for which a DAP/MCP pause command is waiting to surface. */
+  private requestedPauseTargets = new Set<string>();
+  /** Target-scoped pause snapshots for MCP. Never expose session ids. */
+  private mcpPausedTargets = new Map<string, McpPausedTargetState>();
   private urlMapper: ViteUrlMapper | null = null;
   private sourceMapResolver: SourceMapResolver | null = null;
   private breakpointManager: BreakpointManager | null = null;
@@ -285,6 +335,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     // would silently drop the replay, which is what made re-attach against
     // an already-loaded page require a manual page reload to start working.
     this.cdp = await CdpClient.connect(chromePort, this.viteServer!.url);
+    this.activeChromePort = chromePort;
 
     // Initialize managers (depends on cdp)
     this.breakpointManager = new BreakpointManager(this.cdp, this.sourceMapResolver, this.viteServer!.url);
@@ -295,9 +346,18 @@ export class ViteDebugSession extends LoggingDebugSession {
 
     // Initialize network breakpoint manager
     this.networkBreakpointManager = new NetworkBreakpointManager(this.cdp);
-    this.networkBreakpointManager.onMatch((_rule, _request) => {
-      // Pause JS execution when a network breakpoint matches
-      this.cdp?.pause();
+    this.networkBreakpointManager.onMatch(async (_rule, _request, sessionId) => {
+      // Fetch events are scoped to a flattened target session. Resolve that
+      // session back to its public target id so a request in one tab can never
+      // pause whichever sibling tab happened to be active most recently.
+      const cdp = this.cdp;
+      if (!cdp) return;
+      const targetId = sessionId ? cdp.targetIdForSession(sessionId) : cdp.activeTargetId;
+      if (sessionId && !targetId) {
+        logger.debug(`Ignoring network breakpoint from unmanaged target session ${sessionId}`);
+        return;
+      }
+      await cdp.pause(targetId);
     });
 
     // Wire up source map loaded callback. Three responsibilities:
@@ -311,6 +371,7 @@ export class ViteDebugSession extends LoggingDebugSession {
         if (url) {
           this.breakpointManager.resolveBreakpointsForScript(scriptId, url).then(resolved => {
             for (const bp of resolved) {
+              if (bp.owner !== 'vscode') continue;
               this.sendEvent(new BreakpointEvent('changed', {
                 id: bp.dapId,
                 verified: true,
@@ -333,11 +394,14 @@ export class ViteDebugSession extends LoggingDebugSession {
     // immediately replays every already-parsed script via scriptParsed —
     // we need our handler attached or those replays vanish.
     this.cdp.on('scriptParsed', (params: ScriptParsedEvent, sessionId?: string) => this.onScriptParsed(params, sessionId));
-    this.cdp.on('paused', (params: PausedEvent) => this.onPaused(params));
-    this.cdp.on('resumed', () => this.onResumed());
+    this.cdp.on('paused', (params: PausedEvent, sessionId?: string) => this.onPaused(params, sessionId));
+    this.cdp.on('resumed', (sessionId?: string) => this.onResumed(sessionId));
     this.cdp.on('disconnected', () => this.onDisconnected());
     this.cdp.on('consoleAPICalled', (params: ConsoleAPICalledEvent) => this.onConsoleAPICalled(params));
-    this.cdp.on('requestPaused', (params: FetchRequestPausedEvent) => this.networkBreakpointManager?.handleRequest(params));
+    this.cdp.on('requestPaused', (params: FetchRequestPausedEvent, sessionId?: string) => {
+      const manager = this.networkBreakpointManager;
+      if (manager) void manager.handleRequest(params, sessionId);
+    });
 
     // A Vite app is often open in several tabs; each is a separate CDP target.
     // We attach to all of them so breakpoints fire no matter which tab runs the
@@ -349,6 +413,11 @@ export class ViteDebugSession extends LoggingDebugSession {
     });
     this.cdp.on('targetDetached', (sessionId: string) => {
       this.hmrScriptUrlsBySession.delete(sessionId);
+      this.removeMcpPausedSession(sessionId);
+      const managedTargetIds = new Set(this.cdp?.listTargets().map((target) => target.targetId) ?? []);
+      for (const targetId of this.requestedPauseTargets) {
+        if (!managedTargetIds.has(targetId)) this.requestedPauseTargets.delete(targetId);
+      }
       this.sendEvent(new OutputEvent(
         `Tab closed (${this.cdp?.attachedTabCount ?? 0} tab(s) attached)\n`, 'console'
       ));
@@ -927,7 +996,14 @@ export class ViteDebugSession extends LoggingDebugSession {
     _args: DebugProtocol.PauseArguments
   ): Promise<void> {
     if (this.cdp) {
-      await this.cdp.pause();
+      const targetId = this.cdp.activeTargetId;
+      if (targetId) this.requestedPauseTargets.add(targetId);
+      try {
+        await this.cdp.pause(targetId);
+      } catch (error) {
+        if (targetId) this.requestedPauseTargets.delete(targetId);
+        throw error;
+      }
     }
     this.sendResponse(response);
   }
@@ -1019,7 +1095,7 @@ export class ViteDebugSession extends LoggingDebugSession {
   protected async customRequest(
     command: string,
     response: DebugProtocol.Response,
-    args: { expression?: string; cacheKey?: string } | undefined,
+    args: McpCustomRequestArguments | undefined,
   ): Promise<void> {
     if (command === 'viteDebugger.evalForValue') {
       if (!this.cdp) {
@@ -1048,7 +1124,433 @@ export class ViteDebugSession extends LoggingDebugSession {
       }
       return;
     }
+
+    if (command === 'viteDebugger.mcp') {
+      const method = args?.method;
+      if (typeof method !== 'string' || method.length === 0) {
+        response.success = false;
+        response.message = 'Missing MCP method argument';
+        this.sendResponse(response);
+        return;
+      }
+
+      try {
+        const result = await this.handleMcpRequest(method, args?.params);
+        // VS Code's customRequest() already resolves to response.body. Keep the
+        // method result direct so the bridge does not create nested envelopes.
+        response.body = result;
+      } catch (e) {
+        response.success = false;
+        response.message = this.truncateMcpText(
+          e instanceof Error ? e.message : String(e),
+          1000,
+        );
+      }
+      this.sendResponse(response);
+      return;
+    }
     super.customRequest(command, response, args as never);
+  }
+
+  /** Dispatch the narrow, structured API consumed by the MCP bridge. */
+  private async handleMcpRequest(method: string, params: unknown): Promise<unknown> {
+    switch (method) {
+      case 'status':
+        return this.buildMcpStatus();
+      case 'snapshot':
+        return this.buildMcpSnapshot(params);
+      case 'control':
+        return this.handleMcpControl(params);
+      case 'replaceBreakpoints':
+        return this.handleMcpReplaceBreakpoints(params);
+      default:
+        throw new Error(`Unknown MCP method: ${this.truncateMcpText(method, 100)}`);
+    }
+  }
+
+  private buildMcpStatus(): object {
+    const targets = (this.cdp?.listTargets() ?? []).map((target) => ({
+      targetId: target.targetId,
+      type: target.type,
+      title: this.truncateMcpText(target.title || '(untitled)', 200),
+      url: this.sanitizeMcpUrl(target.url),
+      active: target.active,
+      primary: target.primary,
+      paused: target.paused,
+    }));
+
+    const activePause = this.selectMcpPausedTarget();
+    const pausedTargetIds = [...this.mcpPausedTargets.values()]
+      .sort((a, b) => a.pauseEpoch - b.pauseEpoch)
+      .map((state) => state.targetId);
+
+    return {
+      connected: this.cdp?.isConnected ?? false,
+      viteUrl: this.viteServer ? this.sanitizeMcpUrl(this.viteServer.url) : null,
+      chromePort: this.activeChromePort,
+      paused: pausedTargetIds.length > 0,
+      pauseReason: activePause?.reason ?? null,
+      pauseEpoch: this.pauseEpoch,
+      activeTargetId: this.cdp?.activeTargetId ?? null,
+      pauseTargetId: activePause?.targetId ?? null,
+      pausedTargetIds,
+      targets,
+    };
+  }
+
+  /**
+   * Return a bounded pause snapshot. Values are shallow previews only: object
+   * ids and connection/session ids never leave the adapter, obvious credential
+   * fields are redacted, and every collection/string has a hard limit.
+   */
+  private async buildMcpSnapshot(params: unknown): Promise<object> {
+    const input = this.asMcpRecord(params);
+    const requestedTargetId = this.optionalMcpString(input.targetId, 'targetId', 200);
+    const frameLimit = this.boundedMcpInteger(
+      input.frameLimit ?? input.maxFrames,
+      MCP_MAX_FRAMES,
+      1,
+      MCP_MAX_FRAMES,
+    );
+    const variableLimit = this.boundedMcpInteger(
+      input.variableLimit ?? input.maxVariables,
+      MCP_MAX_VARIABLES_PER_SCOPE,
+      1,
+      MCP_MAX_VARIABLES_PER_SCOPE,
+    );
+
+    if (requestedTargetId && !this.cdp?.listTargets().some((item) => item.targetId === requestedTargetId)) {
+      throw new Error(`Unknown or unmanaged Chrome target: ${requestedTargetId}`);
+    }
+
+    // With no targetId, snapshot follows Chrome's active paused target (the
+    // most recently paused tab). With targetId it is strictly target-scoped:
+    // asking for a running tab returns paused:false even if another tab is
+    // paused.
+    const pauseState = requestedTargetId
+      ? this.mcpPausedTargets.get(requestedTargetId)
+      : this.selectMcpPausedTarget();
+
+    if (!pauseState) {
+      return {
+        paused: false,
+        pauseEpoch: this.pauseEpoch,
+        targetId: requestedTargetId ?? null,
+        reason: null,
+        ready: false,
+        frames: [],
+        scopes: [],
+      };
+    }
+
+    const frames = pauseState.resolvedFrames.slice(0, frameLimit).map(({ dapFrame }) => ({
+      name: this.truncateMcpText(dapFrame.name || '(anonymous)', 300),
+      source: dapFrame.source ? {
+        name: this.truncateMcpText(dapFrame.source.name ?? '', 300),
+        path: dapFrame.source.path
+          ? this.truncateMcpText(dapFrame.source.path, 4096)
+          : null,
+      } : null,
+      line: dapFrame.line,
+      column: dapFrame.column,
+      presentationHint: dapFrame.presentationHint ?? null,
+    }));
+
+    const topFrame = pauseState.resolvedFrames[0]?.cdpCallFrame;
+    const eligibleScopes = (topFrame?.scopeChain ?? []).filter((scope) =>
+      scope.type !== 'global' && scope.type !== 'script' && scope.type !== 'module'
+    );
+    const selectedScopes = eligibleScopes.slice(0, MCP_MAX_SCOPES);
+    const scopes = await Promise.all(selectedScopes.map(async (scope) => {
+      const objectId = scope.object.objectId;
+      if (!this.cdp || !objectId) {
+        return {
+          name: this.mcpScopeName(scope.type, scope.name),
+          type: scope.type,
+          variables: [],
+          truncated: false,
+        };
+      }
+
+      try {
+        const properties = await this.withTimeout(
+          this.cdp.getProperties(objectId, true, pauseState.targetId),
+          750,
+        );
+        const visible = properties.filter((property) => property.name !== '__proto__' && property.value);
+        return {
+          name: this.mcpScopeName(scope.type, scope.name),
+          type: scope.type,
+          variables: visible.slice(0, variableLimit).map((property) =>
+            this.summarizeMcpVariable(property.name, property.value!)
+          ),
+          truncated: visible.length > variableLimit,
+        };
+      } catch {
+        return {
+          name: this.mcpScopeName(scope.type, scope.name),
+          type: scope.type,
+          variables: [],
+          truncated: false,
+          unavailable: true,
+        };
+      }
+    }));
+
+    return {
+      paused: true,
+      pauseEpoch: pauseState.pauseEpoch,
+      targetId: pauseState.targetId,
+      reason: pauseState.reason,
+      hitBreakpoints: (pauseState.pausedEvent.hitBreakpoints ?? [])
+        .slice(0, 20)
+        .map((id) => this.truncateMcpText(id, 200)),
+      ready: frames.length > 0,
+      frames,
+      scopes,
+      truncated: {
+        frames: pauseState.resolvedFrames.length > frameLimit,
+        scopes: eligibleScopes.length > MCP_MAX_SCOPES,
+      },
+    };
+  }
+
+  private async handleMcpControl(params: unknown): Promise<object> {
+    if (!this.cdp?.isConnected) throw new Error('Debug session not connected');
+    const input = this.asMcpRecord(params);
+    const rawAction = this.requiredMcpString(input.action, 'action', 40);
+    const aliases: Record<string, McpControlAction> = {
+      pause: 'pause',
+      continue: 'continue',
+      resume: 'continue',
+      step_over: 'step_over',
+      stepOver: 'step_over',
+      step_into: 'step_into',
+      stepInto: 'step_into',
+      step_out: 'step_out',
+      stepOut: 'step_out',
+      reload: 'reload',
+    };
+    const action = aliases[rawAction];
+    if (!action) throw new Error(`Unsupported control action: ${rawAction}`);
+
+    const requestedTargetId = this.optionalMcpString(input.targetId, 'targetId', 200);
+    const targets = this.cdp.listTargets();
+    if (requestedTargetId && !targets.some((target) => target.targetId === requestedTargetId)) {
+      throw new Error(`Unknown or unmanaged Chrome target: ${requestedTargetId}`);
+    }
+
+    const requiresPausedTarget = action === 'continue'
+      || action === 'step_over'
+      || action === 'step_into'
+      || action === 'step_out';
+    const defaultPausedTarget = this.selectMcpPausedTarget()?.targetId;
+    const targetId = requestedTargetId
+      ?? (requiresPausedTarget ? defaultPausedTarget : this.cdp.activeTargetId);
+
+    if (requiresPausedTarget && (!targetId || !this.mcpPausedTargets.has(targetId))) {
+      throw new Error(
+        requestedTargetId
+          ? `Chrome target is not paused: ${requestedTargetId}`
+          : 'No paused Chrome target is available for this action',
+      );
+    }
+
+    switch (action) {
+      case 'pause':
+        this.lastStepAction = null;
+        this.smartStepCount = 0;
+        if (targetId) this.requestedPauseTargets.add(targetId);
+        try {
+          await this.cdp.pause(targetId);
+        } catch (error) {
+          if (targetId) this.requestedPauseTargets.delete(targetId);
+          throw error;
+        }
+        break;
+      case 'continue':
+        this.lastStepAction = null;
+        this.smartStepCount = 0;
+        await this.cdp.resume(targetId);
+        break;
+      case 'step_over':
+        this.lastStepAction = 'stepOver';
+        this.smartStepCount = 0;
+        await this.cdp.stepOver(targetId);
+        break;
+      case 'step_into':
+        this.lastStepAction = 'stepInto';
+        this.smartStepCount = 0;
+        await this.cdp.stepInto(targetId);
+        break;
+      case 'step_out':
+        this.lastStepAction = 'stepOut';
+        this.smartStepCount = 0;
+        await this.cdp.stepOut(targetId);
+        break;
+      case 'reload':
+        // Preserve the existing "reload all Vite tabs" behaviour when no
+        // targetId is supplied; all other actions resolve one concrete target.
+        await this.cdp.reload(input.ignoreCache === true, requestedTargetId);
+        break;
+    }
+
+    return {
+      accepted: true,
+      action,
+      targetId: action === 'reload' ? requestedTargetId ?? null : targetId ?? null,
+      pauseEpoch: this.pauseEpoch,
+    };
+  }
+
+  private async handleMcpReplaceBreakpoints(params: unknown): Promise<object> {
+    if (!this.breakpointManager) throw new Error('Debug session not connected');
+    const input = this.asMcpRecord(params);
+    const sourcePath = this.requiredMcpString(input.sourcePath ?? input.source, 'sourcePath', 4096);
+    if (sourcePath.includes('\0')) throw new Error('sourcePath contains a null byte');
+    if (!Array.isArray(input.breakpoints)) throw new Error('breakpoints must be an array');
+    if (input.breakpoints.length > MCP_MAX_BREAKPOINTS) {
+      throw new Error(`Too many breakpoints (maximum ${MCP_MAX_BREAKPOINTS})`);
+    }
+
+    const requested: DebugProtocol.SourceBreakpoint[] = input.breakpoints.map((value, index) => {
+      const breakpoint = this.asMcpRecord(value, `breakpoints[${index}]`);
+      const line = this.boundedMcpInteger(breakpoint.line, 0, 1, 1_000_000_000);
+      if (line === 0) throw new Error(`breakpoints[${index}].line must be a positive integer`);
+      const column = breakpoint.column === undefined
+        ? undefined
+        : this.boundedMcpInteger(breakpoint.column, 0, 1, 1_000_000_000);
+      if (breakpoint.column !== undefined && column === 0) {
+        throw new Error(`breakpoints[${index}].column must be a positive integer`);
+      }
+      return {
+        line,
+        column,
+        condition: this.optionalMcpString(breakpoint.condition, `breakpoints[${index}].condition`, 4096),
+        hitCondition: this.optionalMcpString(breakpoint.hitCondition, `breakpoints[${index}].hitCondition`, 200),
+        logMessage: this.optionalMcpString(breakpoint.logMessage, `breakpoints[${index}].logMessage`, 4096),
+      };
+    });
+
+    const breakpoints = await this.breakpointManager.setBreakpoints(sourcePath, requested, 'agent');
+    if (requested.length > 0 && breakpoints.some((breakpoint) => !breakpoint.verified)) {
+      this.tryProactiveModuleLoad(sourcePath).catch(() => undefined);
+    }
+
+    return {
+      ownership: 'agent',
+      sourcePath,
+      breakpoints: breakpoints.map((breakpoint) => ({
+        id: breakpoint.id,
+        verified: breakpoint.verified,
+        line: breakpoint.line,
+        column: breakpoint.column ?? null,
+        message: breakpoint.message
+          ? this.truncateMcpText(breakpoint.message, 500)
+          : null,
+      })),
+    };
+  }
+
+  private summarizeMcpVariable(name: string, value: RemoteObject): object {
+    const safeName = this.truncateMcpText(name, 300);
+    if (this.isSensitiveMcpName(name)) {
+      return { name: safeName, type: value.type, value: '[REDACTED]', redacted: true };
+    }
+
+    let preview: string;
+    switch (value.type) {
+      case 'undefined':
+        preview = 'undefined';
+        break;
+      case 'string':
+        preview = JSON.stringify(value.value ?? '');
+        break;
+      case 'boolean':
+      case 'number':
+      case 'bigint':
+        preview = String(value.value ?? value.description ?? value.type);
+        break;
+      case 'function':
+        preview = value.className ? `[Function ${value.className}]` : '[Function]';
+        break;
+      case 'object':
+        preview = value.subtype === 'null'
+          ? 'null'
+          : value.preview?.description ?? value.description ?? value.className ?? value.subtype ?? 'Object';
+        break;
+      default:
+        preview = value.description ?? String(value.value ?? value.type);
+        break;
+    }
+
+    return {
+      name: safeName,
+      type: value.type,
+      subtype: value.subtype ?? null,
+      value: this.truncateMcpText(preview, MCP_MAX_VALUE_LENGTH),
+      expandable: Boolean(value.objectId),
+    };
+  }
+
+  private mcpScopeName(type: string, name?: string): string {
+    return this.truncateMcpText(name ? `${type} (${name})` : type, 300);
+  }
+
+  private isSensitiveMcpName(name: string): boolean {
+    return /(?:pass(?:word|wd)?|secret|token|api[-_]?key|auth(?:orization)?|cookie|credential|private[-_]?key|bearer|jwt|session[-_]?id)/i.test(name);
+  }
+
+  private sanitizeMcpUrl(raw: string): string {
+    const bounded = this.truncateMcpText(raw, 4096);
+    try {
+      const url = new URL(bounded);
+      url.username = '';
+      url.password = '';
+      const keys = [...new Set(url.searchParams.keys())];
+      url.search = '';
+      for (const key of keys.slice(0, 30)) url.searchParams.append(key, '[redacted]');
+      url.hash = '';
+      return this.truncateMcpText(url.toString(), 4096);
+    } catch {
+      return bounded.split(/[?#]/, 1)[0];
+    }
+  }
+
+  private truncateMcpText(value: string, maxLength: number): string {
+    if (value.length <= maxLength) return value;
+    return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
+  }
+
+  private asMcpRecord(value: unknown, label: string = 'params'): Record<string, unknown> {
+    if (value === undefined || value === null) return {};
+    if (typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`${label} must be an object`);
+    }
+    return value as Record<string, unknown>;
+  }
+
+  private requiredMcpString(value: unknown, label: string, maxLength: number): string {
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`${label} must be a non-empty string`);
+    }
+    if (value.length > maxLength) throw new Error(`${label} is too long`);
+    return value;
+  }
+
+  private optionalMcpString(value: unknown, label: string, maxLength: number): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'string') throw new Error(`${label} must be a string`);
+    if (value.length > maxLength) throw new Error(`${label} is too long`);
+    return value;
+  }
+
+  private boundedMcpInteger(value: unknown, fallback: number, min: number, max: number): number {
+    if (value === undefined || value === null) return fallback;
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+      return fallback;
+    }
+    return value;
   }
 
   /**
@@ -1144,6 +1646,7 @@ export class ViteDebugSession extends LoggingDebugSession {
       } else {
         const resolved = await this.breakpointManager.resolveBreakpointsForScript(params.scriptId, params.url);
         for (const bp of resolved) {
+          if (bp.owner !== 'vscode') continue;
           this.sendEvent(new BreakpointEvent('changed', {
             id: bp.dapId,
             verified: true,
@@ -1227,6 +1730,7 @@ export class ViteDebugSession extends LoggingDebugSession {
       affectedSourcePaths, editedSourcePaths,
     );
     for (const bp of resolved) {
+      if (bp.owner !== 'vscode') continue;
       this.sendEvent(new BreakpointEvent('changed', {
         id: bp.dapId,
         verified: true,
@@ -1234,6 +1738,7 @@ export class ViteDebugSession extends LoggingDebugSession {
       } as DebugProtocol.Breakpoint));
     }
     for (const bp of unresolved) {
+      if (bp.owner !== 'vscode') continue;
       this.sendEvent(new BreakpointEvent('changed', {
         id: bp.dapId,
         verified: false,
@@ -1242,6 +1747,7 @@ export class ViteDebugSession extends LoggingDebugSession {
       } as DebugProtocol.Breakpoint));
     }
     for (const bp of deferred) {
+      if (bp.owner !== 'vscode') continue;
       // Do NOT include `line` — the stored bp.line is the pre-edit snapshot
       // and emitting it would yank VSCode's marker back to the wrong row.
       // Omitting `line` signals verified:false without moving the marker;
@@ -1265,7 +1771,30 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.sourceMapResolver.clearPriorSnapshots();
   }
 
-  private async onPaused(params: PausedEvent): Promise<void> {
+  private async onPaused(params: PausedEvent, sessionId?: string): Promise<void> {
+    // Update automation-visible state immediately. Frame/scope summaries are
+    // populated later in this handler, before the DAP StoppedEvent is sent.
+    const pauseTargetId = this.cdp?.targetIdForSession(sessionId)
+      ?? this.cdp?.activeTargetId
+      ?? null;
+    this.paused = true;
+    this.pauseReason = params.reason;
+    const pauseEpoch = ++this.pauseEpoch;
+    this.lastPausedEvent = params;
+    this.lastPauseTargetId = pauseTargetId;
+    this.resolvedFrames = [];
+
+    const pauseState: McpPausedTargetState | null = pauseTargetId ? {
+      targetId: pauseTargetId,
+      sessionId,
+      pauseEpoch,
+      reason: params.reason,
+      pausedEvent: params,
+      resolvedFrames: [],
+      callStackManager: null,
+    } : null;
+    if (pauseState) this.mcpPausedTargets.set(pauseState.targetId, pauseState);
+
     const pauseTopScriptId = params.callFrames[0]?.location.scriptId ?? '?';
     const topLoc = params.callFrames[0]?.location;
     logger.debug(`onPaused entered: reason=${params.reason} frames=${params.callFrames.length} topScript=${pauseTopScriptId} hitBps=${params.hitBreakpoints?.length ?? 0}`);
@@ -1311,7 +1840,8 @@ export class ViteDebugSession extends LoggingDebugSession {
     // to reach user code. Works for both stepping and breakpoints hitting
     // injected wrapper code (e.g., @react-refresh _s() calls).
     const isException = params.reason === 'exception' || params.reason === 'promiseRejection';
-    const isManualPause = params.reason === 'debugCommand';
+    const isManualPause = params.reason === 'debugCommand'
+      || (pauseTargetId !== null && this.requestedPauseTargets.delete(pauseTargetId));
 
     const isExplicitBreakpoint = params.reason === 'breakpoint' ||
       (params.reason === 'other' && params.hitBreakpoints && params.hitBreakpoints.length > 0);
@@ -1343,7 +1873,7 @@ export class ViteDebugSession extends LoggingDebugSession {
           logger.debug('Smart step limit reached, resuming to next breakpoint');
           this.smartStepCount = 0;
           this.lastStepAction = null;
-          await this.cdp.resume();
+          await this.cdp.resume(pauseTargetId ?? undefined);
           return;
         }
 
@@ -1360,11 +1890,11 @@ export class ViteDebugSession extends LoggingDebugSession {
         // factory) is reached rather than stepped over. stepOut continues
         // stepping out. Otherwise fall back to stepOver for line-level skips.
         if (this.lastStepAction === 'stepInto') {
-          await this.cdp.stepInto();
+          await this.cdp.stepInto(pauseTargetId ?? undefined);
         } else if (this.lastStepAction === 'stepOut') {
-          await this.cdp.stepOut();
+          await this.cdp.stepOut(pauseTargetId ?? undefined);
         } else {
-          await this.cdp.stepOver();
+          await this.cdp.stepOver(pauseTargetId ?? undefined);
         }
         return;
       }
@@ -1386,25 +1916,53 @@ export class ViteDebugSession extends LoggingDebugSession {
     };
 
     // Resolve call frames
-    if (this.callStackManager) {
+    if (this.sourceMapResolver && this.urlMapper) {
       logger.debug(`onPaused: awaiting resolveCallFrames (${params.callFrames.length} frames)`);
       const rcfStart = Date.now();
+      // Each paused target gets an isolated frame map. Sharing the DAP
+      // CallStackManager here lets a second tab clear the first tab's frames
+      // while it is still resolving.
+      const pauseCallStackManager = new CallStackManager(this.sourceMapResolver, this.urlMapper);
+      let pauseFrames: ResolvedCallFrame[] = [];
       try {
-        this.resolvedFrames = await this.callStackManager.resolveCallFrames(
+        pauseFrames = await pauseCallStackManager.resolveCallFrames(
           params.callFrames, registerSourceRef
         );
-        await this.applyBreakpointSourceFallback(params);
-        logger.debug(`onPaused: resolveCallFrames done in ${Date.now() - rcfStart}ms (${this.resolvedFrames.length} resolved)`);
+        await this.applyBreakpointSourceFallback(params, pauseFrames);
+        logger.debug(`onPaused: resolveCallFrames done in ${Date.now() - rcfStart}ms (${pauseFrames.length} resolved)`);
       } catch (e) {
         logger.warn(`resolveCallFrames failed after ${Date.now() - rcfStart}ms, stopping with empty stack: ${e}`);
-        this.resolvedFrames = [];
+        pauseFrames = [];
       }
+
+      // Frame/source resolution is asynchronous. The target may have resumed,
+      // detached, or entered a newer pause while it was in flight. In that
+      // case this handler no longer owns the target's visible pause and must
+      // not resurrect its MCP snapshot or overwrite the shared DAP buffers.
+      if (!this.isCurrentPauseState(pauseState, pauseTargetId, pauseEpoch, params)) {
+        logger.debug(
+          `Dropping stale pause before frame publish: target=${pauseTargetId ?? '?'} epoch=${pauseEpoch}`,
+        );
+        return;
+      }
+
+      if (pauseState) {
+        pauseState.resolvedFrames = pauseFrames;
+        pauseState.callStackManager = pauseCallStackManager;
+      }
+
+      // DAP still exposes one synthetic thread. Publish this pause into the
+      // legacy buffers immediately before its StoppedEvent, preserving the
+      // adapter's existing single-thread UI behaviour. MCP never reads these
+      // shared buffers; it uses pauseState above.
+      this.resolvedFrames = pauseFrames;
+      this.callStackManager = pauseCallStackManager;
 
       // Enhance top frame with React component info. Bounded — Runtime.evaluate
       // can hang while the debugger is paused (awaitPromise + microtask
       // starvation), and React info is a nice-to-have. A stall here must not
       // block StoppedEvent or VS Code's debug UI will never activate.
-      if (this.resolvedFrames.length > 0 && this.cdp) {
+      if (pauseFrames.length > 0 && this.cdp && this.lastPauseTargetId === pauseTargetId) {
         const drcStart = Date.now();
         try {
           await this.withTimeout(this.detectReactComponent(params.callFrames[0]), 800);
@@ -1417,46 +1975,94 @@ export class ViteDebugSession extends LoggingDebugSession {
 
     // Determine stop reason
     let reason: string;
-    switch (params.reason) {
-      case 'breakpoint':
-      case 'other':
-        reason = params.hitBreakpoints?.length ? 'breakpoint' : 'step';
-        break;
-      case 'exception':
-      case 'promiseRejection':
-        reason = 'exception';
-        break;
-      case 'debugCommand':
-        reason = 'pause';
-        break;
-      default:
-        reason = 'step';
+    if (isManualPause) {
+      reason = 'pause';
+    } else {
+      switch (params.reason) {
+        case 'breakpoint':
+        case 'other':
+          reason = params.hitBreakpoints?.length ? 'breakpoint' : 'step';
+          break;
+        case 'exception':
+        case 'promiseRejection':
+          reason = 'exception';
+          break;
+        case 'debugCommand':
+          reason = 'pause';
+          break;
+        default:
+          reason = 'step';
+      }
     }
 
-    const top = this.resolvedFrames[0]?.dapFrame;
+    const visiblePauseFrames = pauseState?.resolvedFrames ?? this.resolvedFrames;
+    const top = visiblePauseFrames[0]?.dapFrame;
     logger.debug(
-      `Sending StoppedEvent: reason=${reason} threadId=${THREAD_ID} frames=${this.resolvedFrames.length} ` +
+      `Sending StoppedEvent: reason=${reason} threadId=${THREAD_ID} frames=${visiblePauseFrames.length} ` +
       `top=${top ? `${top.source?.path ?? top.source?.name ?? '?'}:${top.line}` : 'none'}`
     );
+
+    // React/source enrichment above also awaits. Revalidate before changing
+    // any stop-related shared state or announcing the stop so an older handler
+    // cannot emit a ghost StoppedEvent after the same target resumed or
+    // replaced this epoch with a newer pause.
+    if (!this.isCurrentPauseState(pauseState, pauseTargetId, pauseEpoch, params)) {
+      logger.debug(
+        `Dropping stale pause before StoppedEvent: target=${pauseTargetId ?? '?'} epoch=${pauseEpoch}`,
+      );
+      return;
+    }
+
     // Snapshot the scriptId if this pause is in user code so the next
     // smart-step decision can detect a user→library frame transition (see
     // shouldSmartStep). Clear it on any non-user pause so that subsequent
     // smart-steps inside library code don't keep tripping the boundary.
     const topPath = top?.source?.path;
     const topScriptId = params.callFrames[0]?.location.scriptId ?? null;
-    this.lastUserPauseScriptId =
-      topPath && !topPath.includes('/node_modules/') && topScriptId
-        ? topScriptId
-        : null;
+    if (!pauseTargetId || this.lastPauseTargetId === pauseTargetId) {
+      this.lastUserPauseScriptId =
+        topPath && !topPath.includes('/node_modules/') && topScriptId
+          ? topScriptId
+          : null;
+    }
+
     this.sendEvent(new StoppedEvent(reason, THREAD_ID));
   }
 
-  private async applyBreakpointSourceFallback(params: PausedEvent): Promise<void> {
-    if (this.resolvedFrames.length === 0 || !this.breakpointManager) return;
+  /**
+   * Whether an asynchronous onPaused invocation still owns its target pause.
+   * Identity keeps concurrent pauses in different tabs independent, while the
+   * epoch/event fallback covers the rare case where CDP cannot resolve a
+   * target id for the event.
+   */
+  private isCurrentPauseState(
+    pauseState: McpPausedTargetState | null,
+    targetId: string | null,
+    epoch: number,
+    pausedEvent: PausedEvent,
+  ): boolean {
+    if (pauseState) {
+      const current = this.mcpPausedTargets.get(pauseState.targetId);
+      return current === pauseState
+        && current.pauseEpoch === epoch
+        && pauseState.pauseEpoch === epoch;
+    }
+
+    return this.paused
+      && this.pauseEpoch === epoch
+      && this.lastPauseTargetId === targetId
+      && this.lastPausedEvent === pausedEvent;
+  }
+
+  private async applyBreakpointSourceFallback(
+    params: PausedEvent,
+    resolvedFrames: ResolvedCallFrame[] = this.resolvedFrames,
+  ): Promise<void> {
+    if (resolvedFrames.length === 0 || !this.breakpointManager) return;
     const hit = this.breakpointManager.getBreakpointForCdpHit(params.hitBreakpoints);
     if (!hit) return;
 
-    const top = this.resolvedFrames[0].dapFrame;
+    const top = resolvedFrames[0].dapFrame;
     if (top.source?.path) return;
 
     const source: DebugProtocol.Source = {
@@ -1875,11 +2481,64 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.sendEvent(event);
   }
 
-  private onResumed(): void {
+  private onResumed(sessionId?: string): void {
+    const resumedTargetId = this.cdp?.targetIdForSession(sessionId);
+    if (resumedTargetId) {
+      this.mcpPausedTargets.delete(resumedTargetId);
+    } else if (sessionId) {
+      this.removeMcpPausedSession(sessionId);
+    }
+    this.reconcileVisiblePauseState();
     this.sendEvent(new ContinuedEvent(THREAD_ID, true));
   }
 
+  /** Pick the explicitly active pause, falling back to the latest epoch. */
+  private selectMcpPausedTarget(): McpPausedTargetState | undefined {
+    const activeTargetId = this.cdp?.activeTargetId;
+    if (activeTargetId) {
+      const active = this.mcpPausedTargets.get(activeTargetId);
+      if (active) return active;
+    }
+
+    let latest: McpPausedTargetState | undefined;
+    for (const state of this.mcpPausedTargets.values()) {
+      if (!latest || state.pauseEpoch > latest.pauseEpoch) latest = state;
+    }
+    return latest;
+  }
+
+  private removeMcpPausedSession(sessionId: string): void {
+    for (const [targetId, state] of this.mcpPausedTargets) {
+      if (state.sessionId === sessionId) this.mcpPausedTargets.delete(targetId);
+    }
+    this.reconcileVisiblePauseState();
+  }
+
+  /**
+   * Keep the legacy single-thread DAP buffers usable when one of several
+   * paused tabs resumes. MCP state remains independently target-scoped.
+   */
+  private reconcileVisiblePauseState(): void {
+    const selected = this.selectMcpPausedTarget();
+    this.paused = !!selected;
+    this.pauseReason = selected?.reason ?? null;
+    this.lastPausedEvent = selected?.pausedEvent ?? null;
+    this.lastPauseTargetId = selected?.targetId ?? null;
+    this.resolvedFrames = selected?.resolvedFrames ?? [];
+    if (selected?.callStackManager) this.callStackManager = selected.callStackManager;
+    this.scopeManager?.clear();
+    this.variableManager?.clear();
+  }
+
   private onDisconnected(): void {
+    this.paused = false;
+    this.pauseReason = null;
+    this.lastPausedEvent = null;
+    this.lastPauseTargetId = null;
+    this.mcpPausedTargets.clear();
+    this.requestedPauseTargets.clear();
+    this.resolvedFrames = [];
+    this.activeChromePort = null;
     this.sendEvent(new TerminatedEvent());
   }
 
@@ -1932,6 +2591,14 @@ export class ViteDebugSession extends LoggingDebugSession {
       await this.cdp.disconnect();
       this.cdp = null;
     }
+    this.activeChromePort = null;
+    this.paused = false;
+    this.pauseReason = null;
+    this.lastPausedEvent = null;
+    this.lastPauseTargetId = null;
+    this.mcpPausedTargets.clear();
+    this.requestedPauseTargets.clear();
+    this.resolvedFrames = [];
 
     // Debug Chrome is a separate instance — we don't kill it on disconnect
     // so the user can keep using it for subsequent debug sessions

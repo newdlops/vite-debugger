@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.7006 (2026-07-12)
+
+### Added
+
+- **Agent MCP server** — project/window-scoped debugger status, pause snapshots, execution control, and agent-owned source breakpoints for Codex and Claude.
+- **Playwright browser control** — ARIA snapshots and refs, click/fill/press/navigation, screenshots, and bounded console/network history over the debug session's existing Chrome CDP port.
+- **MCP setup command** — copies project-specific Codex or Claude Code configuration from the Command Palette.
+
+### Security
+
+- Authenticated loopback bridge with private per-window manifests and exact workspace/session routing.
+- Same-origin navigation, managed Vite-target allowlisting, paused-page mutation guards, bounded output, and credential redaction.
+- Agent/project configuration and bridge credentials are excluded from VSIX packages.
+
 ## 0.1.4 (2026-04-17)
 
 ### Fixed

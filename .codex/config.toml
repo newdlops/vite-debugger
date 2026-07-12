@@ -6,3 +6,12 @@ startup_timeout_sec = 10
 tool_timeout_sec = 60
 enabled = true
 required = false
+
+[mcp_servers.vite_debugger]
+command = "node"
+args = ["dist/mcp-server.js", "--workspace", "."]
+cwd = "."
+startup_timeout_sec = 10
+tool_timeout_sec = 60
+enabled = true
+required = false

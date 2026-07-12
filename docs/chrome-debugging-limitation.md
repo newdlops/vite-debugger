@@ -67,6 +67,7 @@ macOS에서 시도하면 여러 문제가 발생합니다:
 |------|-----------|
 | VSCode JS Debugger | 별도 Chrome 인스턴스 (temp profile) |
 | Playwright | 별도 Chromium 인스턴스 (temp profile) |
+| Vite Debugger MCP + Playwright | Vite Debugger가 연 디버그 Chrome에 CDP로 연결 |
 | Puppeteer | 별도 Chromium 인스턴스 (temp profile) |
 | Chrome DevTools | Chrome 내장이므로 제약 없음 |
 

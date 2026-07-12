@@ -18,7 +18,11 @@ interface NetworkBreakpointRule {
 
 export class NetworkBreakpointManager {
   private rules: NetworkBreakpointRule[] = [];
-  private onMatchCallback: ((rule: NetworkBreakpointRule, request: FetchRequestPausedEvent) => void) | null = null;
+  private onMatchCallback: ((
+    rule: NetworkBreakpointRule,
+    request: FetchRequestPausedEvent,
+    sessionId?: string,
+  ) => void | Promise<void>) | null = null;
 
   constructor(private cdp: CdpClient) {}
 
@@ -32,24 +36,32 @@ export class NetworkBreakpointManager {
     return this.rules;
   }
 
-  onMatch(callback: (rule: NetworkBreakpointRule, request: FetchRequestPausedEvent) => void): void {
+  onMatch(callback: (
+    rule: NetworkBreakpointRule,
+    request: FetchRequestPausedEvent,
+    sessionId?: string,
+  ) => void | Promise<void>): void {
     this.onMatchCallback = callback;
   }
 
-  async handleRequest(params: FetchRequestPausedEvent): Promise<void> {
+  async handleRequest(params: FetchRequestPausedEvent, sessionId?: string): Promise<void> {
     const matchedRule = this.findMatchingRule(params);
 
     if (matchedRule) {
       logger.info(`Network breakpoint hit: ${matchedRule.name} (${params.request.url})`);
       // Let the request continue but pause JS execution
       if (this.onMatchCallback) {
-        this.onMatchCallback(matchedRule, params);
+        try {
+          await this.onMatchCallback(matchedRule, params, sessionId);
+        } catch (e) {
+          logger.debug(`Failed to pause network breakpoint target: ${e}`);
+        }
       }
     }
 
     // Always continue the network request
     try {
-      await this.cdp.continueFetchRequest(params.requestId);
+      await this.cdp.continueFetchRequest(params.requestId, sessionId);
     } catch (e) {
       logger.debug(`Failed to continue fetch request: ${e}`);
     }

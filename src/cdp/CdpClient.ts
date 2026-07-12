@@ -38,12 +38,25 @@ export interface CdpBreakpointLocation {
   locations: Array<{ scriptId: string; lineNumber: number; columnNumber: number }>;
 }
 
-interface TargetInfo {
+export interface TargetInfo {
   targetId: string;
   type: string;
   title: string;
   url: string;
   attached?: boolean;
+}
+
+/**
+ * Stable, serializable metadata for a page target managed by the debugger.
+ * This deliberately omits the browser websocket URL and other connection
+ * details so it is safe to hand to local automation clients (for example the
+ * MCP bridge).
+ */
+export interface CdpTargetMetadata extends TargetInfo {
+  sessionId: string;
+  active: boolean;
+  primary: boolean;
+  paused: boolean;
 }
 
 /**
@@ -112,13 +125,24 @@ export class CdpClient extends EventEmitter {
   private sessions = new Map<string, TargetInfo>();
   /** Every attached session (incl. not-yet-matching), to catch navigations. */
   private allSessions = new Map<string, TargetInfo>();
+  /**
+   * Per-session lifecycle queue. A page can navigate away from the Vite origin
+   * and back quickly; serializing disable/enable prevents an older disable
+   * from racing with (and undoing) the later re-attach setup.
+   */
+  private sessionLifecycles = new Map<string, Promise<void>>();
   /** The tab currently paused — pause-time ops route here. */
   private activeSessionId?: string;
   /** First matching page session — default for ops when nothing is paused. */
   private primarySessionId?: string;
+  /** Sessions which Chrome currently reports as paused. */
+  private pausedSessionIds = new Set<string>();
 
-  /** Fetch requestId -> session it paused in. */
-  private fetchRequestOwners = new Map<string, string>();
+  /**
+   * Fetch requestId -> sessions it paused in. Request ids are scoped to a
+   * flattened target session and can therefore collide across tabs.
+   */
+  private fetchRequestOwners = new Map<string, Set<string>>();
 
   /** Fan-out URL breakpoints. handle -> spec, handle -> (sessionId -> cdp id). */
   private urlBreakpoints = new Map<string, UrlBreakpointSpec>();
@@ -193,32 +217,51 @@ export class CdpClient extends EventEmitter {
 
     // --- Debugger / Runtime / Fetch (per-session, tagged with sessionId) ---
     client.Debugger.scriptParsed((params: ScriptParsedEvent, sessionId?: string) => {
+      if (!this.isManagedEventSession(sessionId)) return;
       // Globalize the scriptId so the same file in two tabs doesn't collide on
       // the per-session raw id.
       this.emit('scriptParsed', { ...params, scriptId: this.toGlobalScriptId(params.scriptId, sessionId) }, sessionId);
     });
 
     client.Debugger.paused((params: PausedEvent, sessionId?: string) => {
+      if (!this.isManagedEventSession(sessionId)) return;
       // The paused tab becomes the active session: its call frames, scopes and
       // object ids are only valid against this session.
-      if (sessionId) this.activeSessionId = sessionId;
+      if (sessionId) {
+        this.activeSessionId = sessionId;
+        this.pausedSessionIds.add(sessionId);
+      }
       this.emit('paused', this.globalizePausedEvent(params, sessionId), sessionId);
     });
 
     client.Debugger.resumed((_params: unknown, sessionId?: string) => {
+      if (!this.isManagedEventSession(sessionId)) return;
+      if (sessionId) {
+        this.pausedSessionIds.delete(sessionId);
+        if (this.activeSessionId === sessionId) {
+          this.activeSessionId = this.lastPausedSessionId();
+        }
+      }
       this.emit('resumed', sessionId);
     });
 
     client.Runtime.exceptionThrown((params: { exceptionDetails: ExceptionDetails }, sessionId?: string) => {
+      if (!this.isManagedEventSession(sessionId)) return;
       this.emit('exceptionThrown', params.exceptionDetails, sessionId);
     });
 
     client.Runtime.consoleAPICalled((params: ConsoleAPICalledEvent, sessionId?: string) => {
+      if (!this.isManagedEventSession(sessionId)) return;
       this.emit('consoleAPICalled', params, sessionId);
     });
 
     client.Fetch.requestPaused((params: FetchRequestPausedEvent, sessionId?: string) => {
-      if (sessionId) this.fetchRequestOwners.set(params.requestId, sessionId);
+      if (!this.isManagedEventSession(sessionId)) return;
+      if (sessionId) {
+        const owners = this.fetchRequestOwners.get(params.requestId) ?? new Set<string>();
+        owners.add(sessionId);
+        this.fetchRequestOwners.set(params.requestId, owners);
+      }
       this.emit('requestPaused', params, sessionId);
     });
 
@@ -270,18 +313,44 @@ export class CdpClient extends EventEmitter {
       return;
     }
 
-    await this.manageSession(sessionId, targetInfo, params.waitingForDebugger);
+    await this.queueSessionLifecycle(sessionId, () =>
+      this.manageSession(sessionId, params.waitingForDebugger)
+    );
   }
 
   private async onTargetInfoChanged(targetInfo: TargetInfo): Promise<void> {
-    // A tab we'd skipped (e.g. about:blank, or a different site) may have
-    // navigated into the Vite app. Find its session and start managing it.
-    if (targetInfo.type !== 'page' || !this.urlMatches(targetInfo.url)) return;
+    // A tab can move both INTO and OUT OF the Vite app without changing its
+    // targetId/sessionId. Always update its attached-session record, then
+    // transition management according to the new URL.
     for (const [sessionId, info] of this.allSessions) {
       if (info.targetId === targetInfo.targetId) {
         this.allSessions.set(sessionId, targetInfo);
-        if (!this.sessions.has(sessionId)) {
-          await this.manageSession(sessionId, targetInfo, false);
+
+        if (targetInfo.type === 'page' && this.urlMatches(targetInfo.url)) {
+          if (!this.sessions.has(sessionId)) {
+            await this.queueSessionLifecycle(sessionId, () =>
+              this.manageSession(sessionId, false)
+            );
+          } else {
+            // Keep title and URL current for status/automation consumers. The
+            // targetId and sessionId remain stable across same-tab navigations.
+            this.sessions.set(sessionId, targetInfo);
+          }
+        } else {
+          // Make target-scoped operations reject synchronously as soon as the
+          // browser reports the cross-origin navigation. Domain shutdown is
+          // serialized afterwards so a fast navigation back to Vite cannot
+          // be undone by a late Debugger.disable/Fetch.disable.
+          const hadLifecycle = this.sessionLifecycles.has(sessionId);
+          const wasManaged = this.removeManagedSessionState(sessionId);
+          if (wasManaged || hadLifecycle) {
+            await this.queueSessionLifecycle(sessionId, async () => {
+              // A preceding queued manage may have started after the eager
+              // removal above. Remove once more at the transition boundary.
+              this.removeManagedSessionState(sessionId);
+              await this.disableSessionDomains(sessionId);
+            });
+          }
         }
         return;
       }
@@ -292,14 +361,26 @@ export class CdpClient extends EventEmitter {
    *  desired state, and install every known breakpoint. */
   private async manageSession(
     sessionId: string,
-    targetInfo: TargetInfo,
     waitingForDebugger?: boolean,
   ): Promise<void> {
+    // Lifecycle work is queued, so re-check the latest target info rather than
+    // trusting the URL from the event that originally scheduled this task.
+    const targetInfo = this.allSessions.get(sessionId);
+    if (!targetInfo || targetInfo.type !== 'page' || !this.urlMatches(targetInfo.url)) return;
     if (this.sessions.has(sessionId)) return;
     this.sessions.set(sessionId, targetInfo);
     if (!this.primarySessionId) this.primarySessionId = sessionId;
 
-    await this.setupSession(sessionId);
+    try {
+      await this.setupSession(sessionId);
+    } catch (error) {
+      this.removeManagedSessionState(sessionId);
+      throw error;
+    }
+
+    // targetInfoChanged eagerly removes the managed state while setup is in
+    // flight. In that case the queued disable transition owns the next step.
+    if (!this.sessions.has(sessionId)) return;
 
     // We attach with waitForDebuggerOnStart:false, but honor the flag defensively
     // in case Chrome paused the target — never leave a tab hung.
@@ -309,6 +390,18 @@ export class CdpClient extends EventEmitter {
 
     logger.info(`Attached to Vite tab (session ${sessionId}): ${targetInfo.url}`);
     this.emit('targetAttached', sessionId, targetInfo);
+  }
+
+  private queueSessionLifecycle(sessionId: string, task: () => Promise<void>): Promise<void> {
+    const previous = this.sessionLifecycles.get(sessionId) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(task);
+    this.sessionLifecycles.set(sessionId, operation);
+    void operation.finally(() => {
+      if (this.sessionLifecycles.get(sessionId) === operation) {
+        this.sessionLifecycles.delete(sessionId);
+      }
+    }).catch(() => undefined);
+    return operation;
   }
 
   private async setupSession(sessionId: string): Promise<void> {
@@ -353,8 +446,27 @@ export class CdpClient extends EventEmitter {
     }));
   }
 
-  private onDetachedFromTarget(sessionId: string): void {
-    this.allSessions.delete(sessionId);
+  private async disableSessionDomains(sessionId: string): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+
+    // Fetch is disabled first so any interception paused during navigation is
+    // released promptly. Every call is best-effort: the page may have closed
+    // between targetInfoChanged and this queued transition.
+    await client.Fetch.disable({}, sessionId)
+      .catch((e: unknown) => logger.debug(`Fetch.disable on ${sessionId} failed: ${e}`));
+    await Promise.all([
+      client.Debugger.disable({}, sessionId),
+      client.Runtime.disable({}, sessionId),
+      client.Page.disable({}, sessionId),
+    ].map((operation) => Promise.resolve(operation).catch((e: unknown) => {
+      logger.debug(`Domain disable on ${sessionId} failed: ${e}`);
+    })));
+    logger.info(`Stopped debugging tab outside Vite origin (session ${sessionId})`);
+  }
+
+  /** Remove every piece of state that could route an operation to a session. */
+  private removeManagedSessionState(sessionId: string): boolean {
     const wasManaged = this.sessions.delete(sessionId);
 
     // Drop this session's per-breakpoint ids.
@@ -364,11 +476,13 @@ export class CdpClient extends EventEmitter {
     for (const [bpId, sid] of [...this.rawBreakpointSessions]) {
       if (sid === sessionId) this.rawBreakpointSessions.delete(bpId);
     }
-    for (const [reqId, sid] of [...this.fetchRequestOwners]) {
-      if (sid === sessionId) this.fetchRequestOwners.delete(reqId);
+    for (const [reqId, owners] of [...this.fetchRequestOwners]) {
+      owners.delete(sessionId);
+      if (owners.size === 0) this.fetchRequestOwners.delete(reqId);
     }
 
-    if (this.activeSessionId === sessionId) this.activeSessionId = undefined;
+    this.pausedSessionIds.delete(sessionId);
+    if (this.activeSessionId === sessionId) this.activeSessionId = this.lastPausedSessionId();
     if (this.primarySessionId === sessionId) {
       this.primarySessionId = this.sessions.keys().next().value as string | undefined;
     }
@@ -377,6 +491,12 @@ export class CdpClient extends EventEmitter {
       logger.info(`Vite tab detached (session ${sessionId})`);
       this.emit('targetDetached', sessionId);
     }
+    return wasManaged;
+  }
+
+  private onDetachedFromTarget(sessionId: string): void {
+    this.allSessions.delete(sessionId);
+    this.removeManagedSessionState(sessionId);
   }
 
   private async runIfWaitingForDebugger(sessionId: string): Promise<void> {
@@ -391,11 +511,15 @@ export class CdpClient extends EventEmitter {
     const filter = this.targetUrlFilter;
     if (!filter) return true;
     if (!url) return false;
-    if (url.startsWith(filter)) return true;
     try {
       const a = new URL(url);
       const b = new URL(filter);
-      return hostsEquivalent(a.hostname, b.hostname) && a.port === b.port;
+      // Treat localhost and its loopback spelling as equivalent, while still
+      // enforcing the rest of the URL origin. In particular, http -> https is
+      // a cross-origin navigation even when hostname and explicit port match.
+      return a.protocol === b.protocol
+        && hostsEquivalent(a.hostname, b.hostname)
+        && a.port === b.port;
     } catch {
       return false;
     }
@@ -406,9 +530,49 @@ export class CdpClient extends EventEmitter {
     return this.sessions.size;
   }
 
+  /**
+   * Return a point-in-time view of the managed Vite page targets. The returned
+   * objects are copies and can be safely serialized by callers.
+   */
+  listTargets(): CdpTargetMetadata[] {
+    return [...this.sessions].map(([sessionId, info]) => ({
+      ...info,
+      sessionId,
+      active: sessionId === this.activeSessionId,
+      primary: sessionId === this.primarySessionId,
+      paused: this.pausedSessionIds.has(sessionId),
+    }));
+  }
+
+  /** Target id currently selected for pause-time operations, if any. */
+  get activeTargetId(): string | undefined {
+    const sessionId = this.activeSessionId ?? this.primarySessionId;
+    return sessionId ? this.sessions.get(sessionId)?.targetId : undefined;
+  }
+
+  /** Resolve an internal flattened session id to its stable page target id. */
+  targetIdForSession(sessionId?: string): string | undefined {
+    return sessionId ? this.sessions.get(sessionId)?.targetId : undefined;
+  }
+
+  /** True when at least one managed page target is paused. */
+  get hasPausedTargets(): boolean {
+    return this.pausedSessionIds.size > 0;
+  }
+
   // ---------------------------------------------------------------------------
   // Session routing helpers
   // ---------------------------------------------------------------------------
+
+  /** Flattened-domain events from unrelated attached tabs are not debugger events. */
+  private isManagedEventSession(sessionId?: string): boolean {
+    // Flatten-mode events are session-tagged. Keep the undefined case for CDP
+    // implementations which omit the id only when exactly one managed page is
+    // available; otherwise an untagged event is ambiguous and must be ignored.
+    return sessionId === undefined
+      ? this.sessions.size === 1
+      : this.sessions.has(sessionId);
+  }
 
   /** Session for pause-time ops (stepping, evaluate, scopes, variables). */
   private requireActiveSession(): string {
@@ -417,6 +581,21 @@ export class CdpClient extends EventEmitter {
       throw new Error('No attached Chrome tab available for this operation');
     }
     return sessionId;
+  }
+
+  /** Resolve an externally-visible target id to its flattened CDP session. */
+  private requireTargetSession(targetId?: string): string {
+    if (!targetId) return this.requireActiveSession();
+    for (const [sessionId, info] of this.sessions) {
+      if (info.targetId === targetId) return sessionId;
+    }
+    throw new Error(`Unknown or unmanaged Chrome target: ${targetId}`);
+  }
+
+  private lastPausedSessionId(): string | undefined {
+    let latest: string | undefined;
+    for (const sessionId of this.pausedSessionIds) latest = sessionId;
+    return latest;
   }
 
   /** Tag a raw (per-session) scriptId with its session to make it globally unique. */
@@ -434,7 +613,11 @@ export class CdpClient extends EventEmitter {
   /** Route a scriptId-scoped command to the session that owns the script. */
   private routeScript(scriptId: string): { sessionId: string; rawScriptId: string } {
     const { sessionId, rawScriptId } = this.fromGlobalScriptId(scriptId);
-    return { sessionId: sessionId ?? this.requireActiveSession(), rawScriptId };
+    const routedSessionId = sessionId ?? this.requireActiveSession();
+    if (!this.sessions.has(routedSessionId)) {
+      throw new Error(`Unknown or unmanaged Chrome session: ${routedSessionId}`);
+    }
+    return { sessionId: routedSessionId, rawScriptId };
   }
 
   /** Rewrite script ids and URL-breakpoint ids to adapter-level ids. */
@@ -572,24 +755,24 @@ export class CdpClient extends EventEmitter {
     }
   }
 
-  async resume(): Promise<void> {
-    await this.client.Debugger.resume({}, this.requireActiveSession());
+  async resume(targetId?: string): Promise<void> {
+    await this.client.Debugger.resume({}, this.requireTargetSession(targetId));
   }
 
-  async stepOver(): Promise<void> {
-    await this.client.Debugger.stepOver({}, this.requireActiveSession());
+  async stepOver(targetId?: string): Promise<void> {
+    await this.client.Debugger.stepOver({}, this.requireTargetSession(targetId));
   }
 
-  async stepInto(): Promise<void> {
-    await this.client.Debugger.stepInto({}, this.requireActiveSession());
+  async stepInto(targetId?: string): Promise<void> {
+    await this.client.Debugger.stepInto({}, this.requireTargetSession(targetId));
   }
 
-  async stepOut(): Promise<void> {
-    await this.client.Debugger.stepOut({}, this.requireActiveSession());
+  async stepOut(targetId?: string): Promise<void> {
+    await this.client.Debugger.stepOut({}, this.requireTargetSession(targetId));
   }
 
-  async pause(): Promise<void> {
-    await this.client.Debugger.pause({}, this.requireActiveSession());
+  async pause(targetId?: string): Promise<void> {
+    await this.client.Debugger.pause({}, this.requireTargetSession(targetId));
   }
 
   async getScriptSource(scriptId: string): Promise<string> {
@@ -702,12 +885,16 @@ export class CdpClient extends EventEmitter {
 
   // --- Runtime Domain ---
 
-  async getProperties(objectId: string, ownProperties: boolean = true): Promise<PropertyDescriptor[]> {
+  async getProperties(
+    objectId: string,
+    ownProperties: boolean = true,
+    targetId?: string,
+  ): Promise<PropertyDescriptor[]> {
     const result = await this.client.Runtime.getProperties({
       objectId,
       ownProperties,
       generatePreview: true,
-    }, this.requireActiveSession());
+    }, this.requireTargetSession(targetId));
     return result.result;
   }
 
@@ -795,7 +982,14 @@ export class CdpClient extends EventEmitter {
 
   // --- Page Domain ---
 
-  async reload(ignoreCache: boolean = false): Promise<void> {
+  async reload(ignoreCache: boolean = false, targetId?: string): Promise<void> {
+    if (targetId) {
+      await this.client.Page.reload(
+        { ignoreCache },
+        this.requireTargetSession(targetId),
+      );
+      return;
+    }
     // Reload every Vite tab so initial breakpoints catch the next execution in
     // each of them.
     await Promise.all([...this.sessions.keys()].map((sessionId) =>
@@ -806,16 +1000,54 @@ export class CdpClient extends EventEmitter {
 
   // --- Fetch Domain ---
 
-  async continueFetchRequest(requestId: string): Promise<void> {
-    const sessionId = this.fetchRequestOwners.get(requestId) ?? this.requireActiveSession();
-    this.fetchRequestOwners.delete(requestId);
-    await this.client.Fetch.continueRequest({ requestId }, sessionId);
+  async continueFetchRequest(requestId: string, sessionId?: string): Promise<void> {
+    const routedSessionId = this.routeFetchRequest(requestId, sessionId);
+    try {
+      await this.client.Fetch.continueRequest({ requestId }, routedSessionId);
+    } finally {
+      this.releaseFetchRequest(requestId, routedSessionId);
+    }
   }
 
-  async failFetchRequest(requestId: string, reason: string = 'Failed'): Promise<void> {
-    const sessionId = this.fetchRequestOwners.get(requestId) ?? this.requireActiveSession();
-    this.fetchRequestOwners.delete(requestId);
-    await this.client.Fetch.failRequest({ requestId, reason }, sessionId);
+  async failFetchRequest(
+    requestId: string,
+    reason: string = 'Failed',
+    sessionId?: string,
+  ): Promise<void> {
+    const routedSessionId = this.routeFetchRequest(requestId, sessionId);
+    try {
+      await this.client.Fetch.failRequest({ requestId, reason }, routedSessionId);
+    } finally {
+      this.releaseFetchRequest(requestId, routedSessionId);
+    }
+  }
+
+  private routeFetchRequest(requestId: string, requestedSessionId?: string): string {
+    const owners = this.fetchRequestOwners.get(requestId);
+    if (requestedSessionId) {
+      if (owners && owners.size > 0 && !owners.has(requestedSessionId)) {
+        throw new Error(
+          `Fetch request ${requestId} does not belong to target session ${requestedSessionId}`,
+        );
+      }
+      return requestedSessionId;
+    }
+    if (owners?.size === 1) return owners.values().next().value as string;
+    if (owners && owners.size > 1) {
+      throw new Error(
+        `Fetch request ${requestId} exists in multiple target sessions; an explicit sessionId is required`,
+      );
+    }
+    // Backwards compatibility for callers which predate per-target Fetch
+    // routing and do not have an event session id available.
+    return this.requireActiveSession();
+  }
+
+  private releaseFetchRequest(requestId: string, sessionId: string): void {
+    const owners = this.fetchRequestOwners.get(requestId);
+    if (!owners) return;
+    owners.delete(sessionId);
+    if (owners.size === 0) this.fetchRequestOwners.delete(requestId);
   }
 
   // --- Connection Management ---
@@ -829,6 +1061,12 @@ export class CdpClient extends EventEmitter {
       }
       this.client = null;
     }
+    this.sessions.clear();
+    this.allSessions.clear();
+    this.pausedSessionIds.clear();
+    this.fetchRequestOwners.clear();
+    this.activeSessionId = undefined;
+    this.primarySessionId = undefined;
   }
 
   get isConnected(): boolean {

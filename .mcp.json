@@ -9,6 +9,15 @@
         "--workspace",
         "."
       ]
+    },
+    "vite-debugger": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "dist/mcp-server.js",
+        "--workspace",
+        "."
+      ]
     }
   }
 }

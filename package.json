@@ -2,7 +2,7 @@
   "name": "vite-debugger",
   "displayName": "Vite Debugger",
   "description": "Debug Vite applications in VSCode by attaching to Chrome DevTools Protocol",
-  "version": "0.1.7005",
+  "version": "0.1.7006",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "images/icon.png",
@@ -20,7 +20,9 @@
   "categories": [
     "Debuggers"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "viewsContainers": {
@@ -163,6 +165,10 @@
         "title": "Vite Debugger: Detect Vite Server"
       },
       {
+        "command": "vite-debugger.copyMcpConfiguration",
+        "title": "Vite Debugger: Copy Agent MCP Configuration"
+      },
+      {
         "command": "vite-debugger.refreshReactTree",
         "title": "Vite Debugger: Refresh React Component Tree",
         "icon": "$(refresh)"
@@ -197,8 +203,11 @@
     }
   },
   "scripts": {
-    "build": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap && cp node_modules/source-map/lib/mappings.wasm dist/mappings.wasm",
-    "watch": "npm run build -- --watch",
+    "build": "npm run build:extension && npm run build:mcp && cp node_modules/source-map/lib/mappings.wasm dist/mappings.wasm",
+    "build:extension": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "build:mcp": "esbuild ./src/mcp/server.ts --bundle --outfile=dist/mcp-server.js --format=cjs --platform=node --sourcemap --external:playwright-core",
+    "watch": "npm run build && npm run build:extension -- --watch",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -209,10 +218,16 @@
     "package": "npm run build && vsce package"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@vscode/debugadapter": "^1.65.0",
     "@vscode/debugprotocol": "^1.65.0",
     "chrome-remote-interface": "^0.33.2",
-    "source-map": "^0.7.4"
+    "playwright-core": "1.61.1",
+    "source-map": "^0.7.4",
+    "zod": "4.4.3"
+  },
+  "overrides": {
+    "ws": "7.5.11"
   },
   "devDependencies": {
     "@types/chrome-remote-interface": "^0.31.14",

@@ -12,6 +12,7 @@ Debug Vite applications directly in VS Code. Set breakpoints in your `.tsx`/`.ts
 - **Network breakpoints** — pause on fetch/XHR matching patterns (e.g., `GET /api/users`)
 - **Step-in targets** — choose which function call to step into on a line
 - **skipFiles** — configure glob patterns to skip files during stepping
+- **Agent debugging** — let Codex or Claude inspect debugger state and drive the same Chrome through MCP + Playwright
 
 ## Quick Start
 
@@ -88,6 +89,37 @@ Vite Debugger connects to Chrome via the [Chrome DevTools Protocol](https://chro
 VS Code  <--DAP-->  Vite Debugger  <--CDP-->  Chrome  <--HTTP-->  Vite Dev Server
 ```
 
+## Agent debugging with MCP + Playwright
+
+The extension starts a private, authenticated bridge for each VS Code window. A project-scoped MCP sidecar connects to that window's active Vite debug session, while Playwright connects over CDP to the same Chrome. This keeps projects separated when several VS Code windows are open.
+
+```text
+Codex / Claude <--stdio MCP--> project sidecar <--private bridge--> VS Code debugger
+                                  |
+                                  +----Playwright CDP----> debug Chrome
+```
+
+Playwright runs in the sidecar, not in the VS Code Extension Host. The VSIX includes `playwright-core`, but does not download or launch another browser; it controls the Chrome already owned by the Vite debug session.
+
+### Set up an agent
+
+1. Open the project in its own VS Code window and start a Vite debug session.
+2. Run **Vite Debugger: Copy Agent MCP Configuration** from the Command Palette.
+3. Choose Codex or Claude Code, then merge the copied block into `.codex/config.toml` or `.mcp.json`.
+4. Restart the agent so it loads the MCP server.
+
+When developing this repository itself, `npm run build` produces `dist/mcp-server.js`, and the checked-in local Codex/Claude configurations already point to it.
+
+The normal agent workflow is:
+
+1. `debug_status`
+2. `browser_tabs` if a target must be selected
+3. `browser_snapshot`
+4. `browser_click`, `browser_fill`, `browser_press`, or `browser_navigate`
+5. If a breakpoint is hit, `debug_snapshot`, then `debug_control`
+
+Available tools also include `debug_replace_breakpoints`, `browser_screenshot`, `browser_console_messages`, and `browser_network_requests`. Browser mutation is rejected while JavaScript is paused, and navigation is limited to the Vite app's origin.
+
 ### Chrome Connection
 
 The debugger finds a debuggable Chrome in this order:
@@ -105,7 +137,7 @@ The debugger finds a debuggable Chrome in this order:
 
 ## Known Limitations
 
-- Chrome allows only one debugger connection per tab. See [Chrome Debugging Limitation](docs/chrome-debugging-limitation.md) for details.
+- Chrome must be started with a remote-debugging port and a separate debug profile. See [Chrome Debugging Limitation](docs/chrome-debugging-limitation.md) for details.
 - Source maps for dynamically imported modules load on-demand — breakpoints in lazy-loaded files become active when the module is first imported.
 
 ## Testing

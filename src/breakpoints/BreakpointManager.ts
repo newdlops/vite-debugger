@@ -1,14 +1,21 @@
 import { DebugProtocol } from '@vscode/debugprotocol';
 import * as fs from 'fs';
-import { CdpClient } from '../cdp/CdpClient';
+import { CdpBreakpointLocation, CdpClient } from '../cdp/CdpClient';
 import { SourceMapResolver } from '../sourcemap/SourceMapResolver';
 import { fileChecksumCache } from '../util/FileChecksum';
 import { logger } from '../util/Logger';
 import { escapeRegexLiteral, urlHostPatternForHost } from '../util/LocalHosts';
 
-interface ManagedBreakpoint {
+export type BreakpointOwner = 'vscode' | 'agent';
+
+export interface ManagedBreakpoint {
+  owner: BreakpointOwner;
   dapId: number;
   cdpBreakpointId?: string;
+  /** Stable identity of the underlying fan-out CDP breakpoint. Multiple
+   * logical breakpoints (for example one from VS Code and one from an agent)
+   * may share it without either owner being able to remove the other's bp. */
+  physicalKey?: string;
   sourcePath: string;
   line: number;
   column?: number;
@@ -35,6 +42,10 @@ interface ResolvedBreakpointTarget {
 
 export class BreakpointManager {
   private breakpoints = new Map<string, ManagedBreakpoint[]>();  // sourcePath -> breakpoints
+  /** physical breakpoint spec -> CdpClient fan-out handle */
+  private physicalBreakpointIds = new Map<string, string>();
+  /** Deduplicates concurrent HMR re-resolution of a shared physical bp. */
+  private pendingPhysicalBreakpoints = new Map<string, Promise<CdpBreakpointLocation>>();
   private urlRegexCache = new Map<string, string>();  // sourcePath -> precomputed CDP urlRegex
   private nextDapId = 1;
   /**
@@ -71,21 +82,93 @@ export class BreakpointManager {
     return next;
   }
 
+  private physicalBreakpointKey(
+    sourcePath: string,
+    target: ResolvedBreakpointTarget,
+    condition: string | undefined,
+  ): string {
+    return JSON.stringify([
+      sourcePath,
+      this.buildUrlRegex(sourcePath),
+      target.lineNumber,
+      target.columnNumber,
+      condition ?? '',
+    ]);
+  }
+
+  /**
+   * Acquire a single fan-out CDP breakpoint for a logical breakpoint.
+   *
+   * VS Code and an agent can independently request the same location. Chrome
+   * does not provide ownership for that duplicate, so we share one physical
+   * handle and release it only after the last logical owner disappears.
+   */
+  private async acquirePhysicalBreakpoint(
+    sourcePath: string,
+    bp: ManagedBreakpoint,
+    target: ResolvedBreakpointTarget,
+    condition: string | undefined,
+  ): Promise<CdpBreakpointLocation> {
+    const key = this.physicalBreakpointKey(sourcePath, target, condition);
+    bp.physicalKey = key;
+
+    const existingId = this.physicalBreakpointIds.get(key);
+    if (existingId) {
+      bp.cdpBreakpointId = existingId;
+      return { breakpointId: existingId, locations: [] };
+    }
+
+    let pending = this.pendingPhysicalBreakpoints.get(key);
+    if (!pending) {
+      pending = this.cdp.setBreakpointByUrl(
+        target.lineNumber,
+        {
+          urlRegex: this.buildUrlRegex(sourcePath),
+          columnNumber: target.columnNumber,
+          condition,
+        },
+      );
+      this.pendingPhysicalBreakpoints.set(key, pending);
+    }
+
+    try {
+      const result = await pending;
+      this.physicalBreakpointIds.set(key, result.breakpointId);
+      bp.cdpBreakpointId = result.breakpointId;
+      return result;
+    } finally {
+      if (this.pendingPhysicalBreakpoints.get(key) === pending) {
+        this.pendingPhysicalBreakpoints.delete(key);
+      }
+    }
+  }
+
+  private hasPhysicalReference(key: string): boolean {
+    for (const bps of this.breakpoints.values()) {
+      if (bps.some((bp) => bp.physicalKey === key)) return true;
+    }
+    return false;
+  }
+
   async setBreakpoints(
     sourcePath: string,
-    sourceBreakpoints: DebugProtocol.SourceBreakpoint[]
+    sourceBreakpoints: DebugProtocol.SourceBreakpoint[],
+    owner: BreakpointOwner = 'vscode',
   ): Promise<DebugProtocol.Breakpoint[]> {
     return this.serialize(() =>
-      this.setBreakpointsInternal(sourcePath, sourceBreakpoints),
+      this.setBreakpointsInternal(sourcePath, sourceBreakpoints, owner),
     );
   }
 
   private async setBreakpointsInternal(
     sourcePath: string,
-    sourceBreakpoints: DebugProtocol.SourceBreakpoint[]
+    sourceBreakpoints: DebugProtocol.SourceBreakpoint[],
+    owner: BreakpointOwner,
   ): Promise<DebugProtocol.Breakpoint[]> {
-    // Remove existing breakpoints for this source
-    await this.removeBreakpointsForSource(sourcePath);
+    // A replace operation is scoped to its owner. Agent requests must never
+    // alter breakpoints managed by VS Code's setBreakpoints request (and vice
+    // versa).
+    await this.removeBreakpointsForSourceInternal(sourcePath, owner);
 
     const managed: ManagedBreakpoint[] = [];
     const results: DebugProtocol.Breakpoint[] = [];
@@ -93,6 +176,7 @@ export class BreakpointManager {
     for (const sbp of sourceBreakpoints) {
       const dapId = this.nextDapId++;
       const bp: ManagedBreakpoint = {
+        owner,
         dapId,
         sourcePath,
         line: sbp.line,
@@ -113,14 +197,7 @@ export class BreakpointManager {
         try {
           const condition = this.buildCdpCondition(bp);
 
-          const result = await this.cdp.setBreakpointByUrl(
-            target.lineNumber,
-            {
-              urlRegex: this.buildUrlRegex(sourcePath),
-              columnNumber: target.columnNumber,
-              condition,
-            }
-          );
+          const result = await this.acquirePhysicalBreakpoint(sourcePath, bp, target, condition);
 
           bp.cdpBreakpointId = result.breakpointId;
           bp.verified = true;
@@ -190,25 +267,53 @@ export class BreakpointManager {
       });
     }
 
-    this.breakpoints.set(sourcePath, managed);
+    const retained = this.breakpoints.get(sourcePath) ?? [];
+    const combined = [...retained, ...managed];
+    if (combined.length > 0) this.breakpoints.set(sourcePath, combined);
+    else this.breakpoints.delete(sourcePath);
     return results;
   }
 
-  async removeBreakpointsForSource(sourcePath: string): Promise<void> {
+  async removeBreakpointsForSource(
+    sourcePath: string,
+    owner?: BreakpointOwner,
+  ): Promise<void> {
+    return this.serialize(() => this.removeBreakpointsForSourceInternal(sourcePath, owner));
+  }
+
+  private async removeBreakpointsForSourceInternal(
+    sourcePath: string,
+    owner?: BreakpointOwner,
+  ): Promise<void> {
     const existing = this.breakpoints.get(sourcePath);
     if (!existing) return;
 
-    for (const bp of existing) {
-      if (bp.cdpBreakpointId) {
+    const removed = owner
+      ? existing.filter((bp) => bp.owner === owner)
+      : existing;
+    const retained = owner
+      ? existing.filter((bp) => bp.owner !== owner)
+      : [];
+
+    if (retained.length > 0) this.breakpoints.set(sourcePath, retained);
+    else this.breakpoints.delete(sourcePath);
+
+    const releasedKeys = new Set(removed.map((bp) => bp.physicalKey).filter(Boolean) as string[]);
+    for (const key of releasedKeys) {
+      // The physical CDP breakpoint remains live as long as any logical owner
+      // references it. This is particularly important when VS Code and an MCP
+      // agent chose the same source location.
+      if (this.hasPhysicalReference(key)) continue;
+      const cdpBreakpointId = this.physicalBreakpointIds.get(key);
+      this.physicalBreakpointIds.delete(key);
+      if (cdpBreakpointId) {
         try {
-          await this.cdp.removeBreakpoint(bp.cdpBreakpointId);
+          await this.cdp.removeBreakpoint(cdpBreakpointId);
         } catch (e) {
-          logger.warn(`Failed to remove CDP breakpoint ${bp.cdpBreakpointId}: ${e}`);
+          logger.warn(`Failed to remove CDP breakpoint ${cdpBreakpointId}: ${e}`);
         }
       }
     }
-
-    this.breakpoints.delete(sourcePath);
   }
 
   async resolveBreakpointsForScript(scriptId: string, url: string): Promise<ManagedBreakpoint[]> {
@@ -242,15 +347,12 @@ export class BreakpointManager {
       if (!target) return null;
 
       try {
-        const result = await this.cdp.setBreakpointByUrl(
-          target.lineNumber,
-          {
-            urlRegex: this.buildUrlRegex(sourcePath),
-            columnNumber: target.columnNumber,
-            condition: this.buildCdpCondition(bp),
-          }
+        const result = await this.acquirePhysicalBreakpoint(
+          sourcePath,
+          bp,
+          target,
+          this.buildCdpCondition(bp),
         );
-        bp.cdpBreakpointId = result.breakpointId;
         bp.verified = true;
         if (target.originalLine !== undefined) {
           bp.resolvedLine = target.originalLine;
@@ -315,14 +417,22 @@ export class BreakpointManager {
     const unresolved: ManagedBreakpoint[] = [];
     const deferred: ManagedBreakpoint[] = [];
 
-    const perBp = targets.map(async ({ sourcePath, bp }) => {
-      // Old CDP breakpoint is stale after the script replaced — remove it.
-      if (bp.cdpBreakpointId) {
-        try { await this.cdp.removeBreakpoint(bp.cdpBreakpointId); }
-        catch (e) { logger.debug(`Failed to remove old breakpoint during HMR: ${e}`); }
-        bp.cdpBreakpointId = undefined;
-      }
+    // Invalidate each shared physical handle once. Calling remove once per
+    // logical owner would let one owner delete another's newly re-created
+    // breakpoint while the parallel HMR work is still running.
+    const staleIds = new Set<string>();
+    for (const { bp } of targets) {
+      if (bp.physicalKey) this.physicalBreakpointIds.delete(bp.physicalKey);
+      if (bp.cdpBreakpointId) staleIds.add(bp.cdpBreakpointId);
+      bp.cdpBreakpointId = undefined;
+      bp.physicalKey = undefined;
+    }
+    await Promise.all([...staleIds].map(async (breakpointId) => {
+      try { await this.cdp.removeBreakpoint(breakpointId); }
+      catch (e) { logger.debug(`Failed to remove old breakpoint during HMR: ${e}`); }
+    }));
 
+    const perBp = targets.map(async ({ sourcePath, bp }) => {
       // User-edited source: bp.line is pre-edit. If the specific line the
       // bp lives on has different text now, the stored line refers to
       // different code and re-resolving from it would land on the wrong
@@ -347,16 +457,13 @@ export class BreakpointManager {
       if (!target) { bp.verified = false; unresolved.push(bp); return; }
 
       try {
-        const result = await this.cdp.setBreakpointByUrl(
-          target.lineNumber,
-          {
-            urlRegex: this.buildUrlRegex(sourcePath),
-            columnNumber: target.columnNumber,
-            condition: this.buildCdpCondition(bp),
-          }
+        const result = await this.acquirePhysicalBreakpoint(
+          sourcePath,
+          bp,
+          target,
+          this.buildCdpCondition(bp),
         );
 
-        bp.cdpBreakpointId = result.breakpointId;
         bp.verified = true;
         if (target.originalLine !== undefined) {
           bp.resolvedLine = target.originalLine;
@@ -432,6 +539,8 @@ export class BreakpointManager {
 
   clear(): void {
     this.breakpoints.clear();
+    this.physicalBreakpointIds.clear();
+    this.pendingPhysicalBreakpoints.clear();
     this.urlRegexCache.clear();
   }
 

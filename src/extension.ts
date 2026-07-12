@@ -2,15 +2,20 @@ import * as vscode from 'vscode';
 import { ViteDebugSession } from './adapter/ViteDebugSession';
 import { detectViteServers, formatViteServerDescription, formatViteServerInfo } from './vite/ViteServerDetector';
 import { isChromeDebuggable } from './cdp/ChromeDiscovery';
-import { initLogger, LogLevel } from './util/Logger';
+import { initLogger, logger, LogLevel } from './util/Logger';
 import { ViteInlineValuesProvider } from './providers/InlineValuesProvider';
 import { ReactComponentTreeProvider } from './react/ReactComponentTreeProvider';
+import { BridgeServer } from './mcp/BridgeServer';
+import { SessionRegistry } from './mcp/SessionRegistry';
 
 class ViteDebugAdapterFactory implements vscode.DebugAdapterDescriptorFactory {
+  constructor(private readonly sessions: SessionRegistry) {}
+
   createDebugAdapterDescriptor(
-    _session: vscode.DebugSession,
+    session: vscode.DebugSession,
     _executable: vscode.DebugAdapterExecutable | undefined
   ): vscode.ProviderResult<vscode.DebugAdapterDescriptor> {
+    this.sessions.register(session);
     return new vscode.DebugAdapterInlineImplementation(new ViteDebugSession());
   }
 }
@@ -38,12 +43,53 @@ class ViteDebugConfigurationProvider implements vscode.DebugConfigurationProvide
 
 let statusBarItem: vscode.StatusBarItem;
 
-export function activate(context: vscode.ExtensionContext): void {
+async function prepareMcpLauncher(context: vscode.ExtensionContext): Promise<string> {
+  await vscode.workspace.fs.createDirectory(context.globalStorageUri);
+  const launcher = vscode.Uri.joinPath(context.globalStorageUri, 'vite-debugger-mcp.cjs');
+  const bundledServer = context.asAbsolutePath('dist/mcp-server.js');
+  const source = [
+    "'use strict';",
+    `const { runMcpServer } = require(${JSON.stringify(bundledServer)});`,
+    'runMcpServer().catch((error) => {',
+    "  const message = error instanceof Error ? (error.stack || error.message) : String(error);",
+    "  process.stderr.write('[vite-debugger-mcp] Startup failed: ' + message + '\\n');",
+    '  process.exitCode = 1;',
+    '});',
+    '',
+  ].join('\n');
+  await vscode.workspace.fs.writeFile(launcher, Buffer.from(source, 'utf8'));
+  return launcher.fsPath;
+}
+
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const outputChannel = vscode.window.createOutputChannel('Vite Debugger');
   initLogger(outputChannel, LogLevel.Debug);
 
+  const sessionRegistry = new SessionRegistry();
+  const workspaceRoots = () => (vscode.workspace.workspaceFolders ?? [])
+    .filter((folder) => folder.uri.scheme === 'file')
+    .map((folder) => folder.uri.fsPath);
+  const bridge = new BridgeServer(sessionRegistry, workspaceRoots());
+  const mcpLauncherPath = prepareMcpLauncher(context).catch((error) => {
+    logger.warn(`Could not prepare stable MCP launcher: ${(error as Error).message}`);
+    return context.asAbsolutePath('dist/mcp-server.js');
+  });
+  context.subscriptions.push(sessionRegistry, bridge);
+  try {
+    await bridge.start();
+  } catch (error) {
+    // Debugging remains fully usable if the optional local MCP bridge cannot
+    // start (for example, because a hardened environment denies loopback).
+    logger.warn(`MCP bridge is unavailable: ${(error as Error).message}`);
+  }
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      bridge.updateWorkspaceRoots(workspaceRoots());
+    }),
+  );
+
   // Register debug adapter factory
-  const factory = new ViteDebugAdapterFactory();
+  const factory = new ViteDebugAdapterFactory(sessionRegistry);
   context.subscriptions.push(
     vscode.debug.registerDebugAdapterDescriptorFactory('vite', factory)
   );
@@ -176,6 +222,64 @@ export function activate(context: vscode.ExtensionContext): void {
           `Found ${servers.length} Vite server(s): ${items.join(', ')}`
         );
       }
+    }),
+    vscode.commands.registerCommand('vite-debugger.copyMcpConfiguration', async () => {
+      const folders = vscode.workspace.workspaceFolders?.filter((folder) => folder.uri.scheme === 'file') ?? [];
+      if (folders.length === 0) {
+        vscode.window.showWarningMessage('Open a local project folder before copying MCP configuration.');
+        return;
+      }
+
+      let folder = folders[0];
+      if (folders.length > 1) {
+        const selected = await vscode.window.showQuickPick(
+          folders.map((candidate) => ({
+            label: candidate.name,
+            description: candidate.uri.fsPath,
+            folder: candidate,
+          })),
+          { placeHolder: 'Select the project for this MCP server' },
+        );
+        if (!selected) return;
+        folder = selected.folder;
+      }
+
+      const clients: Array<vscode.QuickPickItem & { format: 'codex' | 'claude' }> = [
+        { label: 'Codex', description: '.codex/config.toml', format: 'codex' },
+        { label: 'Claude Code', description: '.mcp.json', format: 'claude' },
+      ];
+      const client = await vscode.window.showQuickPick(
+        clients,
+        { placeHolder: 'Select the agent configuration format' },
+      );
+      if (!client) return;
+
+      const serverPath = await mcpLauncherPath;
+      const workspacePath = folder.uri.fsPath;
+      const configuration = client.format === 'codex'
+        ? [
+            '[mcp_servers.vite_debugger]',
+            'command = "node"',
+            `args = [${JSON.stringify(serverPath)}, "--workspace", ${JSON.stringify(workspacePath)}]`,
+            'startup_timeout_sec = 10',
+            'tool_timeout_sec = 60',
+            'enabled = true',
+            'required = false',
+          ].join('\n')
+        : JSON.stringify({
+            mcpServers: {
+              'vite-debugger': {
+                type: 'stdio',
+                command: 'node',
+                args: [serverPath, '--workspace', workspacePath],
+              },
+            },
+          }, null, 2);
+
+      await vscode.env.clipboard.writeText(configuration);
+      vscode.window.showInformationMessage(
+        `${client.label} MCP configuration copied. Add it to ${client.description}, then restart the agent.`,
+      );
     })
   );
 
@@ -189,6 +293,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.debug.onDidStartDebugSession((session) => {
       if (session.type === 'vite') {
+        sessionRegistry.register(session);
         statusBarItem.text = '$(debug-stop) Vite Debugging';
         statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.debuggingBackground');
         statusBarItem.show();
@@ -217,6 +322,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.debug.onDidTerminateDebugSession((session) => {
       if (session.type === 'vite') {
+        sessionRegistry.unregister(session);
         statusBarItem.text = '$(debug) Vite Debug';
         statusBarItem.backgroundColor = undefined;
         if (autoRefreshTimer) { clearTimeout(autoRefreshTimer); autoRefreshTimer = undefined; }

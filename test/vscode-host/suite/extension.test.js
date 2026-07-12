@@ -2,9 +2,9 @@
 const assert = require('assert');
 const vscode = require('vscode');
 
-// Activation is lazy — our extension declares `activationEvents: []`, so it
-// activates only when one of its contributed commands / debug types is used.
-// We force activation by getting the extension and calling `activate()`.
+// The extension normally activates onStartupFinished so every project window
+// can publish its own MCP bridge. Tests still activate explicitly to avoid
+// depending on host startup timing.
 
 const EXTENSION_ID = 'newdlops.vite-debugger';
 
@@ -33,6 +33,7 @@ suite('vite-debugger extension (VSCode host)', function () {
     const expected = [
       'vite-debugger.startDebug',
       'vite-debugger.detectViteServer',
+      'vite-debugger.copyMcpConfiguration',
       'vite-debugger.refreshReactTree',
       'vite-debugger.breakOnRender',
       'vite-debugger.goToComponent',
