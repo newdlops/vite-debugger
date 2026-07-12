@@ -2,7 +2,7 @@
   "name": "vite-debugger",
   "displayName": "Vite Debugger",
   "description": "Debug Vite applications in VSCode by attaching to Chrome DevTools Protocol",
-  "version": "0.1.7006",
+  "version": "0.1.7007",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "images/icon.png",
@@ -165,6 +165,10 @@
         "title": "Vite Debugger: Detect Vite Server"
       },
       {
+        "command": "vite-debugger.setupMcpConfiguration",
+        "title": "Vite Debugger: Set Up Agent MCP Automatically"
+      },
+      {
         "command": "vite-debugger.copyMcpConfiguration",
         "title": "Vite Debugger: Copy Agent MCP Configuration"
       },
@@ -222,7 +226,9 @@
     "@vscode/debugadapter": "^1.65.0",
     "@vscode/debugprotocol": "^1.65.0",
     "chrome-remote-interface": "^0.33.2",
+    "jsonc-parser": "3.3.1",
     "playwright-core": "1.61.1",
+    "smol-toml": "1.7.0",
     "source-map": "^0.7.4",
     "zod": "4.4.3"
   },

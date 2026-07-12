@@ -1,4 +1,7 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { ViteDebugSession } from './adapter/ViteDebugSession';
 import { detectViteServers, formatViteServerDescription, formatViteServerInfo } from './vite/ViteServerDetector';
 import { isChromeDebuggable } from './cdp/ChromeDiscovery';
@@ -7,6 +10,24 @@ import { ViteInlineValuesProvider } from './providers/InlineValuesProvider';
 import { ReactComponentTreeProvider } from './react/ReactComponentTreeProvider';
 import { BridgeServer } from './mcp/BridgeServer';
 import { SessionRegistry } from './mcp/SessionRegistry';
+import {
+  AgentConfigurationError,
+  AgentMcpLaunch,
+  CLAUDE_CONFIGURATION_PATH,
+  CODEX_CONFIGURATION_PATH,
+  ConfigurationChange,
+  mergeClaudeConfiguration,
+  mergeCodexConfiguration,
+  renderCodexMcpBlock,
+} from './mcp/AgentConfiguration';
+import {
+  assertSafeConfigurationParent,
+  FileConfigurationUpdate,
+  prepareStableMcpLauncher,
+  readConfiguration,
+  withFileLock,
+  writeConfigurationTransaction,
+} from './mcp/AgentConfigurationFiles';
 
 class ViteDebugAdapterFactory implements vscode.DebugAdapterDescriptorFactory {
   constructor(private readonly sessions: SessionRegistry) {}
@@ -43,22 +64,78 @@ class ViteDebugConfigurationProvider implements vscode.DebugConfigurationProvide
 
 let statusBarItem: vscode.StatusBarItem;
 
+type AgentClient = 'codex' | 'claude';
+
+interface PendingConfiguration extends FileConfigurationUpdate {
+  client: AgentClient;
+  change: ConfigurationChange;
+}
+
+interface WorkspaceSelectionOptions {
+  noFolderMessage: string;
+  placeHolder: string;
+}
+
+async function selectLocalWorkspaceFolder(
+  options: WorkspaceSelectionOptions,
+): Promise<vscode.WorkspaceFolder | undefined> {
+  const folders = vscode.workspace.workspaceFolders?.filter((folder) => folder.uri.scheme === 'file') ?? [];
+  if (folders.length === 0) {
+    vscode.window.showWarningMessage(options.noFolderMessage);
+    return undefined;
+  }
+  if (folders.length === 1) return folders[0];
+
+  const selected = await vscode.window.showQuickPick(
+    folders.map((folder) => ({
+      label: folder.name,
+      description: folder.uri.fsPath,
+      folder,
+    })),
+    { placeHolder: options.placeHolder },
+  );
+  return selected?.folder;
+}
+
+function pathComparisonKey(filePath: string): string {
+  const resolved = path.resolve(filePath);
+  return process.platform === 'win32' || process.platform === 'darwin'
+    ? resolved.toLocaleLowerCase('en-US')
+    : resolved;
+}
+
+async function comparisonKeys(filePath: string): Promise<Set<string>> {
+  const keys = new Set([pathComparisonKey(filePath)]);
+  try { keys.add(pathComparisonKey(await fs.realpath(filePath))); } catch { /* file may not exist yet */ }
+  return keys;
+}
+
+async function assertConfigurationDocumentIsSaved(filePath: string): Promise<void> {
+  const targetKeys = await comparisonKeys(filePath);
+  for (const document of vscode.workspace.textDocuments) {
+    if (!document.isDirty || document.uri.scheme !== 'file') continue;
+    const documentKeys = await comparisonKeys(document.uri.fsPath);
+    if ([...documentKeys].some((key) => targetKeys.has(key))) {
+      throw new AgentConfigurationError(`Save ${filePath} before running MCP setup.`);
+    }
+  }
+}
+
+function formatConfiguredClients(configurations: readonly PendingConfiguration[]): string {
+  const labels = configurations.map((configuration) =>
+    configuration.client === 'codex' ? 'Codex' : 'Claude Code');
+  return labels.join(' and ');
+}
+
 async function prepareMcpLauncher(context: vscode.ExtensionContext): Promise<string> {
-  await vscode.workspace.fs.createDirectory(context.globalStorageUri);
-  const launcher = vscode.Uri.joinPath(context.globalStorageUri, 'vite-debugger-mcp.cjs');
-  const bundledServer = context.asAbsolutePath('dist/mcp-server.js');
-  const source = [
-    "'use strict';",
-    `const { runMcpServer } = require(${JSON.stringify(bundledServer)});`,
-    'runMcpServer().catch((error) => {',
-    "  const message = error instanceof Error ? (error.stack || error.message) : String(error);",
-    "  process.stderr.write('[vite-debugger-mcp] Startup failed: ' + message + '\\n');",
-    '  process.exitCode = 1;',
-    '});',
-    '',
-  ].join('\n');
-  await vscode.workspace.fs.writeFile(launcher, Buffer.from(source, 'utf8'));
-  return launcher.fsPath;
+  if (context.globalStorageUri.scheme !== 'file') {
+    throw new AgentConfigurationError('The stable MCP launcher requires a local extension storage directory.');
+  }
+  return prepareStableMcpLauncher({
+    storagePath: context.globalStorageUri.fsPath,
+    bundledServerPath: context.asAbsolutePath('dist/mcp-server.js'),
+    version: String(context.extension.packageJSON.version ?? '0.0.0'),
+  });
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -70,9 +147,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     .filter((folder) => folder.uri.scheme === 'file')
     .map((folder) => folder.uri.fsPath);
   const bridge = new BridgeServer(sessionRegistry, workspaceRoots());
-  const mcpLauncherPath = prepareMcpLauncher(context).catch((error) => {
+  const mcpLauncherPath = prepareMcpLauncher(context);
+  void mcpLauncherPath.catch((error) => {
     logger.warn(`Could not prepare stable MCP launcher: ${(error as Error).message}`);
-    return context.asAbsolutePath('dist/mcp-server.js');
   });
   context.subscriptions.push(sessionRegistry, bridge);
   try {
@@ -175,6 +252,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Commands
   context.subscriptions.push(
     vscode.commands.registerCommand('vite-debugger.startDebug', async () => {
+      const folder = await selectLocalWorkspaceFolder({
+        noFolderMessage: 'Open a local project folder before starting Vite debugging.',
+        placeHolder: 'Select the project to debug',
+      });
+      if (!folder) return;
+
       const servers = await detectViteServers();
       if (servers.length === 0) {
         vscode.window.showWarningMessage(
@@ -199,13 +282,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
 
       vscode.debug.startDebugging(
-        vscode.workspace.workspaceFolders?.[0],
+        folder,
         {
           type: 'vite',
           request: 'launch',
           name: 'Debug Vite App',
           viteUrl,
-          webRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+          webRoot: folder.uri.fsPath,
         }
       );
     })
@@ -223,26 +306,133 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         );
       }
     }),
-    vscode.commands.registerCommand('vite-debugger.copyMcpConfiguration', async () => {
-      const folders = vscode.workspace.workspaceFolders?.filter((folder) => folder.uri.scheme === 'file') ?? [];
-      if (folders.length === 0) {
-        vscode.window.showWarningMessage('Open a local project folder before copying MCP configuration.');
+    vscode.commands.registerCommand('vite-debugger.setupMcpConfiguration', async () => {
+      if (!vscode.workspace.isTrusted) {
+        vscode.window.showWarningMessage('Trust this workspace before configuring agent MCP.');
         return;
       }
 
-      let folder = folders[0];
-      if (folders.length > 1) {
-        const selected = await vscode.window.showQuickPick(
-          folders.map((candidate) => ({
-            label: candidate.name,
-            description: candidate.uri.fsPath,
-            folder: candidate,
-          })),
-          { placeHolder: 'Select the project for this MCP server' },
+      const folder = await selectLocalWorkspaceFolder({
+        noFolderMessage: 'Open a local project folder before configuring agent MCP.',
+        placeHolder: 'Select the project for this MCP server',
+      });
+      if (!folder) return;
+
+      const target = await vscode.window.showQuickPick(
+        [
+          {
+            label: 'Codex + Claude Code',
+            description: 'Configure both project files',
+            clients: ['codex', 'claude'] as AgentClient[],
+          },
+          {
+            label: 'Codex',
+            description: CODEX_CONFIGURATION_PATH,
+            clients: ['codex'] as AgentClient[],
+          },
+          {
+            label: 'Claude Code',
+            description: CLAUDE_CONFIGURATION_PATH,
+            clients: ['claude'] as AgentClient[],
+          },
+        ],
+        { placeHolder: 'Select the agents to configure automatically' },
+      );
+      if (!target) return;
+
+      try {
+        const workspacePath = folder.uri.fsPath;
+        const launch: AgentMcpLaunch = {
+          launcherPath: await mcpLauncherPath,
+          workspacePath,
+        };
+        const canonicalWorkspace = await fs.realpath(workspacePath).catch(() => path.resolve(workspacePath));
+        const lockKey = process.platform === 'win32'
+          ? canonicalWorkspace.toLocaleLowerCase('en-US')
+          : canonicalWorkspace;
+        const setupLock = path.join(
+          context.globalStorageUri.fsPath,
+          `mcp-setup-${crypto.createHash('sha256').update(lockKey).digest('hex').slice(0, 24)}.lock`,
         );
-        if (!selected) return;
-        folder = selected.folder;
+        const { configurations, changed } = await withFileLock(setupLock, async () => {
+          const configurations: PendingConfiguration[] = [];
+
+          if (target.clients.includes('codex')) {
+            const filePath = path.join(workspacePath, CODEX_CONFIGURATION_PATH);
+            await assertSafeConfigurationParent(filePath, workspacePath);
+            await assertConfigurationDocumentIsSaved(filePath);
+            const original = await readConfiguration(filePath);
+            const merged = mergeCodexConfiguration(original.content, launch);
+            configurations.push({
+              client: 'codex',
+              workspacePath,
+              filePath,
+              original,
+              ...merged,
+            });
+          }
+
+          if (target.clients.includes('claude')) {
+            const filePath = path.join(workspacePath, CLAUDE_CONFIGURATION_PATH);
+            await assertSafeConfigurationParent(filePath, workspacePath);
+            await assertConfigurationDocumentIsSaved(filePath);
+            const original = await readConfiguration(filePath);
+            const merged = mergeClaudeConfiguration(original.content, launch);
+            configurations.push({
+              client: 'claude',
+              workspacePath,
+              filePath,
+              original,
+              ...merged,
+            });
+          }
+
+          const changed = configurations.filter((configuration) => configuration.change !== 'unchanged');
+          await writeConfigurationTransaction(changed, {
+            assertDocumentSaved: assertConfigurationDocumentIsSaved,
+          });
+          return { configurations, changed };
+        });
+
+        const clients = formatConfiguredClients(configurations);
+        const message = changed.length === 0
+          ? `${clients} MCP is already configured for ${folder.name}.`
+          : `${clients} MCP configured for ${folder.name}. Restart the agent session to load it.`;
+        const action = await vscode.window.showInformationMessage(message, 'Open Configuration');
+        if (action === 'Open Configuration') {
+          let selected = configurations[0];
+          if (configurations.length > 1) {
+            const picked = await vscode.window.showQuickPick(
+              configurations.map((configuration) => ({
+                label: configuration.client === 'codex' ? 'Codex' : 'Claude Code',
+                description: path.relative(workspacePath, configuration.filePath),
+                configuration,
+              })),
+              { placeHolder: 'Select a configuration to open' },
+            );
+            if (!picked) return;
+            selected = picked.configuration;
+          }
+          await vscode.window.showTextDocument(vscode.Uri.file(selected.filePath));
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn(`Could not configure agent MCP: ${message}`);
+        const action = await vscode.window.showErrorMessage(
+          `Could not configure agent MCP: ${message}`,
+          'Copy Configuration Instead',
+        );
+        if (action === 'Copy Configuration Instead') {
+          await vscode.commands.executeCommand('vite-debugger.copyMcpConfiguration');
+        }
       }
+    }),
+    vscode.commands.registerCommand('vite-debugger.copyMcpConfiguration', async () => {
+      const folder = await selectLocalWorkspaceFolder({
+        noFolderMessage: 'Open a local project folder before copying agent MCP configuration.',
+        placeHolder: 'Select the project for this MCP server',
+      });
+      if (!folder) return;
 
       const clients: Array<vscode.QuickPickItem & { format: 'codex' | 'claude' }> = [
         { label: 'Codex', description: '.codex/config.toml', format: 'codex' },
@@ -254,32 +444,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
       if (!client) return;
 
-      const serverPath = await mcpLauncherPath;
-      const workspacePath = folder.uri.fsPath;
-      const configuration = client.format === 'codex'
-        ? [
-            '[mcp_servers.vite_debugger]',
-            'command = "node"',
-            `args = [${JSON.stringify(serverPath)}, "--workspace", ${JSON.stringify(workspacePath)}]`,
-            'startup_timeout_sec = 10',
-            'tool_timeout_sec = 60',
-            'enabled = true',
-            'required = false',
-          ].join('\n')
-        : JSON.stringify({
-            mcpServers: {
-              'vite-debugger': {
-                type: 'stdio',
-                command: 'node',
-                args: [serverPath, '--workspace', workspacePath],
-              },
-            },
-          }, null, 2);
+      try {
+        const launch: AgentMcpLaunch = {
+          launcherPath: await mcpLauncherPath,
+          workspacePath: folder.uri.fsPath,
+        };
+        const configuration = client.format === 'codex'
+          ? renderCodexMcpBlock(launch)
+          : mergeClaudeConfiguration(undefined, launch).content;
 
-      await vscode.env.clipboard.writeText(configuration);
-      vscode.window.showInformationMessage(
-        `${client.label} MCP configuration copied. Add it to ${client.description}, then restart the agent.`,
-      );
+        await vscode.env.clipboard.writeText(configuration);
+        vscode.window.showInformationMessage(
+          `${client.label} MCP configuration copied. Add it to ${client.description}, then restart the agent.`,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`Could not prepare MCP configuration: ${message}`);
+      }
     })
   );
 

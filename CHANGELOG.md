@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.7007 (2026-07-13)
+
+### Added
+
+- **Automatic agent MCP setup** — a Command Palette action now creates or updates project-scoped Codex and Claude Code MCP configuration, with a combined setup option for both agents.
+- **Safe configuration merging** — preserves unrelated MCP servers, JSONC comments, indentation, and line endings; repeated setup is idempotent.
+
+### Security
+
+- Refuses untrusted workspaces, symbolic-link configuration targets, dirty editor buffers, oversized files, and malformed configuration; files are rechecked immediately before commit.
+- Uses cross-window setup locks, a version-guarded stable launcher, atomic same-directory writes, and rollback if the combined Codex/Claude update fails.
+
 ## 0.1.7006 (2026-07-12)
 
 ### Added

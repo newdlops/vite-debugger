@@ -3,7 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { BridgeClient } from './BridgeClient';
 import { registerMcpTools } from './tools';
 
-const SERVER_VERSION = '0.1.7006';
+const SERVER_VERSION = '0.1.7007';
 
 export function createMcpServer(bridge: BridgeClient): McpServer {
   const server = new McpServer({

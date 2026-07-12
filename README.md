@@ -103,10 +103,15 @@ Playwright runs in the sidecar, not in the VS Code Extension Host. The VSIX incl
 
 ### Set up an agent
 
-1. Open the project in its own VS Code window and start a Vite debug session.
-2. Run **Vite Debugger: Copy Agent MCP Configuration** from the Command Palette.
-3. Choose Codex or Claude Code, then merge the copied block into `.codex/config.toml` or `.mcp.json`.
-4. Restart the agent so it loads the MCP server.
+1. Open the project in its own VS Code window.
+2. Run **Vite Debugger: Set Up Agent MCP Automatically** from the Command Palette.
+3. Choose Codex, Claude Code, or both. The extension safely creates or updates `.codex/config.toml` and/or `.mcp.json` while preserving unrelated MCP servers and comments.
+4. Restart the agent session so it loads the project MCP server. Codex must trust the project before it loads project configuration; Claude Code asks you to approve the project server (you can also inspect it with `/mcp`).
+5. Start a Vite debug session, then use the MCP tools from the agent.
+
+Running setup again is safe and refreshes only the Vite Debugger entry. In a multi-root window, setup asks which project to bind; the generated `--workspace` argument routes that agent to the matching VS Code window and debug session. The older **Copy Agent MCP Configuration** command remains available as a manual fallback.
+
+The generated launcher and workspace paths are local to your machine. Review the files before committing them to source control.
 
 When developing this repository itself, `npm run build` produces `dist/mcp-server.js`, and the checked-in local Codex/Claude configurations already point to it.
 
@@ -139,6 +144,7 @@ The debugger finds a debuggable Chrome in this order:
 
 - Chrome must be started with a remote-debugging port and a separate debug profile. See [Chrome Debugging Limitation](docs/chrome-debugging-limitation.md) for details.
 - Source maps for dynamically imported modules load on-demand — breakpoints in lazy-loaded files become active when the module is first imported.
+- Automatic MCP setup currently supports local `file:` workspaces; Remote SSH and Dev Container workspaces still require environment-specific setup.
 
 ## Testing
 
