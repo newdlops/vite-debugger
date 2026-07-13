@@ -6,7 +6,9 @@ export interface RegisteredSession {
   readonly sessionId: string;
   readonly name: string;
   readonly type: string;
+  readonly request?: 'launch' | 'attach';
   readonly workspaceRoot?: string;
+  readonly startOperationId?: string;
   readonly startedAt: number;
 }
 
@@ -51,13 +53,24 @@ export class SessionRegistry implements vscode.Disposable {
     const workspaceRoot = session.workspaceFolder && isHostFileWorkspace(session.workspaceFolder)
       ? canonicalizeWorkspaceRoot(session.workspaceFolder.uri.fsPath)
       : undefined;
+    const rawStartOperationId = session.configuration?._viteDebuggerMcpStartId;
+    const configuredStartOperationId = typeof rawStartOperationId === 'string' &&
+      /^[0-9a-f-]{36}$/i.test(rawStartOperationId)
+      ? rawStartOperationId
+      : undefined;
+    const configuredRequest = session.configuration?.request === 'launch' ||
+      session.configuration?.request === 'attach'
+      ? session.configuration.request
+      : undefined;
 
     this.sessions.set(session.id, {
       session,
       sessionId: session.id,
       name: session.name,
       type: session.type,
-      workspaceRoot,
+      request: configuredRequest ?? previous?.request,
+      workspaceRoot: workspaceRoot ?? previous?.workspaceRoot,
+      startOperationId: configuredStartOperationId ?? previous?.startOperationId,
       startedAt: previous?.startedAt ?? Date.now(),
     });
   }
@@ -65,6 +78,27 @@ export class SessionRegistry implements vscode.Disposable {
   unregister(sessionOrId: vscode.DebugSession | string): void {
     const id = typeof sessionOrId === 'string' ? sessionOrId : sessionOrId.id;
     this.sessions.delete(id);
+  }
+
+  /**
+   * Remove and return sessions created for one MCP start operation. A debug
+   * adapter can reject launch before VS Code emits onDidTerminate, so the
+   * bridge must be able to evict that otherwise-unusable session explicitly.
+   */
+  takeByStartOperationId(operationId: string, workspaceRoot?: string): vscode.DebugSession[] {
+    const requestedRoot = workspaceRoot === undefined ? undefined : rootKey(workspaceRoot);
+    const matches: vscode.DebugSession[] = [];
+    for (const [sessionId, entry] of this.sessions) {
+      if (entry.startOperationId !== operationId) continue;
+      if (requestedRoot !== undefined && (
+        entry.workspaceRoot === undefined || rootKey(entry.workspaceRoot) !== requestedRoot
+      )) {
+        continue;
+      }
+      this.sessions.delete(sessionId);
+      matches.push(entry.session);
+    }
+    return matches;
   }
 
   list(workspaceRoot?: string): RegisteredSession[] {

@@ -3,7 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { BridgeClient } from './BridgeClient';
 import { registerMcpTools } from './tools';
 
-const SERVER_VERSION = '0.1.7009';
+const SERVER_VERSION = '0.1.7013';
 
 export function createMcpServer(bridge: BridgeClient): McpServer {
   const server = new McpServer({
@@ -11,7 +11,9 @@ export function createMcpServer(bridge: BridgeClient): McpServer {
     version: SERVER_VERSION,
   }, {
     instructions:
-      'This server is bound to one VS Code project window. Begin with debug_status. ' +
+      'This server is bound to one VS Code project window. Begin with debug_status; if no session is active, call debug_start. ' +
+      'If multiple running Vite services share the project sources, pass their local origin as debug_start viteUrl. ' +
+      'If a backend renders the browser page on another local origin, also pass that full route as debug_start pageUrl. ' +
       'When more than one session or browser target exists, pass the returned sessionId and targetId explicitly. ' +
       'browser_navigate can reopen the project Vite page when every managed tab was closed. ' +
       'When paused, use debug_snapshot and debug_control; browser mutation tools are intentionally blocked until resume. ' +

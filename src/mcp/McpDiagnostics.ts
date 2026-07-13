@@ -400,7 +400,7 @@ function classifyDebugStatus(result: unknown): {
         title: 'Debugger bridge',
         status: noSession ? 'warn' : 'fail',
         message: noSession
-          ? 'The MCP server reached VS Code, but no Vite debug session is active.'
+          ? 'The MCP server reached VS Code, but no Vite debug session is active. Call debug_start to start one.'
           : boundedText(text || 'debug_status returned an MCP tool error.', 1_000),
       },
       payload,

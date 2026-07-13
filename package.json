@@ -2,7 +2,7 @@
   "name": "vite-debugger",
   "displayName": "Vite Debugger",
   "description": "Debug Vite applications in VSCode by attaching to Chrome DevTools Protocol",
-  "version": "0.1.7010",
+  "version": "0.1.7014",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "images/icon.png",
@@ -66,6 +66,11 @@
                 "description": "Vite dev server URL (auto-detected if omitted)",
                 "default": ""
               },
+              "pageUrl": {
+                "type": "string",
+                "description": "Application page Chrome should open (defaults to the Vite page; may use a different origin in middleware/backend-rendered setups)",
+                "default": ""
+              },
               "chromePort": {
                 "type": "number",
                 "description": "Chrome remote debugging port",
@@ -101,6 +106,11 @@
               "viteUrl": {
                 "type": "string",
                 "description": "Vite dev server URL (auto-detected if omitted)",
+                "default": ""
+              },
+              "pageUrl": {
+                "type": "string",
+                "description": "Application page Chrome should manage (defaults to the Vite page; may use a different origin in middleware/backend-rendered setups)",
                 "default": ""
               },
               "chromePort": {

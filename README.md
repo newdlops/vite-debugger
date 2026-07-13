@@ -49,11 +49,14 @@ Debug Vite applications directly in VS Code. Set breakpoints in your `.tsx`/`.ts
 
 | Property | Type | Default | Description |
 |---|---|---|---|
-| `viteUrl` | string | auto-detect | Vite dev server URL |
+| `viteUrl` | string | auto-detect | Explicit Vite dev server URL; recommended when several Vite apps run below one workspace. |
+| `pageUrl` | string | detected Vite page | Browser application URL; use this when a backend/middleware server renders the page on a different local origin. |
 | `chromePort` | number | `9222` | Chrome remote debugging port |
 | `webRoot` | string | `${workspaceFolder}` | Workspace root for source resolution |
 | `skipFiles` | string[] | `[]` | Glob patterns for files to skip during stepping |
 | `sourceMapPathOverrides` | object | `{}` | Custom source map path mappings |
+
+Automatic detection is project-scoped: the debugger selects a server only when its discovered Vite root uniquely matches `webRoot` (a monorepo child is allowed). If no root matches, multiple roots match, or root discovery is unavailable, set `viteUrl` explicitly instead of attaching to an arbitrary process. Local HTTPS aliases such as `https://alphac:3004` are supported; a self-signed certificate is relaxed only for a DNS-verified, connection-pinned loopback endpoint.
 
 ### skipFiles
 
@@ -109,13 +112,25 @@ The private bridge and Chrome CDP connection both use loopback. Consequently, th
 2. Run **Vite Debugger: Set Up Agent MCP Automatically** from the Command Palette.
 3. Choose Codex, Claude Code, or both. The extension safely creates or updates `.codex/config.toml` and/or `.mcp.json` while preserving unrelated MCP servers and comments.
 4. Restart the agent session so it loads the project MCP server. Codex must trust the project before it loads project configuration; Claude Code asks you to approve the project server (you can also inspect it with `/mcp`).
-5. Start a Vite debug session, then use the MCP tools from the agent.
+5. Call `debug_start` from the agent (or start a Vite debug session manually), then use the remaining MCP tools.
 
-A `launch` session guarantees that the detected Vite URL is open in its debug Chrome, even when it reuses a window that previously contained only a new tab. An `attach` session leaves existing tabs untouched. If the managed app tab is later closed, `browser_navigate` reopens it automatically for a same-origin route; pass `openIfMissing=false` when that recovery side effect is not wanted.
+A `launch` session guarantees that the application `pageUrl` is open in its debug Chrome, even when it reuses a window that previously contained only a new tab. An `attach` session leaves existing tabs untouched. If the managed app tab is later closed, `browser_navigate` reopens it automatically for a same-origin route; pass `openIfMissing=false` when that recovery side effect is not wanted.
+
+`debug_start` runs a trusted project `type: "vite"` launch configuration through the matching VS Code window, including its user-authored `preLaunchTask`. If no Vite configuration exists, it uses a task-free generated launch configuration and therefore expects the agent or user to have already started the Vite server. The tool never guesses or executes an arbitrary dev-server command. Concurrent or transport-retried starts share an idempotency ID so the same `preLaunchTask` is not run twice. If a registered adapter never becomes ready before the requested timeout, only that correlated zombie session is stopped; a task that has not produced a session yet remains single-flight and can continue starting normally.
+
+When several running Vite services share the same workspace sources, the agent can select one without editing `launch.json`: `debug_start({ "viteUrl": "https://alphac:3004" })`. This selector is restricted to a credential-free local HTTP(S) origin, and the detected Vite root must still belong to this MCP server's project. A failed adapter launch is removed automatically and releases its start reservation, so the next `debug_start` can retry immediately instead of reusing or waiting behind a disconnected session.
+
+When Vite only serves modules and a backend renders the browser page on another port, pass both URLs: `debug_start({ "viteUrl": "https://alphac:3004", "pageUrl": "http://alphac:8004/app" })`. Source maps and breakpoints remain bound to `viteUrl`; Chrome targeting, Playwright actions, navigation, and trace isolation use `pageUrl`. Both agent-supplied URLs must resolve exclusively to loopback, and `pageUrl` rejects credentials, query strings, and fragments.
+
+Some Vite setups intentionally return 404 at `/` and expose their transformed document at `/index.html`. The debugger opens `/index.html` only when it contains a Vite client or module bootstrap. A raw backend template is not mistaken for a runnable page; supply its rendered `pageUrl` instead.
+
+For a loopback HTTPS server whose local certificate Node does not trust, status includes `localTlsCertificateBypass` and an actionable `tlsCertificateWarning`. Detection and external source-map reads remain pinned to loopback, but Chrome still enforces its own certificate policy: trust the URL once in that project's managed Chrome profile or install the local CA in Chrome/OS. The extension never adds Chrome's global `--ignore-certificate-errors` flag.
+
+When execution pauses, the debugger maps user frames immediately and does not wait for an uncached dependency source map. Cached package maps are still used, while missing optimized-dependency maps cannot delay `debug_snapshot` or create a background retry storm.
 
 Running setup again is safe and refreshes only the Vite Debugger entry. In a multi-root window, setup asks which project to bind; the generated `--workspace` argument routes that agent to the matching VS Code window and debug session. The older **Copy Agent MCP Configuration** command remains available as a manual fallback.
 
-Use **Vite Debugger: Diagnose Agent MCP** at any time (or choose **Diagnose MCP** after setup) to launch the exact stable stdio command and verify the agent configuration, MCP handshake, all 20 tools, private VS Code bridge, and `debug_status` path. The bounded PASS/WARN/FAIL report appears in the Vite Debugger output channel; having no active debug session is reported as a warning rather than a broken MCP installation.
+Use **Vite Debugger: Diagnose Agent MCP** at any time (or choose **Diagnose MCP** after setup) to launch the exact stable stdio command and verify the agent configuration, MCP handshake, all 21 tools, private VS Code bridge, and `debug_status` path. The bounded PASS/WARN/FAIL report appears in the Vite Debugger output channel; having no active debug session is reported as a warning rather than a broken MCP installation.
 
 The generated launcher, bridge, and workspace paths are specific to the machine or remote environment in which the Vite Debugger Extension Host is running. Review the files before committing them to source control.
 
@@ -124,17 +139,19 @@ When developing this repository itself, `npm run build` produces `dist/mcp-serve
 The normal agent workflow is:
 
 1. `debug_status`
-2. `browser_tabs` if a target must be selected
-3. `browser_snapshot`
-4. Use a browser action, then `browser_wait_for` when the result is asynchronous
-5. If a breakpoint is hit, `debug_snapshot`, then `debug_control`
+2. If no session exists, `debug_start`
+3. `browser_tabs` if a target must be selected
+4. `browser_snapshot`
+5. Use a browser action, then `browser_wait_for` when the result is asynchronous
+6. If a breakpoint is hit, `debug_snapshot`, then `debug_control`
 
 ### MCP tools
 
-The server exposes 20 project-scoped tools:
+The server exposes 21 project-scoped tools:
 
 | Tool | Purpose |
 | --- | --- |
+| `debug_start` | Start or reuse this project's Vite debug session through VS Code, honoring a configured `preLaunchTask`; optionally select separate local `viteUrl` and `pageUrl` values. |
 | `debug_status` | List/select Vite debug sessions and report targets, pause state, and debugger status. |
 | `debug_snapshot` | Read the paused target's reason, bounded call stack, scopes, and variable previews. |
 | `debug_control` | Pause, continue, step over/into/out, or reload a managed target. |
@@ -184,7 +201,9 @@ A successful stop writes a private zip on the **MCP sidecar's filesystem** under
 
 ### Chrome Connection
 
-The debugger finds a debuggable Chrome in this order:
+For a `launch` session, an explicitly configured reachable `chromePort` is honored. Otherwise the debugger uses a project-owned, hashed Chrome profile and asks Chrome/OS for a collision-free debug port; it reuses only the port and browser identity recorded by that same profile. It never adopts a machine-wide Lighthouse or unrelated headless Chrome.
+
+An `attach` session retains the broader discovery order:
 
 1. Check the specified `chromePort` (default 9222)
 2. Auto-discover any Chrome running with `--remote-debugging-port`

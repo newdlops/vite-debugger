@@ -95,6 +95,7 @@ describe('MCP protocol surface', () => {
       'debug_evaluate',
       'debug_replace_breakpoints',
       'debug_snapshot',
+      'debug_start',
       'debug_status',
     ]);
   });

@@ -29,14 +29,21 @@ export class CallStackManager {
     registerSourceRef?: SourceRefRegistrar,
   ): Promise<ResolvedCallFrame[]> {
     this.frameMap.clear();
-    this.frameIdCounter = 0;
+    this.frameIdCounter = cdpFrames.length;
 
-    const resolved: ResolvedCallFrame[] = [];
-
-    for (const cdpFrame of cdpFrames) {
-      const frameId = ++this.frameIdCounter;
+    // Allocate every frame ID before starting asynchronous source-map and
+    // checksum work. Promise.all preserves the input order, while this eager
+    // registration keeps frame IDs/getCdpFrame deterministic even when a
+    // lower frame finishes resolving before the top frame.
+    const indexedFrames = cdpFrames.map((cdpFrame, index) => ({
+      cdpFrame,
+      frameId: index + 1,
+    }));
+    for (const { cdpFrame, frameId } of indexedFrames) {
       this.frameMap.set(frameId, cdpFrame);
+    }
 
+    return Promise.all(indexedFrames.map(async ({ cdpFrame, frameId }) => {
       const { scriptId, lineNumber, columnNumber } = cdpFrame.location;
       let source: DebugProtocol.Source;
       let line: number;
@@ -53,9 +60,20 @@ export class CallStackManager {
       // If the source map resolves — even to a node_modules file — prefer the
       // original position. This lets the user see the actual package source
       // (e.g., react-dom.development.js) instead of the pre-bundled Vite artifact.
-      const original = await this.sourceMapResolver.generatedToOriginal(
-        scriptId, lineNumber, columnNumber ?? 0
-      );
+      //
+      // Do not start a lazy network fetch for dependency/internal frames while
+      // publishing a pause. Their maps are loaded eagerly from scriptParsed;
+      // if that has not completed (or failed), waiting here can hold the whole
+      // MCP snapshot for seconds. A map that is already cached remains useful
+      // and is safe to resolve synchronously. User-code frames always retain
+      // the lazy lookup so the top frame is mapped accurately.
+      const shouldResolveSourceMap =
+        (!isNodeModules && !isInternal) || this.sourceMapResolver.isSourceMapLoaded(scriptId);
+      const original = shouldResolveSourceMap
+        ? await this.sourceMapResolver.generatedToOriginal(
+          scriptId, lineNumber, columnNumber ?? 0
+        )
+        : null;
 
       if (original) {
         const originalInNodeModules = original.source.includes('/node_modules/');
@@ -126,10 +144,8 @@ export class CallStackManager {
         presentationHint,
       };
 
-      resolved.push({ dapFrame, cdpCallFrame: cdpFrame, scriptId });
-    }
-
-    return resolved;
+      return { dapFrame, cdpCallFrame: cdpFrame, scriptId };
+    }));
   }
 
   getCdpFrame(dapFrameId: number): CallFrame | undefined {

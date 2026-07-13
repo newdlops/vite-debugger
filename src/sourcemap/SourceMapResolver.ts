@@ -1,8 +1,12 @@
 import * as http from 'http';
+import * as https from 'https';
+import * as dns from 'dns';
+import * as net from 'net';
 import * as path from 'path';
 import { SourceMapConsumer, RawSourceMap, SourceMapConsumer as SMC } from 'source-map';
 import { SourceMapCache } from './SourceMapCache';
 import { logger } from '../util/Logger';
+import { isLoopbackHost, normalizeHost } from '../util/LocalHosts';
 
 export interface OriginalLocation {
   source: string;   // Absolute file path
@@ -43,33 +47,205 @@ interface ScriptMeta {
   sourceMapUrl: string;
 }
 
-function httpGet(url: string, timeout: number = 5000): Promise<string> {
+interface LoopbackAddress {
+  address: string;
+  family: 4 | 6;
+}
+
+class SourceMapHttpError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+    this.name = 'SourceMapHttpError';
+  }
+}
+
+const DNS_LOOKUP_TIMEOUT_MS = 500;
+const LOCAL_TLS_TRUST_ERROR_CODES = new Set([
+  'CERT_UNTRUSTED',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+]);
+
+function isLocalTlsTrustError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return typeof code === 'string' && LOCAL_TLS_TRUST_ERROR_CODES.has(code);
+}
+
+async function resolveExclusiveLoopback(hostname: string): Promise<LoopbackAddress | null> {
+  const normalized = normalizeHost(hostname);
+  const literalFamily = net.isIP(normalized);
+  if (literalFamily !== 0) {
+    return isLoopbackHost(normalized)
+      ? { address: normalized, family: literalFamily as 4 | 6 }
+      : null;
+  }
+
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const addresses = await Promise.race([
+      dns.promises.lookup(normalized, { all: true, verbatim: true }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`DNS lookup timed out for ${hostname}`)),
+          DNS_LOOKUP_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    if (addresses.length === 0 || addresses.some(({ address }) => !isLoopbackHost(address))) {
+      return null;
+    }
+    const selected = addresses[0];
+    return { address: selected.address, family: selected.family as 4 | 6 };
+  } catch {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function requestSourceMap(
+  url: URL,
+  timeout: number,
+  pinnedLoopback?: LoopbackAddress,
+  allowUntrustedCertificate: boolean = false,
+): Promise<string> {
   return new Promise((resolve, reject) => {
-    const req = http.get(url, { timeout }, (res) => {
+    let req: http.ClientRequest;
+    const onResponse = (res: http.IncomingMessage): void => {
       const statusCode = res.statusCode ?? 0;
       if (statusCode < 200 || statusCode >= 300) {
         // Consume response to free the socket
         res.resume();
-        reject(new Error(`HTTP ${statusCode} for ${url}`));
+        reject(new SourceMapHttpError(
+          `HTTP ${statusCode} for ${url.toString()}`,
+          statusCode === 408 || statusCode === 429 || statusCode >= 500,
+        ));
         return;
       }
       let body = '';
       res.on('data', (chunk) => { body += chunk; });
       res.on('end', () => resolve(body));
-    });
+    };
+
+    if (pinnedLoopback) {
+      const originalHostname = normalizeHost(url.hostname);
+      const options: http.RequestOptions = {
+        protocol: url.protocol,
+        hostname: pinnedLoopback.address,
+        family: pinnedLoopback.family,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: `${url.pathname}${url.search}`,
+        headers: { host: url.host },
+        timeout,
+      };
+      if (url.protocol === 'https:') {
+        req = https.get({
+          ...options,
+          // Keep the original DNS name for SNI. Certificate validation is
+          // relaxed only after exclusive-loopback verification below.
+          servername: net.isIP(originalHostname) === 0 ? originalHostname : undefined,
+          rejectUnauthorized: !allowUntrustedCertificate,
+        }, onResponse);
+      } else {
+        req = http.get(options, onResponse);
+      }
+    } else {
+      const transport = url.protocol === 'https:' ? https : http;
+      // Normal HTTPS always uses Node's CA and hostname validation.
+      req = transport.get(url, { timeout }, onResponse);
+    }
+
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout after ${timeout}ms for ${url}`)); });
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new SourceMapHttpError(`Timeout after ${timeout}ms for ${url.toString()}`, true));
+    });
   });
 }
 
-async function httpGetWithRetry(url: string, retries: number = 2, timeout: number = 5000): Promise<string> {
+async function httpGet(
+  url: string,
+  timeout: number,
+  localTlsBypassOrigins: Set<string>,
+): Promise<string> {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new SourceMapHttpError(`Unsupported source map URL protocol: ${parsed.protocol}`, false);
+  }
+
+  // Once an origin has proved to be a self-signed local service, avoid a
+  // failed TLS handshake for every script. DNS is still re-checked and the
+  // connection is still pinned to the verified loopback address each time.
+  if (parsed.protocol === 'https:' && localTlsBypassOrigins.has(parsed.origin)) {
+    const loopback = await resolveExclusiveLoopback(parsed.hostname);
+    if (!loopback) {
+      localTlsBypassOrigins.delete(parsed.origin);
+      throw new SourceMapHttpError(
+        `HTTPS source map origin no longer resolves exclusively to loopback: ${parsed.origin}`,
+        false,
+      );
+    }
+    return requestSourceMap(parsed, timeout, loopback, true);
+  }
+
+  try {
+    return await requestSourceMap(parsed, timeout);
+  } catch (error) {
+    if (parsed.protocol !== 'https:' || !isLocalTlsTrustError(error)) throw error;
+
+    const loopback = await resolveExclusiveLoopback(parsed.hostname);
+    if (!loopback) throw error;
+
+    logger.warn(
+      `Source-map HTTPS certificate is not trusted by Node at ${parsed.origin}; ` +
+      `retrying only on pinned loopback address ${loopback.address}.`,
+    );
+    const body = await requestSourceMap(parsed, timeout, loopback, true);
+    localTlsBypassOrigins.add(parsed.origin);
+    return body;
+  }
+}
+
+function shouldRetrySourceMapFetch(error: unknown): boolean {
+  if (error instanceof SourceMapHttpError) return error.retryable;
+  if (isLocalTlsTrustError(error)) return false;
+  if (error && typeof error === 'object') {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ERR_INVALID_PROTOCOL' || code === 'ERR_INVALID_URL') return false;
+  }
+  return true;
+}
+
+function isOptimizedDependencyMap(url: string): boolean {
+  try {
+    return new URL(url).pathname.includes('/node_modules/.vite/deps/');
+  } catch {
+    return false;
+  }
+}
+
+async function httpGetWithRetry(
+  url: string,
+  localTlsBypassOrigins: Set<string>,
+  retries: number = 2,
+  timeout: number = 5000,
+): Promise<string> {
   let lastError: Error | undefined;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  const retryLimit = isOptimizedDependencyMap(url) ? 0 : retries;
+  for (let attempt = 0; attempt <= retryLimit; attempt++) {
     try {
-      return await httpGet(url, timeout);
+      return await httpGet(url, timeout, localTlsBypassOrigins);
     } catch (e) {
       lastError = e instanceof Error ? e : new Error(String(e));
-      if (attempt < retries) {
+      if (!shouldRetrySourceMapFetch(e)) break;
+      if (attempt < retryLimit) {
         // Exponential backoff: 200ms, 600ms
         await new Promise(r => setTimeout(r, 200 * (attempt + 1) * (attempt + 1)));
       }
@@ -129,6 +305,10 @@ export class SourceMapResolver {
   private pendingSourceMisses = new Set<string>();  // Tracks already-logged "no scripts" sources
   private loadingPromises = new Map<string, Promise<void>>();  // Prevent duplicate loads
   private failedScripts = new Set<string>();  // scriptIds whose source map failed to load
+  /** Self-signed HTTPS origins accepted during this resolver's lifetime.
+   *  Every subsequent request still resolves and pins an exclusive loopback
+   *  address; this cache only skips the predictably failing trusted handshake. */
+  private localTlsBypassOrigins = new Set<string>();
   /** Absolute source path -> last-seen sourcesContent. Survives unregisterScript
    *  so HMR reloads can tell which sources were actually edited (content
    *  changed) vs. merely re-bundled (content identical). */
@@ -313,6 +493,11 @@ export class SourceMapResolver {
         this.failedScripts.delete(scriptId);
         continue;
       }
+      // Optimized dependency maps can number in the hundreds and are not
+      // useful for project breakpoints. Give each parsed script one fetch,
+      // but do not let a missing/broken dependency map keep the adapter's
+      // periodic retry loop alive indefinitely.
+      if (isOptimizedDependencyMap(meta.sourceMapUrl)) continue;
       try {
         await this.loadSourceMap(scriptId, meta);
         if (this.cache.has(scriptId)) {
@@ -329,7 +514,11 @@ export class SourceMapResolver {
   }
 
   hasFailedScripts(): boolean {
-    return this.failedScripts.size > 0;
+    for (const scriptId of this.failedScripts) {
+      const meta = this.scriptMetas.get(scriptId);
+      if (meta && !isOptimizedDependencyMap(meta.sourceMapUrl)) return true;
+    }
+    return false;
   }
 
   unregisterScript(scriptId: string): void {
@@ -705,6 +894,7 @@ export class SourceMapResolver {
     this.sourceToScripts.clear();
     this.loadingPromises.clear();
     this.failedScripts.clear();
+    this.localTlsBypassOrigins.clear();
     this.registeredScriptCount = 0;
     this.pendingSourceMisses.clear();
     this.sourceContentByPath.clear();
@@ -728,7 +918,7 @@ export class SourceMapResolver {
       }
       rawMapStr = Buffer.from(match[1], 'base64').toString('utf-8');
     } else {
-      rawMapStr = await httpGetWithRetry(sourceMapUrl, 2, 8000);
+      rawMapStr = await httpGetWithRetry(sourceMapUrl, this.localTlsBypassOrigins, 2, 8000);
     }
 
     let rawMap: RawSourceMap;

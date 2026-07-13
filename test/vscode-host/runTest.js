@@ -14,6 +14,9 @@ async function main() {
     await runTests({
       extensionDevelopmentPath,
       extensionTestsPath,
+      extensionTestsEnv: {
+        VITE_DEBUGGER_TEST_NODE: process.execPath,
+      },
       launchArgs: [
         workspacePath,
         '--disable-extensions',

@@ -1,11 +1,15 @@
 import * as http from 'http';
 import * as childProcess from 'child_process';
+import * as crypto from 'crypto';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
 import { logger } from '../util/Logger';
 import { isPortOpen } from '../util/PortScanner';
-import { localOriginsEquivalent } from '../util/LocalHosts';
+import { isLoopbackHost, localOriginsEquivalent } from '../util/LocalHosts';
+
+const DEBUG_CHROME_START_TIMEOUT_MS = 15_000;
+const DEVTOOLS_ACTIVE_PORT_FILE = 'DevToolsActivePort';
 
 export interface ChromeTarget {
   id: string;
@@ -213,6 +217,189 @@ function getDebugUserDataDir(): string {
   return path.join(home, '.config', 'google-chrome-debug');
 }
 
+/** Stable per-project profile path without exposing the workspace path itself. */
+export function managedChromeUserDataDir(
+  profileScope: string,
+  requestedPort?: number,
+): string {
+  let canonicalScope: string;
+  try {
+    canonicalScope = fs.realpathSync.native(path.resolve(profileScope));
+  } catch {
+    canonicalScope = path.resolve(profileScope);
+  }
+  if (process.platform === 'win32') canonicalScope = canonicalScope.toLowerCase();
+  const profileId = crypto.createHash('sha256')
+    .update(canonicalScope)
+    .update('\0')
+    .update(requestedPort === undefined ? 'leased' : `fixed:${requestedPort}`)
+    .digest('hex')
+    .slice(0, 32);
+  return path.join(os.tmpdir(), 'vite-debugger-chrome-profiles', profileId);
+}
+
+function prepareManagedDebugUserDataDir(profileScope: string, requestedPort?: number): string {
+  const directory = managedChromeUserDataDir(profileScope, requestedPort);
+  const parent = path.dirname(directory);
+  fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+  assertPrivateManagedDirectory(parent);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  assertPrivateManagedDirectory(directory);
+  return directory;
+}
+
+function assertPrivateManagedDirectory(directory: string): void {
+  const stat = fs.lstatSync(directory);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error('Unsafe managed Chrome profile directory');
+  }
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw new Error('Managed Chrome profile directory is owned by another user');
+  }
+  try {
+    fs.chmodSync(directory, 0o700);
+  } catch (error) {
+    if (process.platform !== 'win32') throw error;
+    // chmod is best-effort on Windows. The directory name contains only a
+    // one-way project hash, never the workspace path or MCP operation id.
+  }
+}
+
+interface DevToolsActiveEndpoint {
+  port: number;
+  browserPath: string;
+}
+
+function readDevToolsActiveEndpoint(userDataDir: string): DevToolsActiveEndpoint | undefined {
+  try {
+    const lines = fs.readFileSync(
+      path.join(userDataDir, DEVTOOLS_ACTIVE_PORT_FILE),
+      'utf8',
+    ).split(/\r?\n/);
+    const port = Number(lines[0]);
+    const browserPath = lines[1];
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined;
+    if (!/^\/devtools\/browser\/[A-Za-z0-9._-]+$/.test(browserPath ?? '')) return undefined;
+    return { port, browserPath };
+  } catch {
+    return undefined;
+  }
+}
+
+async function isOwnedChromeEndpoint(endpoint: DevToolsActiveEndpoint): Promise<boolean> {
+  try {
+    const version = await httpGetJson<{ webSocketDebuggerUrl?: unknown }>(
+      `http://127.0.0.1:${endpoint.port}/json/version`,
+    );
+    if (typeof version.webSocketDebuggerUrl !== 'string') return false;
+    const websocket = new URL(version.webSocketDebuggerUrl);
+    const websocketPort = Number(websocket.port || (websocket.protocol === 'wss:' ? 443 : 80));
+    return (websocket.protocol === 'ws:' || websocket.protocol === 'wss:') &&
+      isLoopbackHost(websocket.hostname) &&
+      websocketPort === endpoint.port &&
+      websocket.pathname === endpoint.browserPath;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Start a Chrome instance owned by one launch session.
+ *
+ * Each canonical project scope receives a stable hashed profile, preserving
+ * local login and certificate trust across debug starts without collapsing
+ * different projects into Chrome's single global profile. When no port was
+ * explicitly requested, `--remote-debugging-port=0` lets Chrome/OS lease a
+ * collision-free port and publishes it through DevToolsActivePort. A later
+ * start for the same project reuses only that owned port, never a machine-wide
+ * Lighthouse/headless endpoint.
+ */
+export async function launchManagedDebugChrome(
+  url: string,
+  requestedPort?: number,
+  profileScope: string = process.cwd(),
+  chromePath?: string,
+): Promise<number> {
+  if (requestedPort !== undefined && (
+    !Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 65535
+  )) {
+    throw new Error('Chrome remote-debugging port must be an integer between 1 and 65535');
+  }
+
+  const userDataDir = prepareManagedDebugUserDataDir(profileScope, requestedPort);
+  if (requestedPort === undefined) {
+    const ownedEndpoint = readDevToolsActiveEndpoint(userDataDir);
+    if (ownedEndpoint && await isOwnedChromeEndpoint(ownedEndpoint)) {
+      logger.info(`Reusing project-owned debug Chrome on port ${ownedEndpoint.port}`);
+      return ownedEndpoint.port;
+    }
+    // Do not delete a stale-looking file here: another VS Code window for the
+    // same project may have just launched this profile and not exposed
+    // /json/version yet. Chrome overwrites DevToolsActivePort on a fresh start,
+    // and the readiness loop re-reads and verifies both port and browser id.
+  }
+
+  const execPath = chromePath ?? findChromePath();
+  if (!execPath) {
+    throw new Error('Chrome not found. Please install Chrome or specify the path.');
+  }
+
+  const portArgument = requestedPort ?? 0;
+  const args = [
+    `--remote-debugging-port=${portArgument}`,
+    `--user-data-dir=${userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    url,
+  ];
+
+  logger.info(`Launching project-owned debug Chrome with remote-debugging port ${portArgument || 'leased'}`);
+
+  const proc = childProcess.spawn(execPath, args, {
+    detached: true,
+    stdio: 'ignore',
+  });
+  let spawnError: Error | undefined;
+  proc.once('error', (error) => { spawnError = error; });
+  proc.unref();
+
+  const deadline = Date.now() + DEBUG_CHROME_START_TIMEOUT_MS;
+  let activePort = requestedPort;
+  let delay = 100;
+  while (Date.now() < deadline) {
+    if (spawnError) {
+      throw new Error(`Could not launch isolated debug Chrome: ${spawnError.message}`);
+    }
+    if (requestedPort === undefined) {
+      const endpoint = readDevToolsActiveEndpoint(userDataDir);
+      activePort = endpoint?.port;
+      if (endpoint && await isOwnedChromeEndpoint(endpoint)) {
+        logger.info(`Project-owned debug Chrome ready on leased port ${endpoint.port}`);
+        return endpoint.port;
+      }
+    } else if (activePort !== undefined) {
+      const targets = await listChromeTargets(activePort);
+      if (targets.length > 0) {
+        logger.info(`Isolated debug Chrome ready on port ${activePort}, ${targets.length} tab(s)`);
+        return activePort;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(delay * 2, 1000);
+  }
+
+  try {
+    if (!proc.killed) proc.kill();
+  } catch {
+    // The detached launcher may already have exited. Preserve the actionable
+    // readiness timeout below instead of replacing it with ESRCH/EPERM.
+  }
+  const detail = activePort === undefined
+    ? 'Chrome did not publish a leased DevTools port'
+    : `Chrome did not expose a page target on port ${activePort}`;
+  throw new Error(`${detail} within ${DEBUG_CHROME_START_TIMEOUT_MS / 1000}s`);
+}
+
 /**
  * Launch a debug-enabled Chrome instance.
  *
@@ -255,7 +442,7 @@ export async function launchDebugChrome(
   // Wait for debug port to be ready. Exponential backoff up to ~15s total —
   // catches fast starts (~300ms on warm disk) without burning CPU on long
   // polls, and fails faster than the old fixed 500ms × 40 probe.
-  const deadline = Date.now() + 15_000;
+  const deadline = Date.now() + DEBUG_CHROME_START_TIMEOUT_MS;
   let delay = 100;
   while (Date.now() < deadline) {
     try {

@@ -16,7 +16,7 @@ import {
   type Response,
 } from 'playwright-core';
 import { z } from 'zod';
-import { BridgeClient, type BridgeSessionMetadata } from './BridgeClient';
+import { BridgeClient, BridgeRpcError, type BridgeSessionMetadata } from './BridgeClient';
 import { localOriginsEquivalent } from '../util/LocalHosts';
 
 const MAX_EVENT_HISTORY = 500;
@@ -34,6 +34,7 @@ const MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_UPLOAD_TOTAL_BYTES = 25 * 1024 * 1024;
 const MAX_TRACE_BYTES = 100 * 1024 * 1024;
 const MAX_TRACE_DURATION_MS = 5 * 60_000;
+const DEBUG_START_CLEANUP_TIMEOUT_MS = 1_000;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -81,7 +82,7 @@ interface NetworkEntry {
 
 interface PageState {
   capturedSince: string;
-  viteUrl: string;
+  pageUrl: string;
   console: ConsoleEntry[];
   network: NetworkEntry[];
   dispose: () => void;
@@ -93,7 +94,7 @@ interface TraceState {
   startedAt: string;
   startedAtMs: number;
   targetIds: string[];
-  viteUrl: string;
+  pageUrl: string;
   timer?: NodeJS.Timeout;
   guards: Array<() => void>;
   invalidReason?: string;
@@ -177,6 +178,227 @@ type WaitCondition = z.infer<typeof waitConditionSchema>;
 
 export function registerMcpTools(server: McpServer, bridge: BridgeClient): McpToolsRegistration {
   const browser = new BrowserController();
+
+  server.registerTool('debug_start', {
+    title: 'Start Vite debugging',
+    description:
+      'Starts a Vite debug session in this project\'s VS Code window without UI interaction. ' +
+      'A matching launch.json configuration is used with its preLaunchTask; when none exists, a safe generated ' +
+      'launch configuration attaches to an already-running Vite server. Reuses an active session. ' +
+      'When several Vite servers use the same project sources, pass their local origin as viteUrl. ' +
+      'When another local server renders the browser app, pass that route as pageUrl.',
+    inputSchema: {
+      configurationName: z.string().min(1).max(200).optional().describe(
+        'Exact name of a type=vite launch configuration. Omit to prefer "Debug Vite App" or the only Vite configuration.',
+      ),
+      viteUrl: z.string().min(1).max(MAX_URL_CHARS).optional().describe(
+        'Optional local Vite origin, for example https://alphac:3004. It must resolve exclusively to loopback; paths and credentials are rejected.',
+      ),
+      pageUrl: z.string().min(1).max(MAX_URL_CHARS).optional().describe(
+        'Optional local browser application URL when the rendered page is served separately from Vite, for example http://alphac:8004/app.',
+      ),
+      timeoutMs: z.number().int().min(1_000).max(120_000).optional().default(30_000).describe(
+        'Hard limit for discovery, start, adapter connection, and launch-page readiness.',
+      ),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  }, (args) => safely(async () => {
+    const deadline = Date.now() + args.timeoutMs;
+    const existing = await beforeDeadline(
+      () => listSessions(bridge),
+      deadline,
+      'list Vite debug sessions before starting',
+    );
+    if (existing.length > 1) {
+      return jsonResult({
+        workspace: bridge.workspace,
+        started: false,
+        reused: true,
+        selectionRequired: true,
+        sessions: existing,
+      });
+    }
+    if (existing.length === 1) {
+      const activeConfigurationName = typeof existing[0].name === 'string'
+        ? existing[0].name
+        : undefined;
+      if (args.configurationName && activeConfigurationName !== args.configurationName) {
+        return jsonErrorResult({
+          workspace: bridge.workspace,
+          started: false,
+          reused: false,
+          ready: false,
+          state: 'conflict',
+          message:
+            `An active Vite debug session uses configuration ` +
+            `${activeConfigurationName ? boundedText(activeConfigurationName, 200) : '(unknown)'}, ` +
+            `not the requested ${args.configurationName}. ` +
+            'Stop that session before starting another configuration.',
+        });
+      }
+      const reusedStart: UnknownRecord = {
+        accepted: false,
+        reused: true,
+        request: existing[0].request === 'attach' ? 'attach' : 'launch',
+        ...(typeof existing[0].startOperationId === 'string'
+          ? { operationId: existing[0].startOperationId }
+          : {}),
+      };
+      const ready = await waitForStartedDebugSession(bridge, reusedStart, deadline);
+      if (ready.failure) {
+        return jsonErrorResult({
+          workspace: bridge.workspace,
+          started: false,
+          reused: true,
+          ready: false,
+          state: ready.failure.state,
+          message: ready.failure.message,
+        });
+      }
+      if (ready.timedOut) {
+        const cleanup = await cancelTimedOutCorrelatedDebugStart(
+          bridge,
+          reusedStart,
+          ready.sessions,
+        );
+        if (cleanup?.cancelled) {
+          return jsonErrorResult({
+            workspace: bridge.workspace,
+            started: false,
+            reused: true,
+            ready: false,
+            state: 'terminated',
+            cleanup,
+            message: cleanup.message ??
+              'Stopped the correlated Vite debug session after adapter readiness timed out.',
+          });
+        }
+        return jsonResult({
+          workspace: bridge.workspace,
+          started: false,
+          reused: true,
+          ready: false,
+          state: 'starting',
+          sessions: ready.sessions,
+          message: 'The existing Vite debug session is still connecting. Call debug_status before retrying.',
+          ...(cleanup ? { cleanup } : {}),
+          ...(ready.lastError ? { lastError: ready.lastError } : {}),
+        });
+      }
+      if (!ready.selected) {
+        return jsonResult({
+          workspace: bridge.workspace,
+          started: false,
+          reused: true,
+          selectionRequired: true,
+          sessions: ready.sessions,
+        });
+      }
+      if (args.viteUrl) {
+        const activeViteUrl = readString(
+          ready.selected.status,
+          ['viteUrl'],
+          ['config', 'viteUrl'],
+          ['browser', 'viteUrl'],
+        );
+        if (!activeViteUrl || !urlsHaveSameOrigin(args.viteUrl, activeViteUrl)) {
+          return jsonErrorResult({
+            workspace: bridge.workspace,
+            started: false,
+            reused: false,
+            ready: false,
+            state: 'conflict',
+            message:
+              `An active Vite debug session uses ${activeViteUrl ?? 'an unknown Vite URL'}, ` +
+              `not the requested ${args.viteUrl}. Stop that session before starting another URL.`,
+          });
+        }
+      }
+      if (args.pageUrl) {
+        const activePageUrl = browserPageUrl(ready.selected.status);
+        if (!activePageUrl || !urlsReferToSamePage(args.pageUrl, activePageUrl)) {
+          return jsonErrorResult({
+            workspace: bridge.workspace,
+            started: false,
+            reused: false,
+            ready: false,
+            state: 'conflict',
+            message:
+              `An active Vite debug session uses ${activePageUrl ?? 'an unknown browser page URL'}, ` +
+              `not the requested ${args.pageUrl}. Stop that session before starting another page URL.`,
+          });
+        }
+      }
+      const conflict = debugStartSelectionConflict(bridge, args, reusedStart, ready.selected);
+      return conflict ?? readyDebugStartResult(bridge, reusedStart, ready.selected);
+    }
+
+    const rawStart = await beforeDeadline(
+      () => bridge.startDebugging<unknown>({
+        operationId: crypto.randomUUID(),
+        ...(args.configurationName ? { configurationName: args.configurationName } : {}),
+        ...(args.viteUrl ? { viteUrl: args.viteUrl } : {}),
+        ...(args.pageUrl ? { pageUrl: args.pageUrl } : {}),
+      }),
+      deadline,
+      'ask VS Code to start Vite debugging',
+    );
+    const start = publicDebugStart(rawStart);
+    const ready = await waitForStartedDebugSession(bridge, start, deadline);
+    if (ready.failure) {
+      return jsonErrorResult({
+        workspace: bridge.workspace,
+        started: false,
+        reused: start.reused === true,
+        ready: false,
+        state: ready.failure.state,
+        start,
+        message: ready.failure.message,
+      });
+    }
+    if (ready.timedOut) {
+      const cleanup = await cancelTimedOutCorrelatedDebugStart(bridge, start, ready.sessions);
+      if (cleanup?.cancelled) {
+        return jsonErrorResult({
+          workspace: bridge.workspace,
+          started: start.reused !== true,
+          reused: start.reused === true,
+          ready: false,
+          state: 'terminated',
+          start,
+          cleanup,
+          message: cleanup.message ??
+            'Stopped the correlated Vite debug session after adapter readiness timed out.',
+        });
+      }
+      return jsonResult({
+        workspace: bridge.workspace,
+        started: start.reused !== true,
+        reused: start.reused === true,
+        ready: false,
+        state: 'starting',
+        start,
+        sessions: ready.sessions,
+        message:
+          'No connected Vite session is ready yet. A configured preLaunchTask may still be starting. ' +
+          'Call debug_status before retrying; if no preLaunchTask is configured, start the Vite dev server first.',
+        ...(cleanup ? { cleanup } : {}),
+        ...(ready.lastError ? { lastError: ready.lastError } : {}),
+      });
+    }
+    if (!ready.selected) {
+      return jsonResult({
+        workspace: bridge.workspace,
+        started: true,
+        reused: start.reused === true,
+        selectionRequired: true,
+        sessions: ready.sessions,
+        start,
+      });
+    }
+    const conflict = debugStartSelectionConflict(bridge, args, start, ready.selected);
+    return conflict ?? readyDebugStartResult(bridge, start, ready.selected);
+  }));
 
   server.registerTool('debug_status', {
     title: 'Vite debugger status',
@@ -311,14 +533,16 @@ export function registerMcpTools(server: McpServer, bridge: BridgeClient): McpTo
     const selected = await selectSession(bridge, args.sessionId);
     const pages = await browser.pagesForStatus(selected.status);
     const viteUrl = readString(selected.status, ['viteUrl'], ['config', 'viteUrl'], ['browser', 'viteUrl']);
+    const pageUrl = browserPageUrl(selected.status);
     return jsonResult({
       sessionId: selected.sessionId,
       viteUrl: viteUrl ? sanitizeBrowserUrl(viteUrl) : undefined,
+      pageUrl: pageUrl ? sanitizeBrowserUrl(pageUrl) : undefined,
       pages: pages.map(({ targetId, url, title }) => ({
         targetId,
         url,
         title,
-        matchesViteApp: viteUrl ? urlMatchesVite(url, viteUrl) : undefined,
+        matchesViteApp: pageUrl ? urlMatchesBrowserApp(url, pageUrl) : undefined,
       })),
     });
   }));
@@ -384,17 +608,12 @@ export function registerMcpTools(server: McpServer, bridge: BridgeClient): McpTo
     let destination: string;
 
     if (!args.targetId && managedTargets(selected.status).length === 0) {
-      const viteUrl = readString(
-        selected.status,
-        ['viteUrl'],
-        ['config', 'viteUrl'],
-        ['browser', 'viteUrl'],
-      );
-      if (!viteUrl) {
-        throw new Error('The selected debug session did not report its Vite application URL');
+      const pageUrl = browserPageUrl(selected.status);
+      if (!pageUrl) {
+        throw new Error('The selected debug session did not report its browser application URL');
       }
       // Reject unsafe destinations before asking the adapter to create a tab.
-      destination = sameOriginDestination(args.url, viteUrl, selected.status);
+      destination = sameOriginDestination(args.url, pageUrl, selected.status);
       if (!args.openIfMissing) {
         throw new Error(
           'No managed Vite page is open. Retry browser_navigate with openIfMissing=true or open the Vite URL in debug Chrome.',
@@ -761,19 +980,19 @@ class BrowserController {
       this.clearPageStates();
       return [];
     }
-    const viteUrl = readString(status, ['viteUrl'], ['config', 'viteUrl'], ['browser', 'viteUrl']);
-    if (!viteUrl) {
+    const pageUrl = browserPageUrl(status);
+    if (!pageUrl) {
       this.clearPageStates();
-      throw new Error('The selected debug session did not report its Vite application URL');
+      throw new Error('The selected debug session did not report its browser application URL');
     }
     const port = chromePortFromStatus(status);
     const browser = await this.ensureConnected(port);
     const pages = browser.contexts().flatMap((context) => context.pages()).filter((page) => !page.isClosed());
     const descriptions = (await this.describePages(pages))
       .filter((page) =>
-        allowedTargetIds.has(page.targetId) && urlMatchesVite(page.page.url(), viteUrl)
+        allowedTargetIds.has(page.targetId) && urlMatchesBrowserApp(page.page.url(), pageUrl)
       );
-    this.reconcilePageStates(descriptions, viteUrl);
+    this.reconcilePageStates(descriptions, pageUrl);
     return descriptions.sort((left, right) => left.targetId.localeCompare(right.targetId));
   }
 
@@ -833,10 +1052,10 @@ class BrowserController {
       }
       case 'url': {
         const expected = condition.match === 'exact'
-          ? sameOriginDestination(condition.value, page.url(), { viteUrl: state.viteUrl })
+          ? sameOriginDestination(condition.value, page.url(), { pageUrl: state.pageUrl })
           : undefined;
         await page.waitForURL((url) => {
-          if (!urlMatchesVite(url.href, state.viteUrl)) return false;
+          if (!urlMatchesBrowserApp(url.href, state.pageUrl)) return false;
           const sanitized = sanitizeBrowserUrl(url.href);
           return condition.match === 'exact'
             ? sanitized === sanitizeBrowserUrl(expected!)
@@ -945,13 +1164,13 @@ class BrowserController {
     }
     const context = selected.page.context();
     const allowedTargetIds = managedTargetIds(status);
-    const viteUrl = readString(status, ['viteUrl'], ['config', 'viteUrl'], ['browser', 'viteUrl']);
-    if (!viteUrl) throw new Error('The selected debug session did not report its Vite application URL');
+    const pageUrl = browserPageUrl(status);
+    if (!pageUrl) throw new Error('The selected debug session did not report its browser application URL');
     const descriptions = await this.describePages(
       context.pages().filter((page) => !page.isClosed()),
     );
     const unmanaged = descriptions.filter((page) =>
-      !allowedTargetIds.has(page.targetId) || !urlMatchesVite(page.url, viteUrl));
+      !allowedTargetIds.has(page.targetId) || !urlMatchesBrowserApp(page.url, pageUrl));
     if (unmanaged.length > 0) {
       throw new Error(
         'Trace recording is blocked because the Chrome context contains a page outside this managed Vite app: ' +
@@ -966,7 +1185,7 @@ class BrowserController {
       startedAt: new Date(startedAtMs).toISOString(),
       startedAtMs,
       targetIds: descriptions.map((page) => page.targetId).sort(),
-      viteUrl,
+      pageUrl,
       guards: [],
     };
     this.installTraceGuards(trace, context.pages().filter((page) => !page.isClosed()));
@@ -1156,7 +1375,7 @@ class BrowserController {
   private installTraceGuards(trace: TraceState, pages: readonly Page[]): void {
     const watchPage = (page: Page) => {
       const onFrameNavigated = (frame: Frame) => {
-        if (frame !== page.mainFrame() || urlMatchesVite(frame.url(), trace.viteUrl)) return;
+        if (frame !== page.mainFrame() || urlMatchesBrowserApp(frame.url(), trace.pageUrl)) return;
         trace.invalidReason ??=
           `a traced page navigated outside the managed Vite app (${sanitizeBrowserUrl(frame.url())})`;
       };
@@ -1186,19 +1405,19 @@ class BrowserController {
     );
     const originalTargets = new Set(trace.targetIds);
     const unexpected = descriptions.find((page) =>
-      !originalTargets.has(page.targetId) || !urlMatchesVite(page.url, trace.viteUrl));
+      !originalTargets.has(page.targetId) || !urlMatchesBrowserApp(page.url, trace.pageUrl));
     if (unexpected) {
       trace.invalidReason ??=
         `the traced context contains an unexpected page (${unexpected.targetId}, ${unexpected.url})`;
     }
   }
 
-  private reconcilePageStates(pages: PageDescription[], viteUrl: string): void {
+  private reconcilePageStates(pages: PageDescription[], pageUrl: string): void {
     const allowedPages = new Set(pages.map(({ page }) => page));
     for (const page of this.states.keys()) {
       if (!allowedPages.has(page)) this.unwatchPage(page);
     }
-    for (const { page } of pages) this.watchPage(page, viteUrl);
+    for (const { page } of pages) this.watchPage(page, pageUrl);
   }
 
   private clearPageStates(): void {
@@ -1212,15 +1431,15 @@ class BrowserController {
     state.dispose();
   }
 
-  private watchPage(page: Page, viteUrl: string): PageState {
+  private watchPage(page: Page, pageUrl: string): PageState {
     const existing = this.states.get(page);
     if (existing) {
-      existing.viteUrl = viteUrl;
+      existing.pageUrl = pageUrl;
       return existing;
     }
     const state: PageState = {
       capturedSince: new Date().toISOString(),
-      viteUrl,
+      pageUrl,
       console: [],
       network: [],
       dispose: () => undefined,
@@ -1253,7 +1472,7 @@ class BrowserController {
       if (
         request.isNavigationRequest() &&
         request.frame() === page.mainFrame() &&
-        !urlMatchesVite(request.url(), state.viteUrl)
+        !urlMatchesBrowserApp(request.url(), state.pageUrl)
       ) {
         this.unwatchPage(page);
         return;
@@ -1296,7 +1515,7 @@ class BrowserController {
       });
     };
     const onFrameNavigated = (frame: Frame) => {
-      if (frame === page.mainFrame() && !urlMatchesVite(frame.url(), state.viteUrl)) {
+      if (frame === page.mainFrame() && !urlMatchesBrowserApp(frame.url(), state.pageUrl)) {
         this.unwatchPage(page);
       }
     };
@@ -1378,6 +1597,320 @@ async function listSessions(bridge: BridgeClient): Promise<BridgeSessionMetadata
   });
 }
 
+function publicDebugStart(raw: unknown): UnknownRecord {
+  if (!isRecord(raw)) return {};
+  const result: UnknownRecord = {};
+  if (typeof raw.accepted === 'boolean') result.accepted = raw.accepted;
+  if (typeof raw.reused === 'boolean') result.reused = raw.reused;
+  if (raw.state === 'starting') result.state = raw.state;
+  if (typeof raw.configurationName === 'string') {
+    result.configurationName = boundedText(raw.configurationName, 200);
+  }
+  if (typeof raw.operationId === 'string' && /^[0-9a-f-]{36}$/i.test(raw.operationId)) {
+    result.operationId = raw.operationId;
+  }
+  if (raw.source === 'workspace' || raw.source === 'generated') result.source = raw.source;
+  if (raw.request === 'launch' || raw.request === 'attach') result.request = raw.request;
+  if (typeof raw.preLaunchTask === 'boolean') result.preLaunchTask = raw.preLaunchTask;
+  if (typeof raw.viteUrl === 'string') result.viteUrl = sanitizeBrowserUrl(raw.viteUrl);
+  if (typeof raw.pageUrl === 'string') result.pageUrl = sanitizeBrowserUrl(raw.pageUrl);
+  return result;
+}
+
+function debugStartSelectionConflict(
+  bridge: BridgeClient,
+  requested: { configurationName?: string; viteUrl?: string; pageUrl?: string },
+  start: UnknownRecord,
+  selected: SelectedSession,
+): CallToolResult | undefined {
+  const reused = start.reused === true;
+  const activeConfigurationName = typeof selected.metadata.name === 'string'
+    ? boundedText(selected.metadata.name, 200)
+    : undefined;
+  if (requested.configurationName && activeConfigurationName !== requested.configurationName) {
+    return jsonErrorResult({
+      workspace: bridge.workspace,
+      started: !reused,
+      reused,
+      ready: false,
+      state: 'conflict',
+      message:
+        `The selected Vite session uses configuration ${activeConfigurationName ?? '(unknown)'}, ` +
+        `not the requested ${requested.configurationName}. Stop that session before retrying.`,
+    });
+  }
+
+  if (requested.viteUrl) {
+    const activeViteUrl = readString(
+      selected.status,
+      ['viteUrl'],
+      ['config', 'viteUrl'],
+      ['browser', 'viteUrl'],
+    );
+    if (!activeViteUrl || !urlsHaveSameOrigin(requested.viteUrl, activeViteUrl)) {
+      return jsonErrorResult({
+        workspace: bridge.workspace,
+        started: !reused,
+        reused,
+        ready: false,
+        state: 'conflict',
+        message:
+          `The selected Vite session uses ${activeViteUrl ?? 'an unknown Vite URL'}, ` +
+          `not the requested ${requested.viteUrl}. Stop that session before retrying.`,
+      });
+    }
+  }
+
+  if (requested.pageUrl) {
+    const activePageUrl = browserPageUrl(selected.status);
+    if (!activePageUrl || !urlsReferToSamePage(requested.pageUrl, activePageUrl)) {
+      return jsonErrorResult({
+        workspace: bridge.workspace,
+        started: !reused,
+        reused,
+        ready: false,
+        state: 'conflict',
+        message:
+          `The selected Vite session uses ${activePageUrl ?? 'an unknown browser page URL'}, ` +
+          `not the requested ${requested.pageUrl}. Stop that session before retrying.`,
+      });
+    }
+  }
+  return undefined;
+}
+
+async function cancelTimedOutCorrelatedDebugStart(
+  bridge: BridgeClient,
+  start: UnknownRecord,
+  sessions: readonly BridgeSessionMetadata[],
+): Promise<UnknownRecord | undefined> {
+  const operationId = typeof start.operationId === 'string' && /^[0-9a-f-]{36}$/i.test(start.operationId)
+    ? start.operationId
+    : undefined;
+  if (!operationId || !sessions.some((session) => session.startOperationId === operationId)) {
+    return undefined;
+  }
+
+  try {
+    const raw = await beforeDeadline(
+      () => bridge.cancelDebugStart<unknown>(operationId),
+      Date.now() + DEBUG_START_CLEANUP_TIMEOUT_MS,
+      'stop the timed-out correlated Vite debug session',
+    );
+    if (!isRecord(raw)) return { attempted: true, cancelled: false };
+    return {
+      attempted: true,
+      cancelled: raw.cancelled === true,
+      ...(raw.state === 'starting' || raw.state === 'accepted' ||
+          raw.state === 'declined' || raw.state === 'failed' ||
+          raw.state === 'terminated' || raw.state === 'unknown'
+        ? { state: raw.state }
+        : {}),
+      ...(typeof raw.reason === 'string'
+        ? { reason: boundedText(raw.reason, 200) }
+        : {}),
+      ...(typeof raw.message === 'string'
+        ? { message: boundedText(raw.message, MAX_ERROR_TEXT_CHARS) }
+        : {}),
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      cancelled: false,
+      error: boundedText(error instanceof Error ? error.message : String(error), MAX_ERROR_TEXT_CHARS),
+    };
+  }
+}
+
+function readyDebugStartResult(
+  bridge: BridgeClient,
+  start: UnknownRecord,
+  selected: SelectedSession,
+): CallToolResult {
+  const status = publicDebugStatus(selected.status);
+  const request = start.request === 'attach' || selected.metadata.request === 'attach'
+    ? 'attach'
+    : 'launch';
+  const noManagedTarget = managedTargets(selected.status).length === 0;
+  return jsonResult({
+    workspace: bridge.workspace,
+    started: start.reused !== true,
+    reused: start.reused === true,
+    ready: true,
+    start,
+    sessionId: selected.sessionId,
+    metadata: selected.metadata,
+    ...status,
+    ...(noManagedTarget ? {
+      message:
+        request === 'attach'
+          ? 'The attach session is connected but has no managed Vite page yet. ' +
+            'Call browser_navigate to open and attach the project Vite page.'
+          : 'The launch session is connected but no managed Vite page is open. ' +
+            'Call browser_navigate to reopen and attach the project Vite page.',
+    } : {}),
+  });
+}
+
+async function waitForStartedDebugSession(
+  bridge: BridgeClient,
+  start: UnknownRecord,
+  deadline: number,
+): Promise<{
+  sessions: BridgeSessionMetadata[];
+  selected?: SelectedSession;
+  failure?: { state: 'declined' | 'failed' | 'terminated'; message: string };
+  timedOut?: boolean;
+  lastError?: string;
+}> {
+  const operationId = typeof start.operationId === 'string' ? start.operationId : undefined;
+  const request = start.request === 'attach' ? 'attach' : 'launch';
+  const recoveredTargets = new Set<string>();
+  let lastError: unknown;
+  let sessions: BridgeSessionMetadata[] = [];
+  while (Date.now() < deadline) {
+    try {
+      sessions = await beforeDeadline(
+        () => listSessions(bridge),
+        deadline,
+        'list Vite debug sessions',
+      );
+    } catch (error) {
+      lastError = error;
+      break;
+    }
+    // An unrelated/manual session can appear while VS Code runs a preLaunchTask.
+    // When this start has a correlation token, selecting no session is safer
+    // than attaching browser control to the wrong project/session.
+    const candidates = operationId
+      ? sessions.filter((session) => session.startOperationId === operationId)
+      : sessions;
+    if (candidates.length > 1) return { sessions: candidates };
+    if (candidates.length === 1) {
+      try {
+        const selected = await beforeDeadline(
+          () => selectSession(bridge, candidates[0].sessionId, sessions),
+          deadline,
+          'read Vite debug status',
+        );
+        const connected = readUnknown(
+          selected.status,
+          ['connected'],
+          ['browser', 'connected'],
+          ['debugger', 'connected'],
+        ) === true;
+        const launchTargetReady = request === 'attach' || managedTargets(selected.status).length > 0;
+        if (connected && launchTargetReady) return { sessions: candidates, selected };
+        if (connected && request === 'launch' && start.reused === true) {
+          if (recoveredTargets.has(selected.sessionId)) {
+            // The debugger itself is usable even if tab recreation did not
+            // become visible in status yet; browser_navigate can retry the
+            // same narrow recovery request and reports an actionable error.
+            return { sessions: candidates, selected };
+          }
+          recoveredTargets.add(selected.sessionId);
+          try {
+            await beforeDeadline(
+              () => bridge.sessionRequest(selected.sessionId, 'ensureBrowserTarget', {}),
+              deadline,
+              'reopen the Vite browser target',
+            );
+          } catch (error) {
+            lastError = error;
+          }
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (operationId) {
+      try {
+        const operation = publicDebugStartOperation(
+          await beforeDeadline(
+            () => bridge.debugStartStatus<unknown>(operationId),
+            deadline,
+            'read Vite debug start status',
+          ),
+        );
+        if (operation.state === 'declined' || operation.state === 'failed' ||
+            operation.state === 'terminated') {
+          return {
+            sessions: candidates,
+            failure: {
+              state: operation.state,
+              message: operation.message ?? 'VS Code did not start the Vite debug configuration',
+            },
+          };
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await delay(Math.min(100, remaining));
+  }
+
+  return {
+    sessions,
+    timedOut: true,
+    ...(lastError instanceof Error ? { lastError: boundedText(lastError.message, MAX_ERROR_TEXT_CHARS) } : {}),
+  };
+}
+
+function beforeDeadline<T>(operation: () => Promise<T>, deadline: number, description: string): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    return Promise.reject(new Error(`Timed out while attempting to ${description}`));
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`Timed out while attempting to ${description}`));
+    }, remaining);
+    let pending: Promise<T>;
+    try {
+      pending = operation();
+    } catch (error) {
+      clearTimeout(timer);
+      settled = true;
+      reject(error);
+      return;
+    }
+    pending.then((value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    }, (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+function publicDebugStartOperation(raw: unknown): {
+  state?: 'starting' | 'accepted' | 'declined' | 'failed' | 'terminated' | 'unknown';
+  message?: string;
+} {
+  if (!isRecord(raw)) return {};
+  const state = raw.state === 'starting' || raw.state === 'accepted' ||
+    raw.state === 'declined' || raw.state === 'failed' || raw.state === 'terminated' ||
+    raw.state === 'unknown'
+    ? raw.state
+    : undefined;
+  return {
+    ...(state ? { state } : {}),
+    ...(typeof raw.message === 'string'
+      ? { message: boundedText(raw.message, MAX_ERROR_TEXT_CHARS) }
+      : {}),
+  };
+}
+
 async function selectSession(
   bridge: BridgeClient,
   requestedSessionId?: string,
@@ -1386,7 +1919,7 @@ async function selectSession(
   const sessions = knownSessions ?? await listSessions(bridge);
   if (sessions.length === 0) {
     throw new Error(
-      'No active Vite debug session exists in this VS Code window. Start Vite Debugger, then retry.',
+      'No active Vite debug session exists in this VS Code window. Call debug_start, then retry.',
     );
   }
 
@@ -1835,8 +2368,7 @@ function normalizeAriaRef(value: string): string {
 }
 
 function sameOriginDestination(input: string, currentUrl: string, status: UnknownRecord): string {
-  const viteUrl = readString(status, ['viteUrl'], ['config', 'viteUrl'], ['browser', 'viteUrl']);
-  const base = viteUrl || currentUrl;
+  const base = browserPageUrl(status) || currentUrl;
   let destination: URL;
   let allowed: URL;
   try {
@@ -1847,26 +2379,49 @@ function sameOriginDestination(input: string, currentUrl: string, status: Unknow
   }
   if (!sameOrigin(destination, allowed)) {
     throw new Error(
-      `Cross-origin navigation is disabled: ${destination.origin} does not match Vite origin ${allowed.origin}.`,
+      `Cross-origin navigation is disabled: ${destination.origin} does not match browser app origin ${allowed.origin}.`,
     );
   }
   return destination.href;
 }
 
-function urlMatchesVite(pageUrl: string, viteUrl: string): boolean {
+function browserPageUrl(status: UnknownRecord): string | undefined {
+  return readString(status, ['pageUrl'], ['config', 'pageUrl'], ['browser', 'pageUrl']) ??
+    readString(status, ['viteUrl'], ['config', 'viteUrl'], ['browser', 'viteUrl']);
+}
+
+function urlMatchesBrowserApp(pageUrl: string, appUrl: string): boolean {
   try {
     const page = new URL(pageUrl);
-    const vite = new URL(viteUrl);
-    if (!sameOrigin(page, vite)) return false;
-    const basePath = vite.pathname.endsWith('/') ? vite.pathname : `${vite.pathname}/`;
-    return vite.pathname === '/' || page.pathname === vite.pathname || page.pathname.startsWith(basePath);
+    const app = new URL(appUrl);
+    return sameOrigin(page, app);
   } catch {
-    return pageUrl === viteUrl || pageUrl.startsWith(viteUrl.endsWith('/') ? viteUrl : `${viteUrl}/`);
+    return pageUrl === appUrl || pageUrl.startsWith(appUrl.endsWith('/') ? appUrl : `${appUrl}/`);
   }
 }
 
 function sameOrigin(left: URL, right: URL): boolean {
   return localOriginsEquivalent(left, right);
+}
+
+function urlsHaveSameOrigin(left: string, right: string): boolean {
+  try {
+    return sameOrigin(new URL(left), new URL(right));
+  } catch {
+    return false;
+  }
+}
+
+function urlsReferToSamePage(left: string, right: string): boolean {
+  try {
+    const leftUrl = new URL(left);
+    const rightUrl = new URL(right);
+    const normalizedPath = (value: string) => value.replace(/\/+$/, '') || '/';
+    return sameOrigin(leftUrl, rightUrl) &&
+      normalizedPath(leftUrl.pathname) === normalizedPath(rightUrl.pathname);
+  } catch {
+    return left === right;
+  }
 }
 
 function sanitizeBrowserUrl(value: string): string {
@@ -1900,6 +2455,7 @@ function boundedText(value: string, maxChars: number): string {
 function publicDebugStatus(status: UnknownRecord): UnknownRecord {
   const result: UnknownRecord = { ...status };
   if (typeof result.viteUrl === 'string') result.viteUrl = sanitizeBrowserUrl(result.viteUrl);
+  if (typeof result.pageUrl === 'string') result.pageUrl = sanitizeBrowserUrl(result.pageUrl);
   if (Array.isArray(result.targets)) {
     result.targets = result.targets.slice(0, MAX_MANAGED_TARGETS).map((target) => {
       if (!isRecord(target)) return target;
@@ -1945,6 +2501,10 @@ function jsonResult(value: unknown): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
 }
 
+function jsonErrorResult(value: unknown): CallToolResult {
+  return { ...jsonResult(value), isError: true };
+}
+
 async function safely(operation: () => Promise<CallToolResult>): Promise<CallToolResult> {
   try {
     return await operation();
@@ -1957,7 +2517,22 @@ async function safely(operation: () => Promise<CallToolResult>): Promise<CallToo
 }
 
 function errorMessage(error: unknown): string {
-  return boundedText(error instanceof Error ? error.message : String(error), MAX_ERROR_TEXT_CHARS);
+  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof BridgeRpcError && isRecord(error.data)) {
+    const available = Array.isArray(error.data.availableConfigurations)
+      ? error.data.availableConfigurations
+        .filter((value): value is string => typeof value === 'string')
+        .slice(0, 50)
+        .map((value) => boundedText(value.replace(/[\x00-\x1f\x7f]/g, ' '), 200))
+      : [];
+    if (available.length > 0) {
+      return boundedText(
+        `${message}. Available Vite configurations: ${available.join(', ')}`,
+        MAX_ERROR_TEXT_CHARS,
+      );
+    }
+  }
+  return boundedText(message, MAX_ERROR_TEXT_CHARS);
 }
 
 function isRecord(value: unknown): value is UnknownRecord {

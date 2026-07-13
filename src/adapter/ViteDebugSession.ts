@@ -18,6 +18,7 @@ import {
   isChromeDebuggable,
   findExistingChromeDebugPort,
   launchDebugChrome,
+  launchManagedDebugChrome,
 } from '../cdp/ChromeDiscovery';
 import { detectFirstViteServer, formatViteServerInfo, ViteServerInfo } from '../vite/ViteServerDetector';
 import { ViteUrlMapper } from '../vite/ViteUrlMapper';
@@ -52,6 +53,14 @@ function compileGlob(pattern: string): RegExp {
 
 interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
   viteUrl?: string;
+  /** Browser application page. May use a different local origin from the Vite module server. */
+  pageUrl?: string;
+  /** Internal marker on MCP-generated configs; never exposed as a public launch option. */
+  _viteDebuggerMcpRequireWorkspaceMatch?: boolean;
+  /** Correlates MCP starts and distinguishes schema defaults from launch.json values. */
+  _viteDebuggerMcpStartId?: string;
+  /** True only when chromePort was an own property of the selected launch config. */
+  _viteDebuggerMcpChromePortExplicit?: boolean;
   chromePort?: number;
   webRoot?: string;
   sourceMapPathOverrides?: Record<string, string>;
@@ -61,6 +70,10 @@ interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
 
 interface AttachRequestArguments extends DebugProtocol.AttachRequestArguments {
   viteUrl?: string;
+  /** Browser application page. May use a different local origin from the Vite module server. */
+  pageUrl?: string;
+  /** Internal marker on MCP-generated configs; never exposed as a public launch option. */
+  _viteDebuggerMcpRequireWorkspaceMatch?: boolean;
   chromePort?: number;
   webRoot?: string;
   sourceMapPathOverrides?: Record<string, string>;
@@ -237,21 +250,38 @@ export class ViteDebugSession extends LoggingDebugSession {
   ): Promise<void> {
     try {
       const webRoot = args.webRoot || process.cwd();
-      const chromePort = args.chromePort || 9222;
+      const mcpStarted = typeof args._viteDebuggerMcpStartId === 'string';
+      const chromePortIsExplicit = args._viteDebuggerMcpChromePortExplicit ?? (
+        !mcpStarted && args.chromePort !== undefined
+      );
+      const requestedChromePort = chromePortIsExplicit
+        ? this.validateOptionalChromePort(args.chromePort)
+        : undefined;
       this.skipFileRegexes = (args.skipFiles ?? []).map(compileGlob);
       this.reloadOnAttach = args.reloadOnAttach ?? false;
 
       // Step 1: Detect Vite server
-      this.viteServer = await detectFirstViteServer(args.viteUrl);
+      this.viteServer = await detectFirstViteServer(
+        args.viteUrl,
+        webRoot,
+        args._viteDebuggerMcpRequireWorkspaceMatch === true,
+      );
       if (!this.viteServer) {
-        this.sendErrorResponse(response, 1001, 'No running Vite dev server found. Start Vite first with `npm run dev`.');
+        this.sendErrorResponse(
+          response,
+          1001,
+          `No unambiguous running Vite dev server found for webRoot "${webRoot}". ` +
+          'Start Vite first or set viteUrl explicitly.',
+        );
         return;
       }
+      this.applyConfiguredPageUrl(args.pageUrl);
       logger.info(`Vite server found: ${formatViteServerInfo(this.viteServer)}`);
       this.sendEvent(new OutputEvent(`Vite server: ${formatViteServerInfo(this.viteServer)}\n`, 'console'));
+      this.reportLocalTlsCertificateBypass();
 
       // Step 2: Find Chrome with debug port
-      const activeChromePort = await this.ensureChromeDebugPort(chromePort);
+      const activeChromePort = await this.ensureLaunchChromeDebugPort(requestedChromePort, webRoot);
 
       // Step 3: Connect
       await this.connectAndSetup(activeChromePort, webRoot);
@@ -271,17 +301,28 @@ export class ViteDebugSession extends LoggingDebugSession {
   ): Promise<void> {
     try {
       const webRoot = args.webRoot || process.cwd();
-      const chromePort = args.chromePort || 9222;
+      const chromePort = this.validateOptionalChromePort(args.chromePort) ?? 9222;
       this.skipFileRegexes = (args.skipFiles ?? []).map(compileGlob);
       this.reloadOnAttach = args.reloadOnAttach ?? false;
 
       // Detect Vite server
-      this.viteServer = await detectFirstViteServer(args.viteUrl);
+      this.viteServer = await detectFirstViteServer(
+        args.viteUrl,
+        webRoot,
+        args._viteDebuggerMcpRequireWorkspaceMatch === true,
+      );
       if (!this.viteServer) {
-        this.sendErrorResponse(response, 1001, 'No running Vite dev server found.');
+        this.sendErrorResponse(
+          response,
+          1001,
+          `No unambiguous running Vite dev server found for webRoot "${webRoot}". ` +
+          'Start Vite first or set viteUrl explicitly.',
+        );
         return;
       }
+      this.applyConfiguredPageUrl(args.pageUrl);
       logger.info(`Vite server found: ${formatViteServerInfo(this.viteServer)}`);
+      this.reportLocalTlsCertificateBypass();
 
       // Find Chrome debug port (attach mode: won't launch new Chrome, but will restart if needed)
       const activeChromePort = await this.ensureChromeDebugPort(chromePort);
@@ -294,6 +335,60 @@ export class ViteDebugSession extends LoggingDebugSession {
       const msg = e instanceof Error ? e.message : String(e);
       this.sendErrorResponse(response, 1004, `Attach failed: ${msg}`);
     }
+  }
+
+  private reportLocalTlsCertificateBypass(): void {
+    if (!this.viteServer?.localTlsCertificateBypass) return;
+    this.sendEvent(new OutputEvent(
+      'Warning: Node did not trust the Vite HTTPS certificate. Detection was allowed only because ' +
+      'the host resolved exclusively to loopback. Chrome must still trust the certificate or the app may show a certificate error.\n',
+      'stderr',
+    ));
+  }
+
+  private applyConfiguredPageUrl(pageUrl: string | undefined): void {
+    if (!pageUrl || !this.viteServer) return;
+    const parsed = new URL(pageUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error('pageUrl must use http or https');
+    }
+    this.viteServer = { ...this.viteServer, pageUrl: parsed.href };
+  }
+
+  private validateOptionalChromePort(chromePort: number | undefined): number | undefined {
+    if (chromePort === undefined) return undefined;
+    if (!Number.isInteger(chromePort) || chromePort < 1 || chromePort > 65535) {
+      throw new Error('chromePort must be an integer between 1 and 65535');
+    }
+    return chromePort;
+  }
+
+  /**
+   * Launch sessions only reuse a remote-debugging endpoint when the user
+   * explicitly selected that port. Machine-wide discovery can otherwise grab
+   * a transient Lighthouse/headless Chrome and couple this debug session to a
+   * browser process that the extension neither owns nor can keep alive.
+   *
+   * With no explicit port (the MCP-generated default), Chrome gets a fresh
+   * profile and asks the OS for its own remote-debugging port. An unavailable
+   * explicit port also starts an isolated Chrome, but keeps the requested port.
+   */
+  private async ensureLaunchChromeDebugPort(
+    requestedPort: number | undefined,
+    profileScope: string,
+  ): Promise<number> {
+    if (requestedPort !== undefined && await isChromeDebuggable(requestedPort)) {
+      this.sendEvent(new OutputEvent(`Chrome debug port ${requestedPort} ready\n`, 'console'));
+      return requestedPort;
+    }
+
+    this.sendEvent(new OutputEvent(
+      requestedPort === undefined
+        ? 'Launching isolated debug Chrome with a leased port...\n'
+        : `Launching isolated debug Chrome on requested port ${requestedPort}...\n`,
+      'console',
+    ));
+    return launchManagedDebugChrome(this.vitePageUrl(), requestedPort, profileScope);
   }
 
   /**
@@ -323,7 +418,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.sendEvent(new OutputEvent(
       `Launching debug Chrome on port ${chromePort} with Vite URL...\n`, 'console'
     ));
-    await launchDebugChrome(this.viteServer!.url, chromePort);
+    await launchDebugChrome(this.vitePageUrl(), chromePort);
     return chromePort;
   }
 
@@ -338,7 +433,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     // events) fans out into our handlers — registering them after enable
     // would silently drop the replay, which is what made re-attach against
     // an already-loaded page require a manual page reload to start working.
-    this.cdp = await CdpClient.connect(chromePort, this.viteServer!.url);
+    this.cdp = await CdpClient.connect(chromePort, this.vitePageUrl());
     this.activeChromePort = chromePort;
 
     // Initialize managers (depends on cdp)
@@ -461,8 +556,13 @@ export class ViteDebugSession extends LoggingDebugSession {
   private async ensureLaunchViteTarget(chromePort: number): Promise<void> {
     const result = await this.ensureManagedViteTarget(chromePort);
     if (result.created) {
-      this.sendEvent(new OutputEvent(`Opened Vite app tab: ${this.viteServer!.url}\n`, 'console'));
+      this.sendEvent(new OutputEvent(`Opened Vite app tab: ${this.vitePageUrl()}\n`, 'console'));
     }
+  }
+
+  private vitePageUrl(): string {
+    if (!this.viteServer) throw new Error('No Vite server is selected');
+    return this.viteServer.pageUrl ?? this.viteServer.url;
   }
 
   /**
@@ -481,12 +581,13 @@ export class ViteDebugSession extends LoggingDebugSession {
     const operation = (async (): Promise<{ targetId: string; created: boolean }> => {
       const cdp = this.cdp;
       const viteUrl = this.viteServer?.url;
-      if (!cdp?.isConnected || !viteUrl) {
+      const pageUrl = this.viteServer?.pageUrl ?? viteUrl;
+      if (!cdp?.isConnected || !viteUrl || !pageUrl) {
         throw new Error('Cannot open the Vite tab before Chrome is connected');
       }
 
-      const existing = await findViteTab(chromePort, viteUrl);
-      const expectedTargetId = existing?.id ?? await cdp.createTarget(viteUrl);
+      const existing = await findViteTab(chromePort, pageUrl);
+      const expectedTargetId = existing?.id ?? await cdp.createTarget(pageUrl);
       const created = !existing;
       const deadline = Date.now() + 10_000;
 
@@ -502,7 +603,7 @@ export class ViteDebugSession extends LoggingDebugSession {
       }
 
       throw new Error(
-        `Chrome opened ${viteUrl}, but Vite Debugger did not attach to its page target within 10 seconds.`,
+        `Chrome opened ${pageUrl}, but Vite Debugger did not attach to its page target within 10 seconds.`,
       );
     })();
 
@@ -1241,7 +1342,8 @@ export class ViteDebugSession extends LoggingDebugSession {
   private async handleMcpEnsureBrowserTarget(): Promise<object> {
     const chromePort = this.activeChromePort;
     const viteUrl = this.viteServer?.url;
-    if (!this.cdp?.isConnected || chromePort === null || !viteUrl) {
+    const pageUrl = this.viteServer?.pageUrl ?? viteUrl;
+    if (!this.cdp?.isConnected || chromePort === null || !viteUrl || !pageUrl) {
       throw new Error('The Vite debug session is not connected to Chrome');
     }
     if (this.mcpPausedTargets.size > 0) {
@@ -1250,12 +1352,12 @@ export class ViteDebugSession extends LoggingDebugSession {
 
     const result = await this.ensureManagedViteTarget(chromePort);
     if (result.created) {
-      this.sendEvent(new OutputEvent(`Reopened Vite app tab for browser automation: ${viteUrl}\n`, 'console'));
+      this.sendEvent(new OutputEvent(`Reopened Vite app tab for browser automation: ${pageUrl}\n`, 'console'));
     }
     return {
       targetId: result.targetId,
       created: result.created,
-      url: this.sanitizeMcpUrl(viteUrl),
+      url: this.sanitizeMcpUrl(pageUrl),
     };
   }
 
@@ -1274,10 +1376,20 @@ export class ViteDebugSession extends LoggingDebugSession {
     const pausedTargetIds = [...this.mcpPausedTargets.values()]
       .sort((a, b) => a.pauseEpoch - b.pauseEpoch)
       .map((state) => state.targetId);
+    const localTlsCertificateBypass = this.viteServer?.localTlsCertificateBypass === true;
 
     return {
       connected: this.cdp?.isConnected ?? false,
       viteUrl: this.viteServer ? this.sanitizeMcpUrl(this.viteServer.url) : null,
+      pageUrl: this.viteServer
+        ? this.sanitizeMcpUrl(this.viteServer.pageUrl ?? this.viteServer.url)
+        : null,
+      localTlsCertificateBypass,
+      tlsCertificateWarning: localTlsCertificateBypass
+        ? 'The Vite certificate was accepted by Node only after the hostname resolved exclusively to loopback. ' +
+          'Open the Vite URL once in this project-owned debug Chrome profile and trust the local certificate, ' +
+          'or install its local CA in Chrome/OS, before browser automation.'
+        : null,
       chromePort: this.activeChromePort,
       paused: pausedTargetIds.length > 0,
       pauseReason: activePause?.reason ?? null,

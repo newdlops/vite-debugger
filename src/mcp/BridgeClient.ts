@@ -140,6 +140,25 @@ export class BridgeClient {
     return this.request<T>('listSessions', {});
   }
 
+  async startDebugging<T = unknown>(
+    params: {
+      configurationName?: string;
+      operationId?: string;
+      viteUrl?: string;
+      pageUrl?: string;
+    },
+  ): Promise<T> {
+    return this.request<T>('startDebugging', params);
+  }
+
+  async debugStartStatus<T = unknown>(operationId: string): Promise<T> {
+    return this.request<T>('debugStartStatus', { operationId });
+  }
+
+  async cancelDebugStart<T = unknown>(operationId: string): Promise<T> {
+    return this.request<T>('cancelDebugStart', { operationId });
+  }
+
   async sessionRequest<T = unknown>(
     sessionId: string,
     method: string,

@@ -1,0 +1,12 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "vite-debugger:test-prelaunch",
+      "type": "process",
+      "command": "${env:VITE_DEBUGGER_TEST_NODE}",
+      "args": ["${workspaceFolder}/record-prelaunch.js"],
+      "problemMatcher": []
+    }
+  ]
+}

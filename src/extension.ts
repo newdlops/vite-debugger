@@ -35,13 +35,10 @@ import {
 } from './mcp/McpDiagnostics';
 
 class ViteDebugAdapterFactory implements vscode.DebugAdapterDescriptorFactory {
-  constructor(private readonly sessions: SessionRegistry) {}
-
   createDebugAdapterDescriptor(
-    session: vscode.DebugSession,
+    _session: vscode.DebugSession,
     _executable: vscode.DebugAdapterExecutable | undefined
   ): vscode.ProviderResult<vscode.DebugAdapterDescriptor> {
-    this.sessions.register(session);
     return new vscode.DebugAdapterInlineImplementation(new ViteDebugSession());
   }
 }
@@ -72,6 +69,7 @@ let statusBarItem: vscode.StatusBarItem;
 type AgentClient = 'codex' | 'claude';
 
 const REQUIRED_MCP_TOOLS = [
+  'debug_start',
   'debug_status',
   'debug_snapshot',
   'debug_control',
@@ -240,13 +238,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     logger.warn(`Could not prepare stable MCP launcher: ${(error as Error).message}`);
   });
   context.subscriptions.push(sessionRegistry, bridge);
-  try {
-    await bridge.start();
-  } catch (error) {
-    // Debugging remains fully usable if the optional local MCP bridge cannot
-    // start (for example, because a hardened environment denies loopback).
-    logger.warn(`MCP bridge is unavailable: ${(error as Error).message}`);
-  }
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       bridge.updateWorkspaceRoots(workspaceRoots());
@@ -254,7 +245,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   // Register debug adapter factory
-  const factory = new ViteDebugAdapterFactory(sessionRegistry);
+  const factory = new ViteDebugAdapterFactory();
   context.subscriptions.push(
     vscode.debug.registerDebugAdapterDescriptorFactory('vite', factory)
   );
@@ -666,6 +657,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.debug.onDidTerminateDebugSession((session) => {
       if (session.type === 'vite') {
+        bridge.recordDebugSessionTermination(session);
         sessionRegistry.unregister(session);
         statusBarItem.text = '$(debug) Vite Debug';
         statusBarItem.backgroundColor = undefined;
@@ -684,18 +676,59 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.debug.registerDebugAdapterTrackerFactory('vite', {
       createDebugAdapterTracker(session) {
+        let discarded = false;
+        const discardFailedSession = (reason: string) => {
+          if (discarded) return;
+          discarded = true;
+          bridge.recordDebugSessionFailure(session, reason);
+          sessionRegistry.unregister(session);
+          logger.warn(`Discarding unusable Vite debug session ${session.id}: ${reason}`);
+          void Promise.resolve().then(() => vscode.debug.stopDebugging(session)).catch(() => undefined);
+        };
         return {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           onDidSendMessage(message: any) {
-            if (!message || message.type !== 'event') return;
-            if (message.event === 'stopped' || message.event === 'continued') {
+            if (!message) return;
+            if (message.type === 'response' &&
+                (message.command === 'launch' || message.command === 'attach') &&
+                message.success === false) {
+              discardFailedSession(typeof message.message === 'string'
+                ? message.message
+                : `${message.command} request failed`);
+              return;
+            }
+            if (message.type === 'event' &&
+                (message.event === 'stopped' || message.event === 'continued')) {
               if (session.type === 'vite') scheduleAutoRefresh(150);
+            }
+          },
+          onWillStopSession() {
+            sessionRegistry.unregister(session);
+          },
+          onError(error) {
+            discardFailedSession(error.message);
+          },
+          onExit(code, signal) {
+            if (sessionRegistry.get(session.id)) {
+              discardFailedSession(`debug adapter exited (${code ?? 'no code'}, ${signal ?? 'no signal'})`);
             }
           },
         };
       },
     }),
   );
+
+  // Publish the project bridge only after every Vite debug lifecycle hook is
+  // installed. An agent can call debug_start as soon as the manifest appears;
+  // starting earlier would let that session outrun the registry, failure
+  // tracker, or termination listener during extension activation.
+  try {
+    await bridge.start();
+  } catch (error) {
+    // Debugging remains fully usable if the optional local MCP bridge cannot
+    // start (for example, because a hardened environment denies loopback).
+    logger.warn(`MCP bridge is unavailable: ${(error as Error).message}`);
+  }
 
   // Show status bar if a Vite server is likely (workspace has vite.config)
   checkForViteProject().then(isVite => {

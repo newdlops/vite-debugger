@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "vite",
+      "request": "launch",
+      "name": "VS Code Host MCP Start",
+      "preLaunchTask": "vite-debugger:test-prelaunch",
+      "viteUrl": "http://127.0.0.1:43991/",
+      "chromePort": 49333,
+      "webRoot": "${workspaceFolder}"
+    },
+    {
+      "type": "vite",
+      "request": "launch",
+      "name": "VS Code Host MCP Failure",
+      "viteUrl": "http://127.0.0.1:43992/",
+      "chromePort": 49334,
+      "webRoot": "${workspaceFolder}"
+    }
+  ]
+}

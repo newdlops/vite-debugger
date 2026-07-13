@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.7013 (2026-07-13)
+
+### Fixed
+
+- **HTTPS source maps** — loads external maps through the correct HTTP(S) transport. Self-signed certificates are accepted only after exclusive-loopback DNS verification and an IP-pinned retry; optimized dependency-map failures no longer create a retry storm.
+- **Fast pause snapshots** — resolves call-stack frames concurrently and does not start slow dependency source-map fetches while publishing a pause, so agents receive the mapped user frame without waiting on library maps.
+- **Zombie start cleanup** — publishes the MCP bridge only after every debug lifecycle hook is installed, releases a failed adapter's single-flight reservation immediately, and stops only the correlated session when readiness times out; a still-running `preLaunchTask` remains single-flight instead of being duplicated.
+- **Project-owned launch Chrome** — agent launches no longer attach to transient Lighthouse/headless ports. Each project gets an opaque persistent Chrome profile and an OS-leased debug port, reused only when its `DevToolsActivePort` browser identity still matches.
+- **Strict inherited launch settings** — MCP-started workspace configurations always enforce Vite-root matching, validate inherited application URLs as loopback-only, distinguish an explicit Chrome port from the schema default, and recheck configuration/URL conflicts after start races.
+
+## 0.1.7012 (2026-07-13)
+
+### Fixed
+
+- **Direct agent launch for ambiguous projects** — `debug_start` accepts an optional local `viteUrl`, so an agent can select an already-running server such as `https://alphac:3004` without a Run and Debug click or a hand-written Vite launch configuration.
+- **Separate module and browser origins** — `debug_start` and launch configurations accept `pageUrl` for backend-rendered/middleware apps, while source mapping stays on `viteUrl` and CDP/Playwright page isolation follows the application origin.
+- **Non-root Vite documents** — recognizes projects that return 404 at `/` but serve a transformed app at `/index.html`; raw public/backend templates without a Vite or module bootstrap are no longer opened as false-ready blank pages.
+- **Vite HTML negotiation** — page discovery sends a browser-style HTML `Accept` header, so SPA fallback and `createHtmlPlugin` middleware transform `/` instead of returning a misleading 404 or raw public template.
+- **Modern source-map root discovery** — recovers a project root when transformed Vite/SWC output omits the source map `file` field, using validated absolute source metadata or generated `fileName` paths.
+- **Failed-session cleanup** — launch/attach failures immediately evict and stop their correlated VS Code session, so a rejected adapter cannot remain as a zombie that later returns `No debugger available`.
+
+### Security
+
+- Agent-supplied `viteUrl` and `pageUrl` values must resolve exclusively to loopback. Vite detection pins every strict probe (including metadata requests) against DNS rebinding; credentials, external addresses, unsafe URL components, and cross-project servers are rejected.
+
+## 0.1.7010 (2026-07-13)
+
+### Added
+
+- **Agent-started debugging** — adds `debug_start`, allowing Codex or Claude to start or reuse the project-scoped Vite debug session through the matching VS Code Extension Host without clicking Run and Debug.
+- **Launch readiness** — waits for the adapter to connect and, for launch configurations, for the managed Vite browser target; long-running background `preLaunchTask` starts return an explicit starting state instead of encouraging duplicate sessions.
+- **Reliable start lifecycle** — reports VS Code decline, adapter failure/termination, and closed-tab recovery; caller-generated operation IDs make transport retries and concurrent calls idempotent.
+- **Project-scoped HTTP/HTTPS discovery** — matches a unique Vite source root below `webRoot`, restores forward-verified loopback aliases such as `alphac`, and supports local self-signed HTTPS detection with an MCP certificate warning.
+
+### Security
+
+- Only trusted workspaces and exact bridge-scoped workspace folders may start debugging. The agent can select only existing `type: "vite"` launch/attach configurations by name and cannot inject a raw task, command, environment, URL, or workspace path.
+- User-authored Vite configurations are cloned after validation and started with dirty-editor autosave suppressed. When no Vite configuration exists, the fallback is a task-free generated launch that requires an already-running Vite server.
+- Automatic server selection fails closed on unmatched or ambiguous project roots. Explicit URLs never fall back to a different process, and certificate relaxation is request-local, DNS-verified, and pinned to an exclusively loopback address; Chrome's global certificate checks remain enabled.
+
 ## 0.1.7009 (2026-07-13)
 
 ### Fixed
