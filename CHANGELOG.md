@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.7009 (2026-07-13)
+
+### Fixed
+
+- **Reliable launch target** — `launch` now opens the exact detected Vite URL when it reuses a debuggable Chrome that contains only a new tab or unrelated pages, and waits until the page is managed before completing startup. `attach` continues to preserve existing browser state.
+- **Closed-tab recovery** — `browser_navigate` reopens a missing managed Vite page through the debug adapter, reports whether it created the target, and uses a single-flight guard so concurrent recovery cannot create duplicate tabs.
+- **Virtual loopback origins** — Chrome discovery, debugger target filtering, and Playwright same-origin checks now consistently recognize every `127/8` address alongside `localhost`, `127.0.0.1`, and IPv6 loopback without weakening protocol or port checks.
+- **Actionable diagnostics** — a connected debugger with no managed Vite targets is now reported as a warning instead of a successful browser-ready state.
+
+### Security
+
+- Cross-origin navigation and stale explicit target requests are rejected before closed-tab recovery can create a page. Page recovery is also blocked while JavaScript is paused or a Playwright trace is active.
+
 ## 0.1.7008 (2026-07-13)
 
 ### Added

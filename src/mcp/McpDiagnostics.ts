@@ -445,6 +445,18 @@ function classifyDebugStatus(result: unknown): {
     };
   }
 
+  if (payload.connected === true && Array.isArray(payload.targets) && payload.targets.length === 0) {
+    return {
+      check: {
+        id: 'debug.status',
+        title: 'Debugger bridge',
+        status: 'warn',
+        message: 'The Chrome debugger is connected, but no managed Vite page is available. A launch session should open the app automatically; for an attach session, open the Vite app in that Chrome or call browser_navigate.',
+      },
+      payload,
+    };
+  }
+
   return {
     check: {
       id: 'debug.status',

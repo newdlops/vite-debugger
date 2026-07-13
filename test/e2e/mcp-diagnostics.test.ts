@@ -166,6 +166,36 @@ describe('MCP diagnostics', () => {
     expect(report.markdown).toContain('stderr was truncated');
   });
 
+  it('warns when Chrome is connected without a managed Vite page', async () => {
+    const { workspacePath, launcherPath } = await fixture({
+      status: {
+        workspace: 'fixture-workspace',
+        sessionId: 'vite-session-1',
+        connected: true,
+        chromePort: 9222,
+        targets: [],
+      },
+    });
+
+    const report = await diagnoseMcp({
+      workspacePath,
+      launcherPath,
+      nodeCommand: process.execPath,
+      timeoutMs: 5_000,
+    });
+
+    expect(report.summary.status).toBe('warn');
+    expect(report.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'debug.status',
+        status: 'warn',
+        message: expect.stringMatching(/launch session should open.*attach session.*browser_navigate/i),
+      }),
+    ]));
+    expect(report.debugStatus).toMatchObject({ connected: true, targets: [] });
+    expect(report.markdown).toContain('Overall: **WARN**');
+  });
+
   it('fails when a required tool is missing while preserving the successful bridge result', async () => {
     const { workspacePath, launcherPath } = await fixture({ tools: ['debug_status'] });
     const report = await diagnoseMcp({

@@ -111,6 +111,8 @@ The private bridge and Chrome CDP connection both use loopback. Consequently, th
 4. Restart the agent session so it loads the project MCP server. Codex must trust the project before it loads project configuration; Claude Code asks you to approve the project server (you can also inspect it with `/mcp`).
 5. Start a Vite debug session, then use the MCP tools from the agent.
 
+A `launch` session guarantees that the detected Vite URL is open in its debug Chrome, even when it reuses a window that previously contained only a new tab. An `attach` session leaves existing tabs untouched. If the managed app tab is later closed, `browser_navigate` reopens it automatically for a same-origin route; pass `openIfMissing=false` when that recovery side effect is not wanted.
+
 Running setup again is safe and refreshes only the Vite Debugger entry. In a multi-root window, setup asks which project to bind; the generated `--workspace` argument routes that agent to the matching VS Code window and debug session. The older **Copy Agent MCP Configuration** command remains available as a manual fallback.
 
 Use **Vite Debugger: Diagnose Agent MCP** at any time (or choose **Diagnose MCP** after setup) to launch the exact stable stdio command and verify the agent configuration, MCP handshake, all 20 tools, private VS Code bridge, and `debug_status` path. The bounded PASS/WARN/FAIL report appears in the Vite Debugger output channel; having no active debug session is reported as a warning rather than a broken MCP installation.
@@ -140,7 +142,7 @@ The server exposes 20 project-scoped tools:
 | `debug_replace_breakpoints` | Atomically replace the agent-owned breakpoints for one source without changing user breakpoints. |
 | `browser_tabs` | List the Vite pages available to Playwright and their stable `targetId` values. |
 | `browser_snapshot` | Return an AI-oriented accessibility snapshot with refs for later actions. |
-| `browser_navigate` | Navigate to a relative route or same-origin URL. |
+| `browser_navigate` | Navigate to a relative route or same-origin URL, reopening the managed Vite page if every app tab was closed. |
 | `browser_click` | Click an element selected by snapshot ref, selector, role, text, label, or test id. |
 | `browser_fill` | Replace the value of an input-like element. |
 | `browser_press` | Press a key or shortcut on an element. |

@@ -112,6 +112,8 @@ export class ViteDebugSession extends LoggingDebugSession {
   private viteServer: ViteServerInfo | null = null;
   /** Actual port selected after discovery/launch, not merely launch.json input. */
   private activeChromePort: number | null = null;
+  /** Single-flight guard used by launch and MCP recovery so concurrent callers open at most one tab. */
+  private viteTargetCreation: Promise<{ targetId: string; created: boolean }> | null = null;
   /** MCP-visible execution state. Epoch changes on every real CDP pause. */
   private paused = false;
   private pauseReason: string | null = null;
@@ -253,6 +255,7 @@ export class ViteDebugSession extends LoggingDebugSession {
 
       // Step 3: Connect
       await this.connectAndSetup(activeChromePort, webRoot);
+      await this.ensureLaunchViteTarget(activeChromePort);
 
       this.sendResponse(response);
       this.sendEvent(new InitializedEvent());
@@ -448,6 +451,67 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.scheduleSourceMapRetry();
 
     this.sendEvent(new OutputEvent('Connected to Chrome DevTools\n', 'console'));
+  }
+
+  /**
+   * `launch` owns opening the application. Reusing an already-debuggable Chrome
+   * must not silently degrade into a connected session with zero managed tabs.
+   * `attach` intentionally does not call this helper and preserves browser state.
+   */
+  private async ensureLaunchViteTarget(chromePort: number): Promise<void> {
+    const result = await this.ensureManagedViteTarget(chromePort);
+    if (result.created) {
+      this.sendEvent(new OutputEvent(`Opened Vite app tab: ${this.viteServer!.url}\n`, 'console'));
+    }
+  }
+
+  /**
+   * Ensure Chrome contains one page on this session's exact Vite origin and
+   * wait until the adapter has attached to it. The raw Chrome target lookup is
+   * important here: auto-attach may still be enabling the page when launch (or
+   * an MCP recovery call) arrives, and opening a duplicate would be surprising.
+   */
+  private async ensureManagedViteTarget(
+    chromePort: number,
+  ): Promise<{ targetId: string; created: boolean }> {
+    const managed = this.cdp?.listTargets().find((target) => target.type === 'page');
+    if (managed) return { targetId: managed.targetId, created: false };
+    if (this.viteTargetCreation) return this.viteTargetCreation;
+
+    const operation = (async (): Promise<{ targetId: string; created: boolean }> => {
+      const cdp = this.cdp;
+      const viteUrl = this.viteServer?.url;
+      if (!cdp?.isConnected || !viteUrl) {
+        throw new Error('Cannot open the Vite tab before Chrome is connected');
+      }
+
+      const existing = await findViteTab(chromePort, viteUrl);
+      const expectedTargetId = existing?.id ?? await cdp.createTarget(viteUrl);
+      const created = !existing;
+      const deadline = Date.now() + 10_000;
+
+      while (Date.now() < deadline) {
+        if (this.cdp !== cdp || !cdp.isConnected) {
+          throw new Error('Chrome disconnected while opening the Vite app tab');
+        }
+        const targets = cdp.listTargets();
+        const target = targets.find((candidate) => candidate.targetId === expectedTargetId)
+          ?? targets.find((candidate) => candidate.type === 'page');
+        if (target) return { targetId: target.targetId, created };
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+
+      throw new Error(
+        `Chrome opened ${viteUrl}, but Vite Debugger did not attach to its page target within 10 seconds.`,
+      );
+    })();
+
+    this.viteTargetCreation = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.viteTargetCreation === operation) this.viteTargetCreation = null;
+    }
   }
 
   protected configurationDoneRequest(
@@ -1158,6 +1222,8 @@ export class ViteDebugSession extends LoggingDebugSession {
     switch (method) {
       case 'status':
         return this.buildMcpStatus();
+      case 'ensureBrowserTarget':
+        return this.handleMcpEnsureBrowserTarget();
       case 'snapshot':
         return this.buildMcpSnapshot(params);
       case 'control':
@@ -1169,6 +1235,28 @@ export class ViteDebugSession extends LoggingDebugSession {
       default:
         throw new Error(`Unknown MCP method: ${this.truncateMcpText(method, 100)}`);
     }
+  }
+
+  /** Recreate the managed Vite page after it was closed, without exposing raw CDP to MCP. */
+  private async handleMcpEnsureBrowserTarget(): Promise<object> {
+    const chromePort = this.activeChromePort;
+    const viteUrl = this.viteServer?.url;
+    if (!this.cdp?.isConnected || chromePort === null || !viteUrl) {
+      throw new Error('The Vite debug session is not connected to Chrome');
+    }
+    if (this.mcpPausedTargets.size > 0) {
+      throw new Error('Cannot open a browser target while JavaScript is paused; resume execution first');
+    }
+
+    const result = await this.ensureManagedViteTarget(chromePort);
+    if (result.created) {
+      this.sendEvent(new OutputEvent(`Reopened Vite app tab for browser automation: ${viteUrl}\n`, 'console'));
+    }
+    return {
+      targetId: result.targetId,
+      created: result.created,
+      url: this.sanitizeMcpUrl(viteUrl),
+    };
   }
 
   private buildMcpStatus(): object {
@@ -2600,6 +2688,7 @@ export class ViteDebugSession extends LoggingDebugSession {
   }
 
   private onDisconnected(): void {
+    this.viteTargetCreation = null;
     this.paused = false;
     this.pauseReason = null;
     this.lastPausedEvent = null;
@@ -2635,6 +2724,7 @@ export class ViteDebugSession extends LoggingDebugSession {
   }
 
   private async cleanup(): Promise<void> {
+    this.viteTargetCreation = null;
     if (this.sourceMapRetryTimer) {
       clearTimeout(this.sourceMapRetryTimer);
       this.sourceMapRetryTimer = null;

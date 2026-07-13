@@ -17,6 +17,7 @@ import {
 } from 'playwright-core';
 import { z } from 'zod';
 import { BridgeClient, type BridgeSessionMetadata } from './BridgeClient';
+import { localOriginsEquivalent } from '../util/LocalHosts';
 
 const MAX_EVENT_HISTORY = 500;
 const MAX_MANAGED_TARGETS = 100;
@@ -367,16 +368,61 @@ export function registerMcpTools(server: McpServer, bridge: BridgeClient): McpTo
     inputSchema: {
       ...pageShape,
       url: z.string().min(1).max(MAX_URL_CHARS).describe('Absolute same-origin URL or relative route.'),
+      openIfMissing: z.boolean().optional().default(true).describe(
+        'Reopen the session Vite page when every managed tab was closed. Ignored when targetId is provided.',
+      ),
       waitUntil: z.enum(['commit', 'domcontentloaded', 'load', 'networkidle'])
         .optional().default('domcontentloaded'),
       timeoutMs: z.number().int().min(100).max(60_000).optional().default(DEFAULT_ACTION_TIMEOUT_MS),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   }, (args) => safely(async () => {
-    const selected = await selectSession(bridge, args.sessionId);
+    let selected = await selectSession(bridge, args.sessionId);
     assertNotPaused(selected.status, 'browser_navigate');
-    const chosen = await browser.selectPage(selected.status, args.targetId);
-    const destination = sameOriginDestination(args.url, chosen.url, selected.status);
+    let createdTarget = false;
+    let chosen: PageDescription;
+    let destination: string;
+
+    if (!args.targetId && managedTargets(selected.status).length === 0) {
+      const viteUrl = readString(
+        selected.status,
+        ['viteUrl'],
+        ['config', 'viteUrl'],
+        ['browser', 'viteUrl'],
+      );
+      if (!viteUrl) {
+        throw new Error('The selected debug session did not report its Vite application URL');
+      }
+      // Reject unsafe destinations before asking the adapter to create a tab.
+      destination = sameOriginDestination(args.url, viteUrl, selected.status);
+      if (!args.openIfMissing) {
+        throw new Error(
+          'No managed Vite page is open. Retry browser_navigate with openIfMissing=true or open the Vite URL in debug Chrome.',
+        );
+      }
+      browser.assertCanOpenPage(selected.sessionId);
+      const rawEnsured = await bridge.sessionRequest<unknown>(
+        selected.sessionId,
+        'ensureBrowserTarget',
+        {},
+      );
+      if (!isRecord(rawEnsured) || typeof rawEnsured.targetId !== 'string') {
+        throw new Error('The debug adapter did not return the reopened Vite target id');
+      }
+      createdTarget = rawEnsured.created === true;
+      const ready = await waitForManagedPage(
+        bridge,
+        browser,
+        selected,
+        rawEnsured.targetId,
+        10_000,
+      );
+      selected = ready.selected;
+      chosen = ready.page;
+    } else {
+      chosen = await browser.selectPage(selected.status, args.targetId);
+      destination = sameOriginDestination(args.url, chosen.url, selected.status);
+    }
     const outcome = await runBrowserMutation(bridge, selected, async () => {
       await chosen.page.goto(destination, { waitUntil: args.waitUntil, timeout: args.timeoutMs });
     });
@@ -384,6 +430,7 @@ export function registerMcpTools(server: McpServer, bridge: BridgeClient): McpTo
       sessionId: selected.sessionId,
       targetId: chosen.targetId,
       url: sanitizeBrowserUrl(chosen.page.url()),
+      createdTarget,
       ...outcome,
     });
   }));
@@ -696,6 +743,17 @@ class BrowserController {
   private readonly requestIds = new WeakMap<Request, string>();
   private nextRequestId = 1;
   private activeTrace: TraceState | undefined;
+
+  assertCanOpenPage(sessionId: string): void {
+    const trace = this.activeTrace;
+    if (!trace) return;
+    if (trace.sessionId !== sessionId) {
+      throw new Error(`A browser trace belongs to another debug session: ${trace.sessionId}`);
+    }
+    throw new Error(
+      'browser_navigate cannot reopen a page while a browser trace is active. Stop the trace first.',
+    );
+  }
 
   async pagesForStatus(status: UnknownRecord): Promise<PageDescription[]> {
     const allowedTargetIds = managedTargetIds(status);
@@ -1355,6 +1413,32 @@ async function selectSession(
   return { sessionId: metadata.sessionId, metadata, status };
 }
 
+async function waitForManagedPage(
+  bridge: BridgeClient,
+  browser: BrowserController,
+  selected: SelectedSession,
+  targetId: string,
+  timeoutMs: number,
+): Promise<{ selected: SelectedSession; page: PageDescription }> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    const rawStatus = await bridge.sessionRequest<unknown>(selected.sessionId, 'status', {});
+    const status = isRecord(rawStatus) ? rawStatus : { value: rawStatus };
+    const refreshed = { ...selected, status };
+    if (managedTargetIds(status).has(targetId)) {
+      try {
+        return { selected: refreshed, page: await browser.selectPage(status, targetId) };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    await delay(50);
+  }
+  const detail = lastError instanceof Error ? ` Last error: ${lastError.message}` : '';
+  throw new Error(`The reopened Vite page did not become available to Playwright within ${timeoutMs}ms.${detail}`);
+}
+
 function targetsFromStatus(status: UnknownRecord): TargetDescription[] {
   const raw = readUnknown(status, ['targets'], ['browser', 'targets'], ['session', 'targets']);
   if (!Array.isArray(raw)) return [];
@@ -1782,17 +1866,7 @@ function urlMatchesVite(pageUrl: string, viteUrl: string): boolean {
 }
 
 function sameOrigin(left: URL, right: URL): boolean {
-  if (left.protocol !== right.protocol || effectivePort(left) !== effectivePort(right)) return false;
-  return left.hostname === right.hostname || (isLoopback(left.hostname) && isLoopback(right.hostname));
-}
-
-function effectivePort(url: URL): string {
-  if (url.port) return url.port;
-  return url.protocol === 'https:' ? '443' : url.protocol === 'http:' ? '80' : '';
-}
-
-function isLoopback(hostname: string): boolean {
-  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
+  return localOriginsEquivalent(left, right);
 }
 
 function sanitizeBrowserUrl(value: string): string {

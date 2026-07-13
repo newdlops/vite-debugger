@@ -8,7 +8,7 @@ import { enableTestLogging } from '../helpers/logger';
  * Full-stack adapter E2E. Boots Vite + headless Chrome once, then runs the
  * DAP flow that VSCode would drive:
  *
- *   initialize → launch → setBreakpoints → configurationDone →
+ *   initialize → attach → setBreakpoints → configurationDone →
  *   (trigger click) → stopped → stackTrace → scopes → variables →
  *   continue → (trigger second click) → stopped → continue → disconnect
  *
@@ -59,12 +59,12 @@ describe('ViteDebugSession — full DAP flow', () => {
     expect(body.supportedChecksumAlgorithms).toContain('SHA256');
   });
 
-  it('launch resolves the fixture Vite server and emits InitializedEvent', async () => {
+  it('attach resolves the fixture Vite server and emits InitializedEvent', async () => {
     const initialized = session.dap.waitForEvent('initialized', 30_000);
     await session.dap.request<
-      DebugProtocol.LaunchRequest,
-      DebugProtocol.LaunchResponse
-    >('launch', {
+      DebugProtocol.AttachRequest,
+      DebugProtocol.AttachResponse
+    >('attach', {
       viteUrl: session.vite.url,
       chromePort: session.chrome.port,
       webRoot: session.webRoot,
@@ -94,6 +94,7 @@ describe('ViteDebugSession — full DAP flow', () => {
     // Navigate the browser AFTER the adapter has attached so scriptParsed
     // events fire with the adapter's listener active.
     await session.browser.navigate(session.vite.url);
+    await session.browser.waitForSelector('[data-testid="inc"]');
     // Wait for React mount + Vite module chain to parse/execute and for
     // pending breakpoints to resolve.
     await new Promise((r) => setTimeout(r, 1500));

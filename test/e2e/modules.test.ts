@@ -2,7 +2,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import * as path from 'path';
 import { ViteUrlMapper } from '../../src/vite/ViteUrlMapper';
 import { normalizeViteUrl, SourceMapResolver } from '../../src/sourcemap/SourceMapResolver';
-import { hostsEquivalent, isLoopbackHost, urlHostPatternForHost } from '../../src/util/LocalHosts';
+import {
+  hostsEquivalent,
+  isLoopbackHost,
+  localOriginsEquivalent,
+  urlHostPatternForHost,
+} from '../../src/util/LocalHosts';
 import { detectFirstViteServer, formatViteServerDescription, formatViteServerInfo } from '../../src/vite/ViteServerDetector';
 import { isChromeDebuggable } from '../../src/cdp/ChromeDiscovery';
 import { FixtureViteServer, startFixtureVite } from '../helpers/viteServer';
@@ -94,6 +99,21 @@ describe('local host helpers', () => {
     expect(hostsEquivalent('localhost', '127.112.252.216')).toBe(true);
     expect(hostsEquivalent('127.0.0.1', '127.130.195.13')).toBe(true);
     expect(hostsEquivalent('localhost', '10.0.0.5')).toBe(false);
+  });
+
+  it('matches virtual loopback URL origins without weakening protocol or port checks', () => {
+    expect(localOriginsEquivalent(
+      new URL('http://127.103.218.122:3007/app'),
+      new URL('http://localhost:3007/'),
+    )).toBe(true);
+    expect(localOriginsEquivalent(
+      new URL('http://127.103.218.122:3007/'),
+      new URL('https://localhost:3007/'),
+    )).toBe(false);
+    expect(localOriginsEquivalent(
+      new URL('http://127.103.218.122:3007/'),
+      new URL('http://127.0.0.1:3008/'),
+    )).toBe(false);
   });
 
   it('builds URL host patterns that include virtual 127/8 hosts', () => {

@@ -13,7 +13,7 @@ import {
   RequestPattern,
 } from './CdpTypes';
 import { logger } from '../util/Logger';
-import { hostsEquivalent } from '../util/LocalHosts';
+import { localOriginsEquivalent } from '../util/LocalHosts';
 
 export interface ScriptParsedEvent {
   scriptId: string;
@@ -517,9 +517,7 @@ export class CdpClient extends EventEmitter {
       // Treat localhost and its loopback spelling as equivalent, while still
       // enforcing the rest of the URL origin. In particular, http -> https is
       // a cross-origin navigation even when hostname and explicit port match.
-      return a.protocol === b.protocol
-        && hostsEquivalent(a.hostname, b.hostname)
-        && a.port === b.port;
+      return localOriginsEquivalent(a, b);
     } catch {
       return false;
     }
@@ -753,6 +751,13 @@ export class CdpClient extends EventEmitter {
     if (sessionId) {
       await this.client.Debugger.removeBreakpoint({ breakpointId }, sessionId);
     }
+  }
+
+  /** Open a page in Chrome's default browser context through the browser-level CDP connection. */
+  async createTarget(url: string): Promise<string> {
+    const result = await this.client.Target.createTarget({ url });
+    if (!result?.targetId) throw new Error('Chrome did not return a target id for the new Vite tab');
+    return result.targetId;
   }
 
   async resume(targetId?: string): Promise<void> {

@@ -26,12 +26,12 @@ export interface StartOptions {
  *   3. DAPClient wrapping ViteDebugSession
  *   4. Test-side CDP connection for page interaction
  *
- * Tests then call `dap.request('initialize' | 'launch' | ...)` to drive the
+ * Tests then call `dap.request('initialize' | 'attach' | ...)` to drive the
  * adapter. Teardown disposes everything in reverse order.
  */
 /**
  * Full bring-up sequence that most breakpoint-oriented tests want:
- *  start session → initialize → launch → configurationDone → navigate.
+ *  start session → initialize → attach → configurationDone → navigate.
  * After this returns the fixture page is loaded, the adapter is attached,
  * and setBreakpoints calls will resolve against real scriptParsed events.
  */
@@ -48,9 +48,9 @@ export async function startAttachedSession(): Promise<E2ESession> {
   });
   const initialized = session.dap.waitForEvent('initialized', 30_000);
   await session.dap.request<
-    DebugProtocol.LaunchRequest,
-    DebugProtocol.LaunchResponse
-  >('launch', {
+    DebugProtocol.AttachRequest,
+    DebugProtocol.AttachResponse
+  >('attach', {
     viteUrl: session.vite.url,
     chromePort: session.chrome.port,
     webRoot: session.webRoot,
@@ -58,6 +58,7 @@ export async function startAttachedSession(): Promise<E2ESession> {
   await initialized;
   await session.dap.request('configurationDone', {});
   await session.browser.navigate(session.vite.url);
+  await session.browser.waitForSelector('[data-testid="inc"]');
   // Let Vite dep-optimize + React hydrate + scriptParsed fan-out settle so
   // subsequent setBreakpoints resolves against live scripts.
   await new Promise((r) => setTimeout(r, 1500));

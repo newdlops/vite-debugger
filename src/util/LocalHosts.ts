@@ -44,6 +44,20 @@ export function hostsEquivalent(a: string, b: string): boolean {
          (isLoopbackHost(normalizedA) && isLoopbackHost(normalizedB));
 }
 
+function effectivePort(url: URL): string {
+  if (url.port) return url.port;
+  if (url.protocol === 'http:') return '80';
+  if (url.protocol === 'https:') return '443';
+  return '';
+}
+
+/** Compare web origins while treating every 127/8 spelling, localhost, and ::1 as the same host. */
+export function localOriginsEquivalent(a: URL, b: URL): boolean {
+  return a.protocol === b.protocol &&
+    effectivePort(a) === effectivePort(b) &&
+    hostsEquivalent(a.hostname, b.hostname);
+}
+
 export function escapeRegexLiteral(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

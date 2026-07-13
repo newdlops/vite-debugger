@@ -66,6 +66,45 @@ describe('MCP browser tools through the real server and shared debug Chrome', ()
     return content?.type === 'text' ? content.text : '';
   }
 
+  async function waitForManagedTargets(
+    expectedCount: number,
+    timeoutMs = 10_000,
+  ): Promise<JsonObject[]> {
+    const deadline = Date.now() + timeoutMs;
+    let targets: JsonObject[] = [];
+    while (Date.now() < deadline) {
+      const status = await dapMcp<JsonObject>('status');
+      targets = Array.isArray(status.targets)
+        ? status.targets.filter((target): target is JsonObject =>
+          typeof target === 'object' && target !== null
+        )
+        : [];
+      if (targets.length === expectedCount) return targets;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(
+      `Timed out waiting for ${expectedCount} managed target(s); last count was ${targets.length}`,
+    );
+  }
+
+  async function waitForBrowserPage(origin: string, timeoutMs = 10_000): Promise<Page> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const candidate = playwrightBrowser.contexts()
+        .flatMap((context) => context.pages())
+        .find((browserPage) => {
+          try {
+            return new URL(browserPage.url()).origin === origin;
+          } catch {
+            return false;
+          }
+        });
+      if (candidate) return candidate;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(`Timed out waiting for a Playwright page on ${origin}`);
+  }
+
   async function call<T extends JsonObject>(name: string, args: JsonObject): Promise<T> {
     const result = await callRaw(name, args);
     if (result.isError) {
@@ -407,5 +446,52 @@ describe('MCP browser tools through the real server and shared debug Chrome', ()
     unmanagedPage = undefined;
     const status = await call<JsonObject>('browser_trace', { action: 'status' });
     expect(status).toMatchObject({ trace: { active: false } });
+  }, 30_000);
+
+  it('recovers a closed managed page only for an implicit same-origin navigation', async () => {
+    const [originalTarget] = await waitForManagedTargets(1);
+    const staleTargetId = originalTarget.targetId;
+    expect(typeof staleTargetId).toBe('string');
+
+    await page.close();
+    await waitForManagedTargets(0);
+
+    const crossOrigin = await callRaw('browser_navigate', {
+      url: 'https://example.com/should-not-open',
+    });
+    expect(crossOrigin.isError).toBe(true);
+    expect(resultText(crossOrigin)).toMatch(/cross-origin|same-origin/i);
+    await waitForManagedTargets(0);
+
+    const staleTarget = await callRaw('browser_navigate', {
+      targetId: staleTargetId as string,
+      url: '/',
+    });
+    expect(staleTarget.isError).toBe(true);
+    expect(resultText(staleTarget)).toMatch(/not managed|not available/i);
+    await waitForManagedTargets(0);
+
+    const recovered = await call<JsonObject>('browser_navigate', { url: '/' });
+    expect(recovered).toMatchObject({
+      createdTarget: true,
+      outcome: 'completed',
+      targetId: expect.any(String),
+    });
+    expect(recovered.targetId).not.toBe(staleTargetId);
+
+    const [recoveredTarget] = await waitForManagedTargets(1);
+    expect(recoveredTarget.targetId).toBe(recovered.targetId);
+
+    const expectedOrigin = new URL(session.vite.url).origin;
+    page = await waitForBrowserPage(expectedOrigin);
+    await page.getByRole('heading', { name: 'Fixture app' }).waitFor();
+
+    const reused = await call<JsonObject>('browser_navigate', { url: '/' });
+    expect(reused).toMatchObject({
+      createdTarget: false,
+      outcome: 'completed',
+      targetId: recovered.targetId,
+    });
+    await waitForManagedTargets(1);
   }, 30_000);
 });
