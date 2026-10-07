@@ -1,5 +1,6 @@
 src/**
 test/**
+scripts/**
 node_modules/**
 !node_modules/playwright-core/**
 .vscode/**

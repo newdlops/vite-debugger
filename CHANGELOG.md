@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.7016 (2026-10-07)
+
+### Security
+
+- Updates the MCP SDK to 1.32.1 and TOML parser to 1.9.0, and refreshes affected runtime dependencies. `npm run audit:runtime` checks the production dependency graph.
+- Replaces the SDK, HTTP adapter, URI and IP copies embedded in Playwright with patched dependencies, preserving its 49 utility exports. A checksum-locked build recipe rejects an unexpected upstream bundle.
+- Shares the patched SDK between the extension, MCP sidecar and Playwright utilities, with recorded dependency versions and license notices.
+- Adds bounded subprocess regressions for malformed EOF comments and large TOML configurations, plus MCP transport and IP classification checks for the packaged runtime.
+
 ## 0.1.7015 (2026-10-07)
 
 ### Fixed

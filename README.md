@@ -256,6 +256,8 @@ Environment variables:
 
 Run individual static checks with `npm run lint`, `npm run typecheck`, and `npm run typecheck:test`.
 
+`npm run audit:runtime` audits production dependencies. Build and test commands also replace the older SDK, HTTP adapter, URI and IP copies embedded in Playwright with a shared patched runtime; see [dependency security](docs/dependency-security.md) for the scope, versions, and build verification.
+
 `npm run bench:resources` runs a repeatable synthetic source-map and breakpoint workload and prints Node CPU time, retained JavaScript heap, and Chrome query counts. The recorded before/after comparison is in `test/perf/resource-results.json`; these measurements do not represent total VS Code/Chrome memory or long-running application usage.
 
 Fixtures live under `test/fixtures/sample-app/` (tiny React + Vite project with a deterministic breakpoint target at `src/math.ts:2`) and `test/vscode-host/fixture-workspace/`.
