@@ -359,6 +359,7 @@ async function discoverManifest(workspace: string, manifestDirectory: string): P
       throw new Error(
         `No Vite Debugger MCP bridge is running for ${workspace}. ` +
         'Open this project in VS Code and activate the Vite Debugger extension.',
+        { cause: error },
       );
     }
     throw error;

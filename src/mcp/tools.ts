@@ -2269,10 +2269,10 @@ async function ensurePrivateTraceDirectory(directory: string): Promise<void> {
     }
     const created = await fs.lstat(directory);
     if (created.isSymbolicLink() || !created.isDirectory()) {
-      throw new Error(`Could not create a safe trace directory: ${directory}`);
+      throw new Error(`Could not create a safe trace directory: ${directory}`, { cause: error });
     }
     if (typeof process.getuid === 'function' && created.uid !== process.getuid()) {
-      throw new Error(`Trace directory is owned by another user: ${directory}`);
+      throw new Error(`Trace directory is owned by another user: ${directory}`, { cause: error });
     }
   }
   await fs.chmod(directory, 0o700);

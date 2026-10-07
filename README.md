@@ -226,7 +226,7 @@ An `attach` session retains the broader discovery order:
 
 ## Testing
 
-Development and host testing require a Node.js version supported by Vitest 5: Node 22.12+ on the 22.x line, Node 24, or Node 26+. Run `npm ci` before the checks below.
+Development and host testing require a Node.js version supported by ESLint 10 and Vitest 5: Node 22.13+ on the 22.x line, Node 24, or Node 26+. Run `npm ci` before the checks below.
 
 The repo ships with two layers of regression tests.
 
@@ -255,6 +255,8 @@ Environment variables:
 - `VSCODE_EXECUTABLE_PATH` — use an existing VS Code executable instead of downloading a test build.
 
 Run individual static checks with `npm run lint`, `npm run typecheck`, and `npm run typecheck:test`.
+
+GitHub Actions runs `npm ci`, `npm run audit:all`, and `npm run test:all` on pull requests and pushes to `main`. The workflow uses Node 22.22.2 and Ubuntu 24.04 with the runner's Google Chrome and Xvfb for the VS Code host. It can also be started manually from the Actions tab. Source lint uses `eslint.config.cjs`; both JavaScript and TypeScript recommended rules apply to `src/**/*.ts`.
 
 `npm run audit:all` audits all dependencies, including development and test tools. `npm run audit:runtime` audits production dependencies only. Build and test commands also replace the older SDK, HTTP adapter, URI and IP copies embedded in Playwright with a shared patched runtime; see [dependency security](docs/dependency-security.md) for the scope, versions, and build verification.
 

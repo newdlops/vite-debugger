@@ -13,7 +13,7 @@ Reviewed on 2026-10-07 for release 0.1.7016. The production registry dependency 
 | `proxy-addr` | 2.0.7 | 2.0.8 | Express dependency; absent from the original extension and sidecar bundle outputs. |
 | `qs` | 6.15.3 | 6.16.0 | Express dependency; absent from the original extension and sidecar bundle outputs. |
 
-The Hono adapter stays on its patched 1.x release to retain its Node 18 runtime support. The SDK explicitly accepts this release line. Development and host testing require Node 22.12+ on the 22.x line, Node 24, or Node 26+.
+The Hono adapter stays on its patched 1.x release to retain its Node 18 runtime support. The SDK explicitly accepts this release line. Development and host testing require Node 22.13+ on the 22.x line, Node 24, or Node 26+.
 
 ## Reachability
 
@@ -56,7 +56,8 @@ After a clean `npm ci`, both `npm run audit:all` and `npm run audit:runtime` rep
 | Vite | 5.4.21 | 6.4.4 |
 | Mocha | 10.8.2 | 12.0.3 |
 | esbuild | 0.20.2 | 0.28.2 |
-| glob | 11.0.0 | 11.1.0 |
+| glob | 11.0.0 | 13.0.6 |
+| ESLint | 8.57.1 | 10.12.0 |
 | React Vite plugin (Babel) | 4.3.4 | 5.2.0 |
 | React Vite plugin (SWC) | 3.7.2 | 4.3.3 |
 | Node type definitions | 20.19.39 | 22.20.5 |
@@ -66,3 +67,5 @@ Vitest 5 removes the affected Tinypool dependency and includes the fixes for the
 Vite is now an explicit test dependency. The existing Babel, compact-source-map, and SWC fixture modes remain available. Vitest uses its current [file parallelism](https://vitest.dev/config/fileparallelism.html) and [worker limit](https://vitest.dev/config/maxworkers.html) settings to run files sequentially with isolation. Test typechecking uses the bundler module resolver for modern ESM package exports; the extension's CommonJS/Node build configuration is unchanged.
 
 Run `npm ci`, `npm run audit:all`, `npm run audit:runtime`, `npm run test:all`, and `npm run package` to reproduce the dependency, compatibility, and artifact checks. Registry audit results describe the installed dependency graph at the time of the check; they do not cover arbitrary inlined third-party copies. The separate Playwright verification above continues to cover its replaced runtime copies.
+
+ESLint now uses its native flat configuration and the supported 10.x line. Updating ESLint and glob removes the deprecated 7.x/11.x glob copies, old Rimraf/InFlight chain, and legacy Humanwhocodes config packages. The lockfile contains no deprecated package entries. GitHub Actions performs the full registry audit and existing complete test pipeline on pull requests and `main` pushes.

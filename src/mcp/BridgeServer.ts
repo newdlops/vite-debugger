@@ -267,7 +267,7 @@ export class BridgeServer implements vscode.Disposable {
       const candidatePath = path.join(this.runtimeDirectory, name);
       if (candidatePath === this.manifestPath) continue;
 
-      let remove = false;
+      let remove: boolean;
       try {
         const raw = fs.readFileSync(candidatePath, 'utf8');
         const manifest = JSON.parse(raw) as Partial<BridgeManifest>;
