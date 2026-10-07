@@ -9,6 +9,7 @@
 - Adds `npm run audit:all` for the complete dependency graph and documents the supported development Node versions.
 - Migrates ESLint to the supported 10.x line with native flat configuration and glob to 13.x, removing deprecated dependencies and unused lint suppression comments. Existing lint exceptions remain scoped to intentional dynamic values and empty cleanup catches.
 - Adds GitHub Actions checks for pull requests and `main` pushes, including lint, both typechecks, Chrome regressions, VS Code host tests, and the full dependency audit.
+- Allows bounded 30-second Chrome startup on shared CI runners and cleans up failed test browser starts, with delayed-port and process/profile ownership regressions.
 - Preserves original errors as causes when adding MCP bridge and trace-directory context, and removes redundant initial assignments.
 
 ## 0.1.7016 (2026-10-07)
