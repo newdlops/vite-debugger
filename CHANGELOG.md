@@ -160,7 +160,7 @@
 ### Other
 
 - **HMR URL normalization**: Vite's `?v=<hash>` / `?t=<ts>` cache-busters are stripped so the same logical file is recognized across HMR reloads (stale scriptId cleanup).
-- **Smart-step logging**: only logs at step #1 and every 5th — was spamming on React internal loops.
+- **Smart-step logging**: only logs at step `#1` and every 5th — was spamming on React internal loops.
 
 ## 0.1.0 (2026-04-16)
 
