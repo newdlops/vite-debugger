@@ -115,7 +115,6 @@ interface UrlBreakpointSpec {
  * already-parsed script through this emitter.
  */
 export class CdpClient extends EventEmitter {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private client: any = null;
 
   /** Vite URL used to decide which tabs (targets) we manage. */

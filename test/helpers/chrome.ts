@@ -35,11 +35,11 @@ export async function launchTestChrome(
 ): Promise<LaunchedChrome> {
   // chrome-launcher is ESM-dynamic in some versions; require works for CJS build
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { launch } = require('chrome-launcher') as typeof import('chrome-launcher');
+  const { Launcher } = require('chrome-launcher') as typeof import('chrome-launcher');
 
   const port = opts.port ?? (await getFreePort());
 
-  const instance = await launch({
+  const instance = new Launcher({
     port,
     startingUrl: opts.startingUrl ?? 'about:blank',
     chromeFlags: [
@@ -56,13 +56,24 @@ export async function launchTestChrome(
       '--hide-scrollbars',
     ],
     handleSIGINT: false,
-    // chrome-launcher pool waits for the debug port to be reachable.
+    // Cold Chrome startup can exceed five seconds on shared CI runners.
+    // This only extends readiness polling; test failures are never retried.
     connectionPollInterval: 100,
-    maxConnectionRetries: 50,
+    maxConnectionRetries: 300,
+    logLevel: 'error',
   });
 
+  try {
+    await instance.launch();
+  } catch (error) {
+    // launch() can reject after spawning Chrome. Keep the instance so failed
+    // setup releases its process and temporary profile as well.
+    instance.kill();
+    throw error;
+  }
+
   return {
-    port: instance.port,
+    port: instance.port!,
     kill: async () => {
       await instance.kill();
     },

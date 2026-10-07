@@ -69,7 +69,7 @@ export async function withFileLock<T>(lockPath: string, action: () => Promise<T>
     } catch (error) {
       if (!isFileAlreadyExists(error)) throw error;
 
-      let stale = false;
+      let stale: boolean;
       try {
         const stat = await fs.lstat(lockPath);
         if (stat.isSymbolicLink()) {

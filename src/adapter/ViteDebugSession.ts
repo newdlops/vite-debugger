@@ -2179,7 +2179,7 @@ export class ViteDebugSession extends LoggingDebugSession {
       // CallStackManager here lets a second tab clear the first tab's frames
       // while it is still resolving.
       const pauseCallStackManager = new CallStackManager(this.sourceMapResolver, this.urlMapper);
-      let pauseFrames: ResolvedCallFrame[] = [];
+      let pauseFrames: ResolvedCallFrame[];
       try {
         pauseFrames = await pauseCallStackManager.resolveCallFrames(
           params.callFrames, registerSourceRef

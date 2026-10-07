@@ -685,7 +685,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           void Promise.resolve().then(() => vscode.debug.stopDebugging(session)).catch(() => undefined);
         };
         return {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           onDidSendMessage(message: any) {
             if (!message) return;
             if (message.type === 'response' &&

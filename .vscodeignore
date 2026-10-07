@@ -15,9 +15,10 @@ node_modules/**
 **/.env
 **/.env.*
 .git/**
+.github/**
 tsconfig.json
 .eslintrc.json
-.eslintrc.cjs
+eslint.config.cjs
 vitest.config.ts
 **/*.map
 *.log
