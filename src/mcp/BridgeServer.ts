@@ -455,6 +455,7 @@ export class BridgeServer implements vscode.Disposable {
       throw new RpcError(-32602, 'configurationName must be a string');
     }
     const name = value.trim();
+    // eslint-disable-next-line no-control-regex -- Reject non-printable configuration names.
     if (name.length === 0 || name.length > MAX_DEBUG_CONFIGURATION_NAME || /[\x00-\x1f\x7f]/.test(name)) {
       throw new RpcError(
         -32602,
@@ -486,6 +487,7 @@ export class BridgeServer implements vscode.Disposable {
   ): Promise<string | undefined> {
     if (value === undefined) return undefined;
     if (typeof value !== 'string' || value.length === 0 || value.length > MAX_VITE_URL_CHARS ||
+        // eslint-disable-next-line no-control-regex -- Reject whitespace and control characters before URL parsing.
         /[\x00-\x20\x7f]/.test(value)) {
       throw new RpcError(-32602, `${fieldName} must contain 1-${MAX_VITE_URL_CHARS} URL characters`);
     }
@@ -860,6 +862,7 @@ export class BridgeServer implements vscode.Disposable {
 
   private debugStartError(configurationName: string, error: unknown): string {
     const detail = (error instanceof Error ? error.message : String(error))
+      // eslint-disable-next-line no-control-regex -- Sanitize untrusted error text while preserving tabs and newlines.
       .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ');
     const message = `Could not start Vite debug configuration ${configurationName}: ${detail}`;
     return message.length <= MAX_DEBUG_START_ERROR_CHARS
@@ -936,6 +939,7 @@ export class BridgeServer implements vscode.Disposable {
       if (!isRecord(value) || value.type !== 'vite') continue;
       if (typeof value.name !== 'string') continue;
       const name = value.name.trim();
+      // eslint-disable-next-line no-control-regex -- Reject non-printable configuration names.
       if (name.length === 0 || name.length > MAX_DEBUG_CONFIGURATION_NAME || /[\x00-\x1f\x7f]/.test(name)) {
         continue;
       }

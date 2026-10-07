@@ -226,6 +226,8 @@ An `attach` session retains the broader discovery order:
 
 ## Testing
 
+Development and host testing require Node.js 22 or newer. Run `npm ci` before the checks below.
+
 The repo ships with two layers of regression tests.
 
 **Adapter-level E2E (`vitest`)** — boots a real Vite dev server + headless Chrome and drives `ViteDebugSession` via DAP. Covers launch, breakpoint set/hit/clear, stack/scopes/variables, evaluate, continue, and source-map resolution. No VSCode UI is required.
@@ -240,7 +242,7 @@ npm run test:e2e
 npm run test:vscode
 ```
 
-**Both:**
+**All checks** — source lint, source and test typechecks, adapter E2E, and VS Code host smoke:
 
 ```sh
 npm run test:all
@@ -249,6 +251,12 @@ npm run test:all
 Environment variables:
 
 - `VITE_DEBUGGER_TEST_LOG=1` — mirror the extension's internal logger + adapter `OutputEvent`s to stderr during `test:e2e`. Useful when a regression pauses in an unexpected location.
+- `VSCODE_TEST_VERSION` — select a VS Code test version (defaults to `stable`).
+- `VSCODE_EXECUTABLE_PATH` — use an existing VS Code executable instead of downloading a test build.
+
+Run individual static checks with `npm run lint`, `npm run typecheck`, and `npm run typecheck:test`.
+
+`npm run bench:resources` runs a repeatable synthetic source-map and breakpoint workload and prints Node CPU time, retained JavaScript heap, and Chrome query counts. The recorded before/after comparison is in `test/perf/resource-results.json`; these measurements do not represent total VS Code/Chrome memory or long-running application usage.
 
 Fixtures live under `test/fixtures/sample-app/` (tiny React + Vite project with a deterministic breakpoint target at `src/math.ts:2`) and `test/vscode-host/fixture-workspace/`.
 

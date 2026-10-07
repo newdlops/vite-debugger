@@ -12,6 +12,8 @@ async function main() {
 
   try {
     await runTests({
+      version: process.env.VSCODE_TEST_VERSION || 'stable',
+      vscodeExecutablePath: process.env.VSCODE_EXECUTABLE_PATH,
       extensionDevelopmentPath,
       extensionTestsPath,
       extensionTestsEnv: {

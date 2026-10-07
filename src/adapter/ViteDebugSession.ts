@@ -12,6 +12,7 @@ import {
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { CdpClient, ScriptParsedEvent, PausedEvent } from '../cdp/CdpClient';
 import { ConsoleAPICalledEvent, RemoteObject, BreakLocation, FetchRequestPausedEvent } from '../cdp/CdpTypes';
+import { BreakpointLocationResolver, MappedBreakpointLocation } from '../breakpoints/BreakpointLocationResolver';
 import { NetworkBreakpointManager } from '../breakpoints/NetworkBreakpointManager';
 import {
   findViteTab,
@@ -46,12 +47,12 @@ function compileGlob(pattern: string): RegExp {
     .replace(/[.+^${}()|[\]]/g, '\\$&')
     .replace(/\*\*/g, '\u0000')
     .replace(/\*/g, '[^/]*')
-    .replace(/\u0000/g, '.*')
+    .split('\u0000').join('.*')
     .replace(/\?/g, '[^/]');
   return new RegExp(regexStr);
 }
 
-interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
+export interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
   viteUrl?: string;
   /** Browser application page. May use a different local origin from the Vite module server. */
   pageUrl?: string;
@@ -68,7 +69,7 @@ interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
   reloadOnAttach?: boolean;
 }
 
-interface AttachRequestArguments extends DebugProtocol.AttachRequestArguments {
+export interface AttachRequestArguments extends DebugProtocol.AttachRequestArguments {
   viteUrl?: string;
   /** Browser application page. May use a different local origin from the Vite module server. */
   pageUrl?: string;
@@ -139,6 +140,7 @@ export class ViteDebugSession extends LoggingDebugSession {
   private mcpPausedTargets = new Map<string, McpPausedTargetState>();
   private urlMapper: ViteUrlMapper | null = null;
   private sourceMapResolver: SourceMapResolver | null = null;
+  private breakpointLocations: BreakpointLocationResolver | null = null;
   private breakpointManager: BreakpointManager | null = null;
   private callStackManager: CallStackManager | null = null;
   private scopeManager: ScopeManager | null = null;
@@ -437,7 +439,8 @@ export class ViteDebugSession extends LoggingDebugSession {
     this.activeChromePort = chromePort;
 
     // Initialize managers (depends on cdp)
-    this.breakpointManager = new BreakpointManager(this.cdp, this.sourceMapResolver, this.viteServer!.url);
+    this.breakpointLocations = new BreakpointLocationResolver(this.cdp, this.sourceMapResolver);
+    this.breakpointManager = new BreakpointManager(this.cdp, this.sourceMapResolver, this.viteServer!.url, this.breakpointLocations);
     this.callStackManager = new CallStackManager(this.sourceMapResolver, this.urlMapper);
     this.scopeManager = new ScopeManager();
     this.variableManager = new VariableManager(this.cdp);
@@ -474,7 +477,8 @@ export class ViteDebugSession extends LoggingDebugSession {
               this.sendEvent(new BreakpointEvent('changed', {
                 id: bp.dapId,
                 verified: true,
-                line: bp.line,
+                line: bp.resolvedLine ?? bp.line,
+                column: bp.resolvedColumn ?? bp.column,
               } as DebugProtocol.Breakpoint));
             }
           }).catch(() => {});
@@ -511,7 +515,24 @@ export class ViteDebugSession extends LoggingDebugSession {
       ));
     });
     this.cdp.on('targetDetached', (sessionId: string) => {
+      const scripts = this.hmrScriptUrlsBySession.get(sessionId);
       this.hmrScriptUrlsBySession.delete(sessionId);
+      const removedIds = new Set(scripts?.values());
+      for (const [url, scriptId] of scripts ?? []) {
+        this.sourceMapResolver?.unregisterScript(scriptId, true);
+        this.scriptIdToUrl.delete(scriptId);
+        this.unmappableScripts.delete(scriptId);
+        if (this.knownScriptUrls.get(url) === scriptId) {
+          this.knownScriptUrls.delete(url);
+          for (const other of this.hmrScriptUrlsBySession.values()) {
+            const replacement = other.get(url);
+            if (replacement) this.knownScriptUrls.set(url, replacement);
+          }
+        }
+      }
+      for (const [reference, scriptId] of this.sourceRefToScriptId) {
+        if (removedIds.has(scriptId)) this.sourceRefToScriptId.delete(reference);
+      }
       this.removeMcpPausedSession(sessionId);
       const managedTargetIds = new Set(this.cdp?.listTargets().map((target) => target.targetId) ?? []);
       for (const targetId of this.requestedPauseTargets) {
@@ -664,6 +685,7 @@ export class ViteDebugSession extends LoggingDebugSession {
     // any bp on it can hit.
     const hasUnverified = breakpoints.some((bp) => !bp.verified);
     if (hasUnverified && (args.breakpoints?.length ?? 0) > 0) {
+      if (this.sourceMapResolver?.hasFailedScripts()) this.scheduleSourceMapRetry();
       this.tryProactiveModuleLoad(sourcePath).catch(() => undefined);
     }
   }
@@ -744,74 +766,27 @@ export class ViteDebugSession extends LoggingDebugSession {
     const endLine = args.endLine ?? args.line;
     const normalizedPath = sourcePath.replace(/\\/g, '/');
 
-    // Collect distinct (scriptId, genLine) ranges we need to query. A single
-    // original line often maps to many generated positions spread across
-    // several generated lines (JSX expansion, HMR wrappers, etc.); a single
-    // generated line can also host mappings for several original lines.
-    // Dedupe so getPossibleBreakpoints is called once per distinct gen-line.
-    const genLinesByScript = new Map<string, Set<number>>();
-    for (let origLine = startLine; origLine <= endLine; origLine++) {
-      const genPositions = this.sourceMapResolver.getGeneratedPositionsForOriginalLine(
-        sourcePath,
-        origLine,
-      );
-      for (const gp of genPositions) {
-        let lines = genLinesByScript.get(gp.scriptId);
-        if (!lines) {
-          lines = new Set();
-          genLinesByScript.set(gp.scriptId, lines);
-        }
-        lines.add(gp.lineNumber);
-      }
-    }
-
-    if (genLinesByScript.size === 0) {
-      response.body = { breakpoints: [] };
-      this.sendResponse(response);
-      return;
-    }
-
-    // Query CDP per (scriptId, genLine) in parallel.
-    const queryResults = await Promise.all(
-      [...genLinesByScript].flatMap(([scriptId, lines]) =>
-        [...lines].map(async (genLine) => {
-          try {
-            const locations = await this.cdp!.getPossibleBreakpoints(
-              { scriptId, lineNumber: genLine, columnNumber: 0 },
-              { scriptId, lineNumber: genLine + 1, columnNumber: 0 },
-            );
-            return { scriptId, locations };
-          } catch {
-            return { scriptId, locations: [] as BreakLocation[] };
-          }
-        }),
-      ),
-    );
-
-    // Back-map each CDP location to the original source; keep only those
-    // that land in the requested source and line range.
+    const locations = this.breakpointLocations
+      ??= new BreakpointLocationResolver(this.cdp, this.sourceMapResolver);
     const seen = new Set<string>();
     const breakpoints: DebugProtocol.BreakpointLocation[] = [];
-    for (const { scriptId, locations } of queryResults) {
-      const backs = await Promise.all(
-        locations.map((loc) =>
-          this.sourceMapResolver!.generatedToOriginal(
-            scriptId,
-            loc.lineNumber,
-            loc.columnNumber ?? 0,
-          ),
-        ),
-      );
-      for (const original of backs) {
-        if (!original) continue;
-        if (original.source !== normalizedPath) continue;
-        if (original.line < startLine || original.line > endLine) continue;
-        // DAP columns are 1-based; generatedToOriginal returns 0-based.
-        const col = (original.column ?? 0) + 1;
-        const key = `${original.line}:${col}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        breakpoints.push({ line: original.line, column: col });
+    // Large editor ranges must not spawn thousands of promises/CDP requests
+    // at once. The shared line cache still deduplicates each batch.
+    for (const scriptId of this.sourceMapResolver.getScriptsForSource(sourcePath)) {
+      for (let first = startLine; first <= endLine; first += 32) {
+        const requests: Array<Promise<MappedBreakpointLocation[]>> = [];
+        for (let line = first; line <= Math.min(first + 31, endLine); line++) {
+          requests.push(locations.forOriginalLine(normalizedPath, line, scriptId));
+        }
+        for (const positions of await Promise.all(requests)) {
+          for (const original of positions) {
+            const col = original.originalColumn + 1;
+            const key = `${original.originalLine}:${col}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            breakpoints.push({ line: original.originalLine, column: col });
+          }
+        }
       }
     }
 
@@ -1025,8 +1000,11 @@ export class ViteDebugSession extends LoggingDebugSession {
   ): Promise<void> {
     this.lastStepAction = null;
     this.smartStepCount = 0;
-    if (this.cdp) {
-      await this.cdp.resume();
+    try {
+      if (this.cdp) await this.cdp.resume();
+    } catch (error) {
+      this.sendErrorResponse(response, 1010, `Continue failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
     }
     response.body = { allThreadsContinued: true };
     this.sendResponse(response);
@@ -1882,16 +1860,19 @@ export class ViteDebugSession extends LoggingDebugSession {
 
     // Register source map: track metadata immediately, then load eagerly.
     // ensureSourceMap populates sourceToScripts which is needed for breakpoint resolution.
+    let scriptRevision: number | undefined;
     if (this.sourceMapResolver) {
       if (isHmrReload) {
         this.sourceMapResolver.unregisterScript(previousScriptId);
       }
       this.sourceMapResolver.trackScript(params.scriptId, params.url, params.sourceMapURL);
+      scriptRevision = this.sourceMapResolver.getScriptRevision(params.scriptId);
 
       // Await source map load — needed for breakpoint resolution below.
       // If loading fails, onSourceMapLoaded callback won't fire, and retry timer
       // will handle it later.
       const loaded = await this.sourceMapResolver.ensureSourceMap(params.scriptId);
+      if (this.sourceMapResolver.getScriptRevision(params.scriptId) !== scriptRevision) return;
       if (!loaded) {
         logger.warn(`Source map not available for ${params.url} — breakpoints for this file will be pending`);
         // Schedule retry if there are pending breakpoints
@@ -1919,7 +1900,8 @@ export class ViteDebugSession extends LoggingDebugSession {
           this.sendEvent(new BreakpointEvent('changed', {
             id: bp.dapId,
             verified: true,
-            line: bp.line,
+            line: bp.resolvedLine ?? bp.line,
+            column: bp.resolvedColumn ?? bp.column,
           } as DebugProtocol.Breakpoint));
         }
       }
@@ -1929,6 +1911,10 @@ export class ViteDebugSession extends LoggingDebugSession {
     // loadedSourcesRequest response so VSCode does not drop checksum state
     // after HMR and mark the top stack frame as modified/disabled.
     const loadedSource = await this.createSourceForScript(params.url, params.scriptId);
+    if (this.sourceMapResolver?.getScriptRevision(params.scriptId) !== scriptRevision) {
+      if (loadedSource.sourceReference) this.sourceRefToScriptId.delete(loadedSource.sourceReference);
+      return;
+    }
     this.sendEvent(new LoadedSourceEvent(isHmrReload ? 'changed' : 'new', loadedSource));
   }
 
@@ -2003,7 +1989,8 @@ export class ViteDebugSession extends LoggingDebugSession {
       this.sendEvent(new BreakpointEvent('changed', {
         id: bp.dapId,
         verified: true,
-        line: bp.line,
+        line: bp.resolvedLine ?? bp.line,
+        column: bp.resolvedColumn ?? bp.column,
       } as DebugProtocol.Breakpoint));
     }
     for (const bp of unresolved) {
@@ -2846,6 +2833,8 @@ export class ViteDebugSession extends LoggingDebugSession {
       this.hmrBatchTimer = null;
       this.pendingHmrScriptIds.length = 0;
     }
+    this.breakpointLocations?.dispose();
+    this.breakpointLocations = null;
     this.sourceMapResolver?.clear();
     this.breakpointManager?.clear();
     this.networkBreakpointManager?.clear();

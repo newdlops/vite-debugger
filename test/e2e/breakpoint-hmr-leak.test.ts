@@ -102,8 +102,12 @@ describe('Breakpoint HMR leak (log.txt reproduction)', () => {
   async function clickAndCheckPause(windowMs = 3000): Promise<
     { paused: true; event: DebugProtocol.Event } | { paused: false }
   > {
+    // Fast Refresh can reload the page. Observe the click once the fixture
+    // is interactive instead of relying on a fixed HMR settling duration.
+    await session.browser.waitForSelector('[data-testid="inc"]');
     session.dap.clearQueue('stopped');
     const stoppedPromise = session.dap.waitForEvent('stopped', windowMs);
+    void stoppedPromise.catch(() => undefined);
     await session.browser.triggerClick('[data-testid="inc"]');
     try {
       const ev = await stoppedPromise;

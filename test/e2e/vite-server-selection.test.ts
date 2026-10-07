@@ -7,6 +7,11 @@ import { describe, expect, it, vi } from 'vitest';
 
 const childProcess = vi.hoisted(() => ({ exec: vi.fn() }));
 
+// These probes always use lookup({ all: true }); expose that overload to Vitest.
+const allAddressDns: {
+  lookup(hostname: string, options: dns.LookupAllOptions): Promise<dns.LookupAddress[]>;
+} = dns.promises;
+
 vi.mock('child_process', () => ({ exec: childProcess.exec }));
 
 import {
@@ -333,7 +338,7 @@ describe('root-scoped Vite server selection', () => {
     if (!address || typeof address === 'string') throw new Error('Fixture did not bind a TCP port');
 
     let lookupCount = 0;
-    const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(async () => {
+    const lookup = vi.spyOn(allAddressDns, 'lookup').mockImplementation(async () => {
       lookupCount += 1;
       return lookupCount === 1
         ? [{ address: '127.0.0.1', family: 4 }]
@@ -467,7 +472,7 @@ describe('root-scoped Vite server selection', () => {
 
       // A trust failure alone is insufficient. If DNS contains even one
       // non-loopback address, the certificate bypass must be refused.
-      const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(async () => ([
+      const lookup = vi.spyOn(allAddressDns, 'lookup').mockImplementation(async () => ([
         { address: '127.0.0.1', family: 4 },
         { address: '192.0.2.10', family: 4 },
       ]));
@@ -487,7 +492,7 @@ describe('root-scoped Vite server selection', () => {
     const lookupService = vi.spyOn(dns.promises, 'lookupService').mockImplementation(
       async () => ({ hostname: 'localhost', service: 'https' }),
     );
-    const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(async () => ([
+    const lookup = vi.spyOn(allAddressDns, 'lookup').mockImplementation(async () => ([
       { address: '127.0.0.1', family: 4 },
     ]));
     childProcess.exec.mockImplementation((
@@ -528,7 +533,7 @@ describe('root-scoped Vite server selection', () => {
     const lookupService = vi.spyOn(dns.promises, 'lookupService').mockImplementation(
       async () => ({ hostname: 'alphac', service: 'https' }),
     );
-    const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(async () => ([
+    const lookup = vi.spyOn(allAddressDns, 'lookup').mockImplementation(async () => ([
       { address: '127.0.0.2', family: 4 },
       { address: '192.0.2.10', family: 4 },
     ]));

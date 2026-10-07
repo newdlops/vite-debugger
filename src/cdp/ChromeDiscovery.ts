@@ -34,7 +34,7 @@ function httpGetJson<T>(url: string, timeout: number = 3000): Promise<T> {
       res.on('end', () => {
         try {
           resolve(JSON.parse(body));
-        } catch (e) {
+        } catch {
           reject(new Error(`Failed to parse JSON from ${url}`));
         }
       });

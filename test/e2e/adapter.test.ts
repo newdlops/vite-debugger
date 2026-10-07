@@ -3,6 +3,7 @@ import * as path from 'path';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { E2ESession, startE2ESession } from '../helpers/session';
 import { enableTestLogging } from '../helpers/logger';
+import type { ViteAttachRequest } from '../helpers/dapClient';
 
 /**
  * Full-stack adapter E2E. Boots Vite + headless Chrome once, then runs the
@@ -62,7 +63,7 @@ describe('ViteDebugSession — full DAP flow', () => {
   it('attach resolves the fixture Vite server and emits InitializedEvent', async () => {
     const initialized = session.dap.waitForEvent('initialized', 30_000);
     await session.dap.request<
-      DebugProtocol.AttachRequest,
+      ViteAttachRequest,
       DebugProtocol.AttachResponse
     >('attach', {
       viteUrl: session.vite.url,

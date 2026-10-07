@@ -8,13 +8,13 @@ describe('BreakpointManager ownership', () => {
     let nextHandle = 1;
     const setBreakpointByUrl = vi.fn(async () => ({
       breakpointId: `physical-${nextHandle++}`,
-      locations: [],
+      locations: [{ scriptId: 'script-1', lineNumber: 1, columnNumber: 0 }],
     }));
     const removeBreakpoint = vi.fn(async () => undefined);
     const cdp = {
       setBreakpointByUrl,
       removeBreakpoint,
-      getPossibleBreakpoints: vi.fn(async () => []),
+      getPossibleBreakpoints: vi.fn(async () => [{ scriptId: 'script-1', lineNumber: 1, columnNumber: 0 }]),
     } as unknown as CdpClient;
 
     const sourcePath = '/workspace/src/math.ts';
@@ -25,7 +25,14 @@ describe('BreakpointManager ownership', () => {
         columnNumber: column,
       })),
       getScriptsForSource: vi.fn(() => ['script-1']),
-      generatedToOriginal: vi.fn(async () => null),
+      getScriptUrl: vi.fn(() => 'http://127.0.0.1:5173/src/math.ts'),
+      getScriptRevision: vi.fn(() => 1),
+      onScriptRemoved: vi.fn(() => () => undefined),
+      ensureSourceMap: vi.fn(async () => true),
+      isSourceMapLoaded: vi.fn(() => true),
+      getSourceContent: vi.fn(() => null),
+      getGeneratedLinesForOriginalLine: vi.fn(() => [1]),
+      generatedToOriginal: vi.fn(async () => ({ source: sourcePath, line: 2, column: 0 })),
     } as unknown as SourceMapResolver;
 
     const manager = new BreakpointManager(cdp, resolver, 'http://127.0.0.1:5173/');

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { Mock } from 'vitest';
 import { NetworkBreakpointManager } from '../../src/breakpoints/NetworkBreakpointManager';
 import { CdpClient } from '../../src/cdp/CdpClient';
 import type { FetchRequestPausedEvent } from '../../src/cdp/CdpTypes';
@@ -18,8 +19,8 @@ function pausedRequest(requestId: string): FetchRequestPausedEvent {
 
 function routableCdpClient(owners: Map<string, Set<string>>): {
   client: CdpClient;
-  continueRequest: ReturnType<typeof vi.fn>;
-  failRequest: ReturnType<typeof vi.fn>;
+  continueRequest: Mock<[], Promise<undefined>>;
+  failRequest: Mock<[], Promise<undefined>>;
 } {
   // CdpClient's constructor is intentionally private for production callers;
   // Reflect.construct gives this routing-only test a normally initialized

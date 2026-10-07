@@ -26,7 +26,7 @@ export class SourceMapCache {
   private tail: Node | null = null;  // LRU
   private maxSize: number;
 
-  constructor(maxSize: number = 500) {
+  constructor(maxSize: number = 500, private onEvicted?: (key: string) => void) {
     this.maxSize = maxSize;
   }
 
@@ -58,6 +58,7 @@ export class SourceMapCache {
       this.removeNode(evicted);
       this.map.delete(evicted.key);
       try { evicted.consumer.destroy(); } catch { /* best-effort */ }
+      this.onEvicted?.(evicted.key);
     }
   }
 

@@ -1,6 +1,6 @@
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { DAPClient } from './dapClient';
-import { FixtureViteServer, startFixtureVite } from './viteServer';
+import { FixtureViteOptions, FixtureViteServer, startFixtureVite } from './viteServer';
 import { LaunchedChrome, launchTestChrome } from './chrome';
 import { BrowserSession, connectTestBrowser } from './browser';
 
@@ -15,6 +15,7 @@ export interface E2ESession {
 }
 
 export interface StartOptions {
+  vite?: FixtureViteOptions;
   /** Reserved for future variants — currently tests always drive navigation after attach. */
   skipNavigate?: boolean;
 }
@@ -35,38 +36,42 @@ export interface StartOptions {
  * After this returns the fixture page is loaded, the adapter is attached,
  * and setBreakpoints calls will resolve against real scriptParsed events.
  */
-export async function startAttachedSession(): Promise<E2ESession> {
-  const session = await startE2ESession();
-  await session.dap.request<
-    DebugProtocol.InitializeRequest,
-    DebugProtocol.InitializeResponse
-  >('initialize', {
-    adapterID: 'vite',
-    linesStartAt1: true,
-    columnsStartAt1: true,
-    pathFormat: 'path',
-  });
-  const initialized = session.dap.waitForEvent('initialized', 30_000);
-  await session.dap.request<
-    DebugProtocol.AttachRequest,
-    DebugProtocol.AttachResponse
-  >('attach', {
-    viteUrl: session.vite.url,
-    chromePort: session.chrome.port,
-    webRoot: session.webRoot,
-  });
-  await initialized;
-  await session.dap.request('configurationDone', {});
-  await session.browser.navigate(session.vite.url);
-  await session.browser.waitForSelector('[data-testid="inc"]');
-  // Let Vite dep-optimize + React hydrate + scriptParsed fan-out settle so
-  // subsequent setBreakpoints resolves against live scripts.
-  await new Promise((r) => setTimeout(r, 1500));
-  return session;
+export async function startAttachedSession(options: StartOptions = {}): Promise<E2ESession> {
+  const session = await startE2ESession(options);
+  try {
+    await session.dap.request<
+      DebugProtocol.InitializeRequest,
+      DebugProtocol.InitializeResponse
+    >('initialize', {
+      adapterID: 'vite',
+      linesStartAt1: true,
+      columnsStartAt1: true,
+      pathFormat: 'path',
+    });
+    const attachArgs = {
+      viteUrl: session.vite.url,
+      chromePort: session.chrome.port,
+      webRoot: session.webRoot,
+    };
+    await Promise.all([
+      session.dap.waitForEvent('initialized', 30_000),
+      session.dap.request<DebugProtocol.Request, DebugProtocol.AttachResponse>('attach', attachArgs),
+    ]);
+    await session.dap.request('configurationDone', {});
+    await session.browser.navigate(session.vite.url + '/');
+    await session.browser.waitForSelector('[data-testid="inc"]');
+    // Let Vite dep-optimize + React hydrate + scriptParsed fan-out settle so
+    // subsequent setBreakpoints resolves against live scripts.
+    await new Promise((r) => setTimeout(r, 1500));
+    return session;
+  } catch (error) {
+    await session.dispose();
+    throw error;
+  }
 }
 
 export async function startE2ESession(options: StartOptions = {}): Promise<E2ESession> {
-  const vite = await startFixtureVite();
+  const vite = await startFixtureVite(0, options.vite);
   let chrome: LaunchedChrome | null = null;
   let browser: BrowserSession | null = null;
   let dap: DAPClient | null = null;

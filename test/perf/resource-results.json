@@ -1,0 +1,150 @@
+{
+  "method": "Five samples, forced GC between phases; synthetic adapter workload excluding Chrome/Vite startup and network latency. Heap measurements are Node JavaScript heap, not total process RSS.",
+  "command": "npm run bench:resources",
+  "before": {
+    "node": "v22.22.2",
+    "platform": "darwin-arm64",
+    "workload": {
+      "lines": 6000,
+      "segmentsPerLine": 4,
+      "scripts": 8,
+      "breakpointCount": 24,
+      "samples": 5
+    },
+    "samples": [
+      {
+        "loadMs": 28.805875,
+        "loadCpuMs": 63.529,
+        "loadedHeapBytes": 20308848,
+        "breakpointMs": 219.336875,
+        "breakpointCpuMs": 232.39,
+        "boundHeapBytes": 20652176,
+        "cdpQueries": 24
+      },
+      {
+        "loadMs": 18.08054199999998,
+        "loadCpuMs": 30.321,
+        "loadedHeapBytes": 20506560,
+        "breakpointMs": 190.272875,
+        "breakpointCpuMs": 200.741,
+        "boundHeapBytes": 20531432,
+        "cdpQueries": 24
+      },
+      {
+        "loadMs": 17.40537500000005,
+        "loadCpuMs": 22.621,
+        "loadedHeapBytes": 20479032,
+        "breakpointMs": 199.65979200000004,
+        "breakpointCpuMs": 206.913,
+        "boundHeapBytes": 20496712,
+        "cdpQueries": 24
+      },
+      {
+        "loadMs": 15.941458000000011,
+        "loadCpuMs": 21.698,
+        "loadedHeapBytes": 20471040,
+        "breakpointMs": 207.19841699999995,
+        "breakpointCpuMs": 209.619,
+        "boundHeapBytes": 20486368,
+        "cdpQueries": 24
+      },
+      {
+        "loadMs": 15.903249999999957,
+        "loadCpuMs": 21.416,
+        "loadedHeapBytes": 20471624,
+        "breakpointMs": 206.72062500000004,
+        "breakpointCpuMs": 212.585,
+        "boundHeapBytes": 20482104,
+        "cdpQueries": 24
+      }
+    ]
+  },
+  "after": {
+    "node": "v22.22.2",
+    "platform": "darwin-arm64",
+    "workload": {
+      "lines": 6000,
+      "segmentsPerLine": 4,
+      "scripts": 8,
+      "breakpointCount": 24,
+      "samples": 5
+    },
+    "samples": [
+      {
+        "loadMs": 4.815790999999997,
+        "loadCpuMs": 4.691,
+        "loadedHeapBytes": 1943808,
+        "breakpointMs": 29.335292000000003,
+        "breakpointCpuMs": 63.343,
+        "boundHeapBytes": 6988200,
+        "cdpQueries": 1
+      },
+      {
+        "loadMs": 3.068415999999999,
+        "loadCpuMs": 3.071,
+        "loadedHeapBytes": 2153312,
+        "breakpointMs": 15.688625000000002,
+        "breakpointCpuMs": 33.516,
+        "boundHeapBytes": 6846824,
+        "cdpQueries": 1
+      },
+      {
+        "loadMs": 2.771375000000006,
+        "loadCpuMs": 3.108,
+        "loadedHeapBytes": 2131600,
+        "breakpointMs": 16.305542000000017,
+        "breakpointCpuMs": 34.222,
+        "boundHeapBytes": 6820032,
+        "cdpQueries": 1
+      },
+      {
+        "loadMs": 2.9664999999999964,
+        "loadCpuMs": 2.894,
+        "loadedHeapBytes": 2124104,
+        "breakpointMs": 14.328667000000024,
+        "breakpointCpuMs": 28.169,
+        "boundHeapBytes": 6801736,
+        "cdpQueries": 1
+      },
+      {
+        "loadMs": 3.6890830000000108,
+        "loadCpuMs": 3.516,
+        "loadedHeapBytes": 2124160,
+        "breakpointMs": 14.830833000000013,
+        "breakpointCpuMs": 30.072,
+        "boundHeapBytes": 6804480,
+        "cdpQueries": 1
+      }
+    ]
+  },
+  "median": {
+    "loadMs": {
+      "before": 17.40537500000005,
+      "after": 3.068415999999999
+    },
+    "loadCpuMs": {
+      "before": 22.621,
+      "after": 3.108
+    },
+    "loadedHeapBytes": {
+      "before": 20471624,
+      "after": 2124160
+    },
+    "breakpointMs": {
+      "before": 206.72062500000004,
+      "after": 15.688625000000002
+    },
+    "breakpointCpuMs": {
+      "before": 209.619,
+      "after": 33.516
+    },
+    "boundHeapBytes": {
+      "before": 20496712,
+      "after": 6820032
+    },
+    "cdpQueries": {
+      "before": 24,
+      "after": 1
+    }
+  }
+}

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.7015 (2026-10-07)
+
+### Fixed
+
+- **Component breakpoint accuracy** — resolves breakpoints against the original source and executable Chrome locations, including compact transforms, React component wrappers, pending modules, HMR, and Vite base paths. Empty or stale Chrome locations no longer produce falsely verified breakpoints.
+- **Continue races** — reconciles targets that Chrome has already resumed without clearing a newer pause, and returns failed continue requests through DAP instead of leaving them pending.
+- **Target cleanup** — discards closed-tab scripts, source references, and stale asynchronous source-map loads while preserving breakpoints in remaining tabs.
+
+### Performance
+
+- Discovers source files without eagerly expanding every source-map position, and builds compact line indexes only when needed.
+- Shares bounded executable-location caches between source breakpoints and gutter queries; concurrent requests reuse one Chrome query.
+- Releases derived indexes on cache eviction and avoids repeated decoding of failed immutable maps.
+
+### Development
+
+- Adds TypeScript ESLint configuration and a separate test typecheck; `npm run test:all` now runs lint, both typechecks, adapter tests, and VS Code host tests.
+- Updates the VS Code test runner for current macOS executable names and supports explicit test versions or executable paths.
+- Adds reproducible resource benchmarks and browser regressions for component mapping, HMR, multi-tab cleanup, and continue races.
+
 ## 0.1.7013 (2026-07-13)
 
 ### Fixed

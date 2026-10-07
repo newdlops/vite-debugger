@@ -3,7 +3,7 @@ import * as https from 'https';
 import * as dns from 'dns';
 import * as net from 'net';
 import * as path from 'path';
-import { SourceMapConsumer, RawSourceMap, SourceMapConsumer as SMC } from 'source-map';
+import { SourceMapConsumer, RawSourceMap } from 'source-map';
 import { SourceMapCache } from './SourceMapCache';
 import { logger } from '../util/Logger';
 import { isLoopbackHost, normalizeHost } from '../util/LocalHosts';
@@ -31,11 +31,10 @@ interface ScriptEntry {
    *  Pre-computed once at load so `findSourceName` is O(1) instead of an
    *  O(m) eachMapping scan on every originalToGenerated call. */
   sourceNameByPath: Map<string, string>;
-  /** source-name → (originalLine → generated positions on that line).
-   *  Built from a single eachMapping pass at load; lets `breakpointLocations`
-   *  and JSX-aware bp placement enumerate all breakable positions on an
-   *  original line without per-lookup full scans. */
-  generatedByLine: Map<string, Map<number, Array<{ lineNumber: number; columnNumber: number }>>>;
+  sourcePathByName: Map<string, string>;
+  /** Built only when breakpoint placement needs it. Columns stay in the
+   * consumer; callers query Chrome once per distinct generated line. */
+  generatedLinesByLine?: Map<string, Map<number, number[]>>;
   /** Whether the source map has been fetched and parsed */
   loaded: boolean;
 }
@@ -45,6 +44,7 @@ interface ScriptMeta {
   scriptId: string;
   url: string;
   sourceMapUrl: string;
+  revision: number;
 }
 
 interface LoopbackAddress {
@@ -295,7 +295,7 @@ function getLine(content: string, line: number): string | null {
 }
 
 export class SourceMapResolver {
-  private cache = new SourceMapCache();
+  private cache: SourceMapCache;
   private scripts = new Map<string, ScriptEntry>();
   private scriptMetas = new Map<string, ScriptMeta>();  // scriptId -> metadata (pre-load)
   private sourceToScripts = new Map<string, Set<string>>();  // filePath -> Set<scriptId>
@@ -322,12 +322,18 @@ export class SourceMapResolver {
    *  Populated in loadSourceMap, drained by consumeChangedSources — used to
    *  tell the breakpoint manager which files to treat as user-edited. */
   private recentlyChangedSources = new Set<string>();
+  private nextRevision = 1;
+  private scriptRemovedListeners = new Set<(scriptId: string) => void>();
   /** Callback invoked after a source map is successfully loaded (for resolving pending breakpoints) */
   onSourceMapLoaded: ((scriptId: string) => void) | null = null;
 
-  constructor(webRoot: string, viteRoot?: string) {
+  constructor(webRoot: string, viteRoot?: string, options: { maxCachedMaps?: number } = {}) {
     this.webRoot = webRoot.replace(/\/$/, '');
     this.viteRoot = (viteRoot ?? webRoot).replace(/\/$/, '');
+    this.cache = new SourceMapCache(options.maxCachedMaps ?? 500, (scriptId) => {
+      const entry = this.scripts.get(scriptId);
+      if (entry) entry.generatedLinesByLine = undefined;
+    });
   }
 
   /**
@@ -338,7 +344,12 @@ export class SourceMapResolver {
     if (!sourceMapUrl || !url) return;
     const normalizedUrl = normalizeViteUrl(url);
     const resolvedSmUrl = resolveSourceMapUrl(url, sourceMapUrl);
-    this.scriptMetas.set(scriptId, { scriptId, url: normalizedUrl, sourceMapUrl: resolvedSmUrl });
+    const previous = this.scriptMetas.get(scriptId);
+    if (previous?.url === normalizedUrl && previous.sourceMapUrl === resolvedSmUrl) return;
+    if (previous) this.unregisterScript(scriptId);
+    this.scriptMetas.set(scriptId, {
+      scriptId, url: normalizedUrl, sourceMapUrl: resolvedSmUrl, revision: this.nextRevision++,
+    });
 
     // Do NOT dedupe by URL here. The same file is parsed under a DIFFERENT
     // scriptId in every browser tab (CDP numbers scripts per session, and we
@@ -366,20 +377,32 @@ export class SourceMapResolver {
     // Need to load — get metadata
     const meta = this.scriptMetas.get(scriptId);
     if (!meta) return false;
+    // Re-decoding an immutable broken inline map or an optimized dependency
+    // map on every frame cannot recover it. A new script revision can.
+    if (this.failedScripts.has(scriptId)
+      && (meta.sourceMapUrl.startsWith('data:') || isOptimizedDependencyMap(meta.sourceMapUrl))) return false;
 
     const promise = this.loadSourceMap(scriptId, meta);
     this.loadingPromises.set(scriptId, promise);
     try {
       await promise;
     } finally {
-      this.loadingPromises.delete(scriptId);
+      if (this.loadingPromises.get(scriptId) === promise) this.loadingPromises.delete(scriptId);
     }
     return this.cache.has(scriptId);
   }
 
   private async loadSourceMap(scriptId: string, meta: ScriptMeta): Promise<void> {
+    let pendingConsumer: SourceMapConsumer | null = null;
     try {
       const { consumer, rawMap } = await this.fetchAndParseSourceMap(scriptId, meta.sourceMapUrl);
+      pendingConsumer = consumer;
+      // A tab can close, HMR can replace a script, or the session can stop
+      // while its map is loading. Never resurrect its metadata or WASM.
+      if (this.scriptMetas.get(scriptId) !== meta) {
+        consumer?.destroy();
+        return;
+      }
       if (!consumer) {
         this.failedScripts.add(scriptId);
         return;
@@ -390,40 +413,20 @@ export class SourceMapResolver {
 
       this.registeredScriptCount++;
 
-      // Single pass: collect unique source names, build the reverse map
-      // (resolved-path → source-name) so findSourceName is O(1) later, AND
-      // build a per-line index of generated positions so breakpointLocations
-      // can enumerate valid bp positions without a second full scan.
-      const sourceNames = new Set<string>();
-      const generatedByLine = new Map<
-        string,
-        Map<number, Array<{ lineNumber: number; columnNumber: number }>>
-      >();
-      consumer.eachMapping((mapping) => {
-        if (!mapping.source) return;
-        sourceNames.add(mapping.source);
-        let lineMap = generatedByLine.get(mapping.source);
-        if (!lineMap) {
-          lineMap = new Map();
-          generatedByLine.set(mapping.source, lineMap);
-        }
-        let bucket = lineMap.get(mapping.originalLine);
-        if (!bucket) {
-          bucket = [];
-          lineMap.set(mapping.originalLine, bucket);
-        }
-        bucket.push({
-          lineNumber: mapping.generatedLine - 1,
-          columnNumber: mapping.generatedColumn,
-        });
-      });
+      // Source discovery needs no mapping traversal. In particular, large
+      // vendor maps need not allocate thousands of JS objects or parse their
+      // WASM mappings merely because the page loaded them.
+      // Both supported consumers expose sources; the base typings omit it.
+      const sourceNames = new Set((consumer as SourceMapConsumer & { sources: string[] }).sources);
 
       const sources: string[] = [];
       const sourceNameByPath = new Map<string, string>();
+      const sourcePathByName = new Map<string, string>();
       for (const sourceName of sourceNames) {
         const resolved = this.resolveSourcePath(sourceName, meta.url, sourceMapFileDir);
         sources.push(resolved);
         sourceNameByPath.set(resolved, sourceName);
+        sourcePathByName.set(sourceName, resolved);
 
         if (!this.sourceToScripts.has(resolved)) {
           this.sourceToScripts.set(resolved, new Set());
@@ -451,9 +454,11 @@ export class SourceMapResolver {
         }
       }
 
+      this.cache.set(scriptId, consumer);
+      pendingConsumer = null;
       this.scripts.set(scriptId, {
         scriptId, url: meta.url, sourceMapUrl: meta.sourceMapUrl,
-        sources, sourceMapFile, sourceNameByPath, generatedByLine, loaded: true,
+        sources, sourceMapFile, sourceNameByPath, sourcePathByName, loaded: true,
       });
 
       // Clear from failed set if a retry succeeded
@@ -470,6 +475,8 @@ export class SourceMapResolver {
         try { this.onSourceMapLoaded(scriptId); } catch {}
       }
     } catch (e) {
+      pendingConsumer?.destroy();
+      if (this.scriptMetas.get(scriptId) !== meta) return;
       this.failedScripts.add(scriptId);
       logger.warn(`Failed to load source map for ${meta.url} (${meta.sourceMapUrl.startsWith('data:') ? 'data URI' : meta.sourceMapUrl}): ${e}`);
     }
@@ -497,7 +504,7 @@ export class SourceMapResolver {
       // useful for project breakpoints. Give each parsed script one fetch,
       // but do not let a missing/broken dependency map keep the adapter's
       // periodic retry loop alive indefinitely.
-      if (isOptimizedDependencyMap(meta.sourceMapUrl)) continue;
+      if (meta.sourceMapUrl.startsWith('data:') || isOptimizedDependencyMap(meta.sourceMapUrl)) continue;
       try {
         await this.loadSourceMap(scriptId, meta);
         if (this.cache.has(scriptId)) {
@@ -516,12 +523,12 @@ export class SourceMapResolver {
   hasFailedScripts(): boolean {
     for (const scriptId of this.failedScripts) {
       const meta = this.scriptMetas.get(scriptId);
-      if (meta && !isOptimizedDependencyMap(meta.sourceMapUrl)) return true;
+      if (meta && !meta.sourceMapUrl.startsWith('data:') && !isOptimizedDependencyMap(meta.sourceMapUrl)) return true;
     }
     return false;
   }
 
-  unregisterScript(scriptId: string): void {
+  unregisterScript(scriptId: string, forgetUnusedContent: boolean = false): void {
     const entry = this.scripts.get(scriptId);
     if (entry) {
       for (const source of entry.sources) {
@@ -530,6 +537,11 @@ export class SourceMapResolver {
           scripts.delete(scriptId);
           if (scripts.size === 0) {
             this.sourceToScripts.delete(source);
+            if (forgetUnusedContent) {
+              this.sourceContentByPath.delete(source);
+              this.priorSourceContentByPath.delete(source);
+              this.recentlyChangedSources.delete(source);
+            }
           }
         }
       }
@@ -541,10 +553,13 @@ export class SourceMapResolver {
     this.cache.delete(scriptId);
     this.scripts.delete(scriptId);
     this.scriptMetas.delete(scriptId);
+    this.loadingPromises.delete(scriptId);
     this.failedScripts.delete(scriptId);
+    for (const listener of this.scriptRemovedListeners) listener(scriptId);
   }
 
-  async originalToGenerated(filePath: string, line: number, column: number = 0): Promise<GeneratedLocation | null> {
+  async originalToGenerated(filePath: string, line: number, column: number = 0, expectedScriptId?: string): Promise<GeneratedLocation | null> {
+    if (line < 1 || column < 0) return null;
     const normalizedPath = filePath.replace(/\\/g, '/');
     const scriptIds = this.sourceToScripts.get(normalizedPath);
     if (!scriptIds || scriptIds.size === 0) {
@@ -556,6 +571,8 @@ export class SourceMapResolver {
     }
 
     for (const scriptId of scriptIds) {
+      if (expectedScriptId && scriptId !== expectedScriptId) continue;
+      if (!this.cache.has(scriptId)) await this.ensureSourceMap(scriptId);
       const consumer = this.cache.get(scriptId);
       if (!consumer) continue;
 
@@ -572,11 +589,12 @@ export class SourceMapResolver {
       // @react-refresh wrapper code at the bottom of the file.
       // We pick the EARLIEST generated position (lowest line number) because
       // the actual function body comes before the refresh wrapper code.
-      const allPositions = consumer.allGeneratedPositionsFor({
+      const allPositions = this.readMappings(scriptId, () => consumer.allGeneratedPositionsFor({
         source: sourceName,
         line,
         column,
-      });
+      }));
+      if (!allPositions) continue;
 
       if (allPositions.length > 0) {
         // Sort by line, then column — pick the earliest position
@@ -603,15 +621,14 @@ export class SourceMapResolver {
       }
 
       // Fallback: try LEAST_UPPER_BOUND for lines with no exact mapping
-      const generated = consumer.generatedPositionFor({
+      const generated = this.readMappings(scriptId, () => consumer.generatedPositionFor({
         source: sourceName,
         line,
         column,
-        // @ts-ignore — bias is supported but not in all type definitions
         bias: 2,  // SourceMapConsumer.LEAST_UPPER_BOUND
-      });
+      }));
 
-      if (generated.line !== null) {
+      if (generated && generated.line !== null) {
         return {
           scriptId,
           lineNumber: generated.line - 1,
@@ -623,7 +640,8 @@ export class SourceMapResolver {
     return null;
   }
 
-  async generatedToOriginal(scriptId: string, lineNumber: number, columnNumber: number = 0): Promise<OriginalLocation | null> {
+  async generatedToOriginal(scriptId: string, lineNumber: number, columnNumber: number = 0, allowFallback: boolean = true): Promise<OriginalLocation | null> {
+    if (lineNumber < 0 || columnNumber < 0) return null;
     // Lazy load: if source map not yet loaded, load it now
     if (!this.cache.has(scriptId) && this.scriptMetas.has(scriptId)) {
       await this.ensureSourceMap(scriptId);
@@ -641,31 +659,39 @@ export class SourceMapResolver {
     // the given position. This is critical for Vite's 1-line minified output
     // where code like `line 1, column 3000` needs to find the nearest mapping
     // segment at `column <= 3000` on the same line.
-    const original = consumer.originalPositionFor({
+    const original = this.readMappings(scriptId, () => consumer.originalPositionFor({
       line: lineNumber + 1,
       column: columnNumber,
-    });
+    }));
+    if (!original) return null;
 
     if (original.source !== null && original.line !== null) {
       return {
-        source: this.resolveSourcePath(original.source, entry.url, sourceMapFileDir),
+        source: entry.sourcePathByName.get(original.source)
+          ?? this.resolveSourcePath(original.source, entry.url, sourceMapFileDir),
         line: original.line,
         column: original.column ?? 0,
       };
     }
 
+    // Breakpoint placement must not borrow a mapping from another generated
+    // line or from beyond an explicitly unmapped helper. Stack presentation
+    // keeps the tolerant fallbacks below for scripts with sparse mappings.
+    if (!allowFallback) return null;
+
     // LEAST_UPPER_BOUND: if no mapping at-or-before, try at-or-after.
     // This helps when paused at the very start of a mapping segment.
-    const upper = consumer.originalPositionFor({
+    const upper = this.readMappings(scriptId, () => consumer.originalPositionFor({
       line: lineNumber + 1,
       column: columnNumber,
-      // @ts-ignore — bias is supported but not in all type definitions
       bias: 2,  // SourceMapConsumer.LEAST_UPPER_BOUND
-    });
+    }));
+    if (!upper) return null;
 
     if (upper.source !== null && upper.line !== null) {
       return {
-        source: this.resolveSourcePath(upper.source, entry.url, sourceMapFileDir),
+        source: entry.sourcePathByName.get(upper.source)
+          ?? this.resolveSourcePath(upper.source, entry.url, sourceMapFileDir),
         line: upper.line,
         column: upper.column ?? 0,
       };
@@ -674,13 +700,15 @@ export class SourceMapResolver {
     // No mapping on this line at all — search backwards through previous lines.
     // This handles multi-line generated code where some lines have no mappings.
     for (let searchLine = lineNumber - 1; searchLine >= Math.max(0, lineNumber - 50); searchLine--) {
-      const prev = consumer.originalPositionFor({
+      const prev = this.readMappings(scriptId, () => consumer.originalPositionFor({
         line: searchLine + 1,
         column: Infinity,  // Find the LAST mapping on the previous line
-      });
+      }));
+      if (!prev) return null;
       if (prev.source !== null && prev.line !== null) {
         return {
-          source: this.resolveSourcePath(prev.source, entry.url, sourceMapFileDir),
+          source: entry.sourcePathByName.get(prev.source)
+            ?? this.resolveSourcePath(prev.source, entry.url, sourceMapFileDir),
           line: prev.line,
           column: prev.column ?? 0,
         };
@@ -696,14 +724,57 @@ export class SourceMapResolver {
     return scripts ? [...scripts] : [];
   }
 
+  getScriptUrl(scriptId: string): string | null {
+    return this.scriptMetas.get(scriptId)?.url ?? null;
+  }
+
+  getScriptRevision(scriptId: string): number | undefined {
+    return this.scriptMetas.get(scriptId)?.revision;
+  }
+
+  onScriptRemoved(listener: (scriptId: string) => void): () => void {
+    this.scriptRemovedListeners.add(listener);
+    return () => { this.scriptRemovedListeners.delete(listener); };
+  }
+
+  getSourceContent(filePath: string): string | null {
+    return this.sourceContentByPath.get(filePath.replace(/\\/g, '/')) ?? null;
+  }
+
+  getGeneratedLinesForOriginalLine(filePath: string, line: number, scriptId: string): readonly number[] {
+    const entry = this.scripts.get(scriptId);
+    const consumer = this.cache.get(scriptId);
+    if (!entry || !consumer) return [];
+    const sourceName = entry.sourceNameByPath.get(filePath.replace(/\\/g, '/'));
+    if (!sourceName) return [];
+    if (!entry.generatedLinesByLine) {
+      const index = new Map<string, Map<number, number[]>>();
+      const parsed = this.readMappings(scriptId, () => {
+        consumer.eachMapping((mapping) => {
+          if (!mapping.source) return;
+          let sourceLines = index.get(mapping.source);
+          if (!sourceLines) index.set(mapping.source, sourceLines = new Map());
+          let lines = sourceLines.get(mapping.originalLine);
+          if (!lines) sourceLines.set(mapping.originalLine, lines = []);
+          const generatedLine = mapping.generatedLine - 1;
+          if (lines[lines.length - 1] !== generatedLine) lines.push(generatedLine);
+        });
+        return index;
+      });
+      if (!parsed) return [];
+      entry.generatedLinesByLine = parsed;
+    }
+    return entry.generatedLinesByLine.get(sourceName)?.get(line) ?? [];
+  }
+
   /**
    * Enumerate every generated position that maps to `line` in `filePath`,
    * across all scripts that include that source. Used by
    * `breakpointLocationsRequest` to discover which columns are breakable
    * on a source line (multi-line JSX, single-line lambdas, etc.).
    *
-   * Returns positions sorted by generated line then column. O(1) lookup
-   * per script thanks to the generatedByLine index built at load time.
+   * Columns are retrieved from the consumer without retaining a duplicate
+   * object for every mapping. Breakpoint placement uses the compact line index.
    */
   getGeneratedPositionsForOriginalLine(filePath: string, line: number): GeneratedLocation[] {
     const normalizedPath = filePath.replace(/\\/g, '/');
@@ -716,15 +787,17 @@ export class SourceMapResolver {
       if (!entry) continue;
       const sourceName = entry.sourceNameByPath.get(normalizedPath);
       if (!sourceName) continue;
-      const lineMap = entry.generatedByLine.get(sourceName);
-      if (!lineMap) continue;
-      const positions = lineMap.get(line);
-      if (!positions) continue;
+      if (this.getGeneratedLinesForOriginalLine(normalizedPath, line, scriptId).length === 0) continue;
+      // Without column the runtime enumerates the entire original line.
+      const positions = this.cache.get(scriptId)?.allGeneratedPositionsFor(
+        { source: sourceName, line } as Parameters<SourceMapConsumer['allGeneratedPositionsFor']>[0],
+      ) ?? [];
       for (const p of positions) {
+        if (p.line === null) continue;
         results.push({
           scriptId,
-          lineNumber: p.lineNumber,
-          columnNumber: p.columnNumber,
+          lineNumber: p.line - 1,
+          columnNumber: p.column ?? 0,
         });
       }
     }
@@ -888,6 +961,9 @@ export class SourceMapResolver {
   }
 
   clear(): void {
+    for (const scriptId of this.scriptMetas.keys()) {
+      for (const listener of this.scriptRemovedListeners) listener(scriptId);
+    }
     this.cache.clear();
     this.scripts.clear();
     this.scriptMetas.clear();
@@ -903,6 +979,18 @@ export class SourceMapResolver {
   }
 
   // --- Private ---
+
+  private readMappings<T>(scriptId: string, read: () => T): T | null {
+    try { return read(); }
+    catch (error) {
+      this.cache.delete(scriptId);
+      const entry = this.scripts.get(scriptId);
+      if (entry) entry.generatedLinesByLine = undefined;
+      this.failedScripts.add(scriptId);
+      logger.warn(`Invalid mappings for ${scriptId}: ${error}`);
+      return null;
+    }
+  }
 
   private async fetchAndParseSourceMap(
     scriptId: string,
@@ -924,7 +1012,7 @@ export class SourceMapResolver {
     let rawMap: RawSourceMap;
     try {
       rawMap = JSON.parse(rawMapStr);
-    } catch (e) {
+    } catch {
       logger.warn(`Invalid JSON in source map for ${scriptId}: ${rawMapStr.substring(0, 100)}...`);
       return { consumer: null, rawMap: {} as RawSourceMap };
     }
@@ -935,7 +1023,6 @@ export class SourceMapResolver {
     }
 
     const consumer = await new SourceMapConsumer(rawMap);
-    this.cache.set(scriptId, consumer);
     return { consumer, rawMap };
   }
 

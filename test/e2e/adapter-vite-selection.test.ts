@@ -19,10 +19,11 @@ vi.mock('../../src/vite/ViteServerDetector', () => ({
 vi.mock('../../src/cdp/ChromeDiscovery', () => chrome);
 
 import { ViteDebugSession } from '../../src/adapter/ViteDebugSession';
+import type { AttachRequestArguments, LaunchRequestArguments } from '../../src/adapter/ViteDebugSession';
 
 interface SessionRequests {
-  launchRequest(response: DebugProtocol.LaunchResponse, args: DebugProtocol.LaunchRequestArguments): Promise<void>;
-  attachRequest(response: DebugProtocol.AttachResponse, args: DebugProtocol.AttachRequestArguments): Promise<void>;
+  launchRequest(response: DebugProtocol.LaunchResponse, args: LaunchRequestArguments): Promise<void>;
+  attachRequest(response: DebugProtocol.AttachResponse, args: AttachRequestArguments): Promise<void>;
   sendErrorResponse: ReturnType<typeof vi.fn>;
 }
 
@@ -132,7 +133,7 @@ describe('ViteDebugSession root-scoped detection wiring', () => {
         viteUrl: 'https://alphac:3004/',
         _viteDebuggerMcpStartId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
         _viteDebuggerMcpRequireWorkspaceMatch: true,
-      } as never,
+      },
     );
 
     expect(detector.detectFirst).toHaveBeenCalledWith(

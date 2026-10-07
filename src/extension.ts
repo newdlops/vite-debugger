@@ -4,7 +4,6 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { ViteDebugSession } from './adapter/ViteDebugSession';
 import { detectViteServers, formatViteServerDescription, formatViteServerInfo } from './vite/ViteServerDetector';
-import { isChromeDebuggable } from './cdp/ChromeDiscovery';
 import { initLogger, logger, LogLevel } from './util/Logger';
 import { ViteInlineValuesProvider } from './providers/InlineValuesProvider';
 import { ReactComponentTreeProvider } from './react/ReactComponentTreeProvider';

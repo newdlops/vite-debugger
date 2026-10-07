@@ -137,6 +137,7 @@ export class CdpClient extends EventEmitter {
   private primarySessionId?: string;
   /** Sessions which Chrome currently reports as paused. */
   private pausedSessionIds = new Set<string>();
+  private pauseRevisions = new Map<string, number>();
 
   /**
    * Fetch requestId -> sessions it paused in. Request ids are scoped to a
@@ -230,6 +231,7 @@ export class CdpClient extends EventEmitter {
       if (sessionId) {
         this.activeSessionId = sessionId;
         this.pausedSessionIds.add(sessionId);
+        this.pauseRevisions.set(sessionId, (this.pauseRevisions.get(sessionId) ?? 0) + 1);
       }
       this.emit('paused', this.globalizePausedEvent(params, sessionId), sessionId);
     });
@@ -482,6 +484,7 @@ export class CdpClient extends EventEmitter {
     }
 
     this.pausedSessionIds.delete(sessionId);
+    this.pauseRevisions.delete(sessionId);
     if (this.activeSessionId === sessionId) this.activeSessionId = this.lastPausedSessionId();
     if (this.primarySessionId === sessionId) {
       this.primarySessionId = this.sessions.keys().next().value as string | undefined;
@@ -761,7 +764,22 @@ export class CdpClient extends EventEmitter {
   }
 
   async resume(targetId?: string): Promise<void> {
-    await this.client.Debugger.resume({}, this.requireTargetSession(targetId));
+    const sessionId = this.requireTargetSession(targetId);
+    const revision = this.pauseRevisions.get(sessionId);
+    try {
+      await this.client.Debugger.resume({}, sessionId);
+    } catch (error) {
+      const response = (error as { response?: { code?: number; message?: string } })?.response;
+      if (response?.code !== -32000 || response.message !== 'Can only perform operation while paused.') throw error;
+      // Chrome is authoritative: the original pause already ended (for
+      // example during navigation or another client's resume). Reconcile the
+      // target without erasing a newer pause that arrived while awaiting CDP.
+      if (this.sessions.has(sessionId) && this.pauseRevisions.get(sessionId) === revision) {
+        this.pausedSessionIds.delete(sessionId);
+        if (this.activeSessionId === sessionId) this.activeSessionId = this.lastPausedSessionId();
+        this.emit('resumed', sessionId);
+      }
+    }
   }
 
   async stepOver(targetId?: string): Promise<void> {
@@ -1083,6 +1101,7 @@ export class CdpClient extends EventEmitter {
     this.sessions.clear();
     this.allSessions.clear();
     this.pausedSessionIds.clear();
+    this.pauseRevisions.clear();
     this.fetchRequestOwners.clear();
     this.activeSessionId = undefined;
     this.primarySessionId = undefined;

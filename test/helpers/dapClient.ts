@@ -1,6 +1,15 @@
 import { EventEmitter } from 'events';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { ViteDebugSession } from '../../src/adapter/ViteDebugSession';
+import type { AttachRequestArguments, LaunchRequestArguments } from '../../src/adapter/ViteDebugSession';
+
+export interface ViteAttachRequest extends DebugProtocol.AttachRequest {
+  arguments: AttachRequestArguments;
+}
+
+export interface ViteLaunchRequest extends DebugProtocol.LaunchRequest {
+  arguments: LaunchRequestArguments;
+}
 
 type Listener<T> = (event: T) => void;
 
@@ -23,7 +32,8 @@ export class DAPClient {
 
   constructor() {
     this.session = new ViteDebugSession();
-    this.session.onDidSendMessage((msg: DebugProtocol.ProtocolMessage) => {
+    this.session.onDidSendMessage((message) => {
+      const msg = message as DebugProtocol.ProtocolMessage;
       if (msg.type === 'response') {
         const r = msg as DebugProtocol.Response;
         const cb = this.pending.get(r.request_seq);

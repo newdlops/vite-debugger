@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { E2ESession, startE2ESession } from '../helpers/session';
+import type { ViteAttachRequest, ViteLaunchRequest } from '../helpers/dapClient';
 
 interface McpDapRequest extends DebugProtocol.Request {
   command: 'viteDebugger.mcp';
@@ -39,7 +40,7 @@ describe('ViteDebugSession — launch target creation', () => {
   async function attach(current: E2ESession): Promise<void> {
     const initialized = current.dap.waitForEvent('initialized', 30_000);
     await current.dap.request<
-      DebugProtocol.AttachRequest,
+      ViteAttachRequest,
       DebugProtocol.AttachResponse
     >('attach', {
       viteUrl: current.vite.url,
@@ -52,7 +53,7 @@ describe('ViteDebugSession — launch target creation', () => {
   async function launch(current: E2ESession): Promise<void> {
     const initialized = current.dap.waitForEvent('initialized', 30_000);
     await current.dap.request<
-      DebugProtocol.LaunchRequest,
+      ViteLaunchRequest,
       DebugProtocol.LaunchResponse
     >('launch', {
       viteUrl: current.vite.url,

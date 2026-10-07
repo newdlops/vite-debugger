@@ -2523,6 +2523,7 @@ function errorMessage(error: unknown): string {
       ? error.data.availableConfigurations
         .filter((value): value is string => typeof value === 'string')
         .slice(0, 50)
+        // eslint-disable-next-line no-control-regex -- Sanitize configuration names in error output.
         .map((value) => boundedText(value.replace(/[\x00-\x1f\x7f]/g, ' '), 200))
       : [];
     if (available.length > 0) {

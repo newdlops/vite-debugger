@@ -93,7 +93,6 @@ function requestUrl(
   return new Promise((resolve, reject) => {
     let settled = false;
     let req: http.ClientRequest;
-    let deadline: NodeJS.Timeout;
     const finish = (result: HttpGetResult): void => {
       if (settled) return;
       settled = true;
@@ -156,7 +155,7 @@ function requestUrl(
       req = transport.get(url, { timeout, headers }, onResponse);
     }
 
-    deadline = setTimeout(() => {
+    const deadline = setTimeout(() => {
       req.destroy();
       fail(new Error('Request deadline exceeded'));
     }, timeout);
@@ -415,6 +414,7 @@ function probeHostsForEndpoint(endpoint: ListeningEndpoint): string[] {
 }
 
 function isValidLocalHostname(hostname: string): boolean {
+  // eslint-disable-next-line no-control-regex -- Limit DNS names to ASCII before validating each label.
   if (hostname.length === 0 || hostname.length > 253 || !/^[\x00-\x7f]+$/.test(hostname)) {
     return false;
   }
@@ -506,6 +506,19 @@ export async function detectViteServers(
       const url = new URL(preferredUrl);
       const result = await probeViteHost(url.origin, requireLocalPreferredUrl);
       if (result) return [result];
+      // A Vite base path may make all origin-root probes return 404. Honor
+      // the explicitly supplied path while retaining the origin for resolving
+      // the absolute module URLs found in the application's HTML.
+      const basePath = url.pathname.replace(/\/$/, '');
+      if (basePath) {
+        const prefixed = await probeViteHost(`${url.origin}${basePath}`, requireLocalPreferredUrl);
+        if (prefixed) {
+          const metadata = await queryViteMetadata(
+            url.origin, `${url.origin}${basePath}/`, requireLocalPreferredUrl,
+          );
+          return [{ ...prefixed, url: url.origin, ...metadata }];
+        }
+      }
       logger.warn(`No Vite server responded at preferred URL: ${url.origin}`);
     } catch {
       logger.warn(`Invalid preferred URL: ${preferredUrl}`);

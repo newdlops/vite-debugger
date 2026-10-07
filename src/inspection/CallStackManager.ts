@@ -26,7 +26,7 @@ export class CallStackManager {
 
   async resolveCallFrames(
     cdpFrames: CallFrame[],
-    registerSourceRef?: SourceRefRegistrar,
+    _registerSourceRef?: SourceRefRegistrar,
   ): Promise<ResolvedCallFrame[]> {
     this.frameMap.clear();
     this.frameIdCounter = cdpFrames.length;

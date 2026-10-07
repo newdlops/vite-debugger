@@ -5,6 +5,7 @@ import { SourceMapResolver } from '../sourcemap/SourceMapResolver';
 import { fileChecksumCache } from '../util/FileChecksum';
 import { logger } from '../util/Logger';
 import { escapeRegexLiteral, urlHostPatternForHost } from '../util/LocalHosts';
+import { BreakpointLocationResolver } from './BreakpointLocationResolver';
 
 export type BreakpointOwner = 'vscode' | 'agent';
 
@@ -43,10 +44,10 @@ interface ResolvedBreakpointTarget {
 export class BreakpointManager {
   private breakpoints = new Map<string, ManagedBreakpoint[]>();  // sourcePath -> breakpoints
   /** physical breakpoint spec -> CdpClient fan-out handle */
-  private physicalBreakpointIds = new Map<string, string>();
+  private physicalBreakpoints = new Map<string, CdpBreakpointLocation>();
   /** Deduplicates concurrent HMR re-resolution of a shared physical bp. */
   private pendingPhysicalBreakpoints = new Map<string, Promise<CdpBreakpointLocation>>();
-  private urlRegexCache = new Map<string, string>();  // sourcePath -> precomputed CDP urlRegex
+  private urlRegexCache = new Map<string, string>();  // script URL -> precomputed CDP urlRegex
   private nextDapId = 1;
   /**
    * Serializes all CDP-touching operations (setBreakpoints,
@@ -67,7 +68,8 @@ export class BreakpointManager {
   constructor(
     private cdp: CdpClient,
     private sourceMapResolver: SourceMapResolver,
-    private viteUrl: string,
+    _viteUrl: string,
+    private locations = new BreakpointLocationResolver(cdp, sourceMapResolver),
   ) {}
 
   /**
@@ -89,7 +91,7 @@ export class BreakpointManager {
   ): string {
     return JSON.stringify([
       sourcePath,
-      this.buildUrlRegex(sourcePath),
+      this.buildUrlRegex(target.scriptId),
       target.lineNumber,
       target.columnNumber,
       condition ?? '',
@@ -110,31 +112,67 @@ export class BreakpointManager {
     condition: string | undefined,
   ): Promise<CdpBreakpointLocation> {
     const key = this.physicalBreakpointKey(sourcePath, target, condition);
+    const previousKey = bp.physicalKey;
+    if (previousKey && previousKey !== key) {
+      bp.physicalKey = undefined;
+      bp.cdpBreakpointId = undefined;
+      if (!this.hasPhysicalReference(previousKey)) {
+        const previous = this.physicalBreakpoints.get(previousKey);
+        this.physicalBreakpoints.delete(previousKey);
+        if (previous) await this.cdp.removeBreakpoint(previous.breakpointId);
+      }
+    }
     bp.physicalKey = key;
 
-    const existingId = this.physicalBreakpointIds.get(key);
-    if (existingId) {
-      bp.cdpBreakpointId = existingId;
-      return { breakpointId: existingId, locations: [] };
+    const existing = this.physicalBreakpoints.get(key);
+    if (existing && existing.locations.length > 0) {
+      bp.cdpBreakpointId = existing.breakpointId;
+      return existing;
     }
 
     let pending = this.pendingPhysicalBreakpoints.get(key);
     if (!pending) {
-      pending = this.cdp.setBreakpointByUrl(
-        target.lineNumber,
-        {
-          urlRegex: this.buildUrlRegex(sourcePath),
+      pending = (async () => {
+        // A URL breakpoint with no bound locations is still pending. Retry
+        // it when a mapped script arrives rather than treating its handle as
+        // proof that Chrome installed it in executable code.
+        if (existing) {
+          this.physicalBreakpoints.delete(key);
+          await this.cdp.removeBreakpoint(existing.breakpointId);
+        }
+        const result = await this.cdp.setBreakpointByUrl(target.lineNumber, {
+          urlRegex: this.buildUrlRegex(target.scriptId),
           columnNumber: target.columnNumber,
           condition,
-        },
-      );
+        });
+        if (result.locations.length > 0) {
+          const mapped = await Promise.all(result.locations.map(async (location) => {
+            const original = await this.sourceMapResolver.generatedToOriginal(
+              location.scriptId, location.lineNumber, location.columnNumber, false,
+            );
+            return original && samePath(original.source, sourcePath)
+              && original.line === target.originalLine
+              && original.column === target.originalColumn;
+          }));
+          if (!mapped.some(Boolean)) {
+            await this.cdp.removeBreakpoint(result.breakpointId);
+            throw new Error(`Chrome did not bind the requested source position in ${sourcePath}`);
+          }
+        }
+        return result;
+      })();
       this.pendingPhysicalBreakpoints.set(key, pending);
     }
 
     try {
       const result = await pending;
-      this.physicalBreakpointIds.set(key, result.breakpointId);
+      this.physicalBreakpoints.set(key, result);
       bp.cdpBreakpointId = result.breakpointId;
+      for (const bps of this.breakpoints.values()) {
+        for (const shared of bps) {
+          if (shared.physicalKey === key) shared.cdpBreakpointId = result.breakpointId;
+        }
+      }
       return result;
     } finally {
       if (this.pendingPhysicalBreakpoints.get(key) === pending) {
@@ -200,7 +238,7 @@ export class BreakpointManager {
           const result = await this.acquirePhysicalBreakpoint(sourcePath, bp, target, condition);
 
           bp.cdpBreakpointId = result.breakpointId;
-          bp.verified = true;
+          bp.verified = result.locations.length > 0;
           if (target.originalLine !== undefined) {
             bp.resolvedLine = target.originalLine;
             bp.resolvedColumn = target.originalColumn !== undefined
@@ -208,32 +246,6 @@ export class BreakpointManager {
               : undefined;
             resolvedLine = target.originalLine;
             resolvedColumn = bp.resolvedColumn;
-          }
-
-          // Map CDP's actual resolved position back to original source
-          // to report the real breakpoint location to VSCode. CDP may snap
-          // the breakpoint to a nearby generated position that maps to a
-          // DIFFERENT original source (e.g., inlined @react-refresh preamble
-          // mapping to react-dom.development.js); if we took that line, the
-          // bp would be reported at a weird row in the user's file. Only
-          // trust the remap when the source matches the user's file.
-          if (result.locations.length > 0) {
-            const actualLoc = result.locations[0];
-            const actualOriginal = await this.sourceMapResolver.generatedToOriginal(
-              actualLoc.scriptId, actualLoc.lineNumber, actualLoc.columnNumber
-            );
-            if (actualOriginal && samePath(actualOriginal.source, sourcePath)) {
-              resolvedLine = actualOriginal.line;
-              resolvedColumn = actualOriginal.column + 1;  // DAP is 1-based
-              bp.line = resolvedLine;
-              bp.resolvedLine = resolvedLine;
-              bp.resolvedColumn = resolvedColumn;
-            } else if (actualOriginal) {
-              logger.debug(
-                `CDP snapped bp at ${sourcePath}:${sbp.line} into a different ` +
-                `source (${actualOriginal.source}); keeping user line`
-              );
-            }
           }
 
           logger.debug(
@@ -304,8 +316,8 @@ export class BreakpointManager {
       // references it. This is particularly important when VS Code and an MCP
       // agent chose the same source location.
       if (this.hasPhysicalReference(key)) continue;
-      const cdpBreakpointId = this.physicalBreakpointIds.get(key);
-      this.physicalBreakpointIds.delete(key);
+      const cdpBreakpointId = this.physicalBreakpoints.get(key)?.breakpointId;
+      this.physicalBreakpoints.delete(key);
       if (cdpBreakpointId) {
         try {
           await this.cdp.removeBreakpoint(cdpBreakpointId);
@@ -353,7 +365,7 @@ export class BreakpointManager {
           target,
           this.buildCdpCondition(bp),
         );
-        bp.verified = true;
+        bp.verified = result.locations.length > 0;
         if (target.originalLine !== undefined) {
           bp.resolvedLine = target.originalLine;
           bp.resolvedColumn = target.originalColumn !== undefined
@@ -364,14 +376,8 @@ export class BreakpointManager {
           `Pending breakpoint resolved: ${sourcePath}:${bp.line} -> ${result.breakpointId} ` +
           `at generated ${target.lineNumber}:${target.columnNumber}`
         );
-        return bp;
+        return bp.verified ? bp : null;
       } catch (e) {
-        const msg = String(e);
-        if (msg.includes('already exists')) {
-          bp.verified = true;
-          logger.debug(`Pending breakpoint already exists: ${sourcePath}:${bp.line}`);
-          return bp;
-        }
         logger.warn(`Failed to resolve pending breakpoint: ${e}`);
         return null;
       }
@@ -422,7 +428,7 @@ export class BreakpointManager {
     // breakpoint while the parallel HMR work is still running.
     const staleIds = new Set<string>();
     for (const { bp } of targets) {
-      if (bp.physicalKey) this.physicalBreakpointIds.delete(bp.physicalKey);
+      if (bp.physicalKey) this.physicalBreakpoints.delete(bp.physicalKey);
       if (bp.cdpBreakpointId) staleIds.add(bp.cdpBreakpointId);
       bp.cdpBreakpointId = undefined;
       bp.physicalKey = undefined;
@@ -464,7 +470,7 @@ export class BreakpointManager {
           this.buildCdpCondition(bp),
         );
 
-        bp.verified = true;
+        bp.verified = result.locations.length > 0;
         if (target.originalLine !== undefined) {
           bp.resolvedLine = target.originalLine;
           bp.resolvedColumn = target.originalColumn !== undefined
@@ -472,35 +478,16 @@ export class BreakpointManager {
             : undefined;
         }
 
-        if (result.locations.length > 0) {
-          const actualLoc = result.locations[0];
-          const actualOriginal = await this.sourceMapResolver.generatedToOriginal(
-            actualLoc.scriptId, actualLoc.lineNumber, actualLoc.columnNumber
-          );
-          // Same guard as setBreakpointsInternal — never overwrite bp.line
-          // with a row number from a different original source (e.g., an
-          // inlined react-dom/react-refresh position).
-          if (actualOriginal && samePath(actualOriginal.source, sourcePath)) {
-            bp.line = actualOriginal.line;
-            bp.resolvedLine = actualOriginal.line;
-            bp.resolvedColumn = actualOriginal.column + 1;
-          }
-        }
-
-        resolved.push(bp);
+        if (bp.verified) resolved.push(bp);
+        else unresolved.push(bp);
         logger.debug(
           `Breakpoint re-set after HMR: ${sourcePath}:${bp.line} -> ` +
           `CDP ${result.breakpointId} at generated ${target.lineNumber}:${target.columnNumber}`
         );
       } catch (e) {
-        if (String(e).includes('already exists')) {
-          bp.verified = true;
-          resolved.push(bp);
-        } else {
-          bp.verified = false;
-          unresolved.push(bp);
-          logger.warn(`Failed to re-set breakpoint after HMR: ${e}`);
-        }
+        bp.verified = false;
+        unresolved.push(bp);
+        logger.warn(`Failed to re-set breakpoint after HMR: ${e}`);
       }
     });
 
@@ -539,9 +526,10 @@ export class BreakpointManager {
 
   clear(): void {
     this.breakpoints.clear();
-    this.physicalBreakpointIds.clear();
+    this.physicalBreakpoints.clear();
     this.pendingPhysicalBreakpoints.clear();
     this.urlRegexCache.clear();
+    this.locations.clear();
   }
 
   private async resolveBreakpointTarget(
@@ -559,20 +547,25 @@ export class BreakpointManager {
     }
 
     const requestedColumn = bp.column === undefined ? 0 : Math.max(0, bp.column - 1);
+    const scriptIds = expectedScriptId
+      ? [expectedScriptId]
+      : this.sourceMapResolver.getScriptsForSource(sourcePath);
+    for (const scriptId of scriptIds) {
+      const exact = await this.findBreakableOriginalPosition(
+        sourcePath, bp.line, requestedColumn, scriptId, true,
+      );
+      if (exact) return exact;
+    }
+
     const generated = await this.sourceMapResolver.originalToGenerated(
-      sourcePath, bp.line, requestedColumn,
+      sourcePath, bp.line, requestedColumn, expectedScriptId,
     );
     if (!generated) return null;
     if (expectedScriptId && generated.scriptId !== expectedScriptId) return null;
 
-    // Refine position: find nearest valid breakpoint location. This keeps the
-    // existing behavior for explicit-column bps and ordinary line bps.
-    const refined = await this.refineBreakpointPosition(generated, sourcePath);
-    return {
-      scriptId: generated.scriptId,
-      lineNumber: refined?.lineNumber ?? generated.lineNumber,
-      columnNumber: refined?.columnNumber ?? generated.columnNumber,
-    };
+    // Non-executable source positions may move forward, but must still bind
+    // to a real, mapped statement in this source.
+    return this.refineBreakpointPosition(generated, sourcePath, bp.line);
   }
 
   private async findAnonymousFunctionBodyBreakpoint(
@@ -616,50 +609,21 @@ export class BreakpointManager {
     line: number,
     column: number,
     scriptId: string,
+    allowEarlierColumn: boolean = false,
   ): Promise<ResolvedBreakpointTarget | null> {
-    const genPositions = this.sourceMapResolver
-      .getGeneratedPositionsForOriginalLine(sourcePath, line)
-      .filter((pos) => pos.scriptId === scriptId);
-    if (genPositions.length === 0) return null;
-
-    const genLines = [...new Set(genPositions.map((pos) => pos.lineNumber))];
-    const queried = await Promise.all(genLines.map(async (genLine) => {
-      try {
-        const locations = await this.cdp.getPossibleBreakpoints(
-          { scriptId, lineNumber: genLine, columnNumber: 0 },
-          { scriptId, lineNumber: genLine + 1, columnNumber: 0 },
-        );
-        return locations;
-      } catch {
-        return [];
-      }
-    }));
-
-    const candidates: Array<{
-      lineNumber: number;
-      columnNumber: number;
-      originalColumn: number;
-    }> = [];
-
-    for (const loc of queried.flat()) {
-      const original = await this.sourceMapResolver.generatedToOriginal(
-        scriptId,
-        loc.lineNumber,
-        loc.columnNumber ?? 0,
-      );
-      if (!original || !samePath(original.source, sourcePath)) continue;
-      if (original.line !== line) continue;
-      if (original.column < column) continue;
-      candidates.push({
-        lineNumber: loc.lineNumber,
-        columnNumber: loc.columnNumber ?? 0,
-        originalColumn: original.column,
-      });
-    }
+    const candidates = (await this.locations.forOriginalLine(sourcePath, line, scriptId))
+      .filter((location) => allowEarlierColumn || location.originalColumn >= column);
 
     if (candidates.length === 0) return null;
     candidates.sort((a, b) => {
-      if (a.originalColumn !== b.originalColumn) return a.originalColumn - b.originalColumn;
+      const aBefore = a.originalColumn < column;
+      const bBefore = b.originalColumn < column;
+      if (aBefore !== bBefore) return aBefore ? 1 : -1;
+      if (a.originalColumn !== b.originalColumn) {
+        return aBefore
+          ? b.originalColumn - a.originalColumn
+          : a.originalColumn - b.originalColumn;
+      }
       if (a.lineNumber !== b.lineNumber) return a.lineNumber - b.lineNumber;
       return a.columnNumber - b.columnNumber;
     });
@@ -675,6 +639,8 @@ export class BreakpointManager {
   }
 
   private async readSourceText(sourcePath: string): Promise<string | null> {
+    const content = this.sourceMapResolver.getSourceContent(sourcePath);
+    if (content !== null) return content;
     try {
       return await fs.promises.readFile(sourcePath, 'utf8');
     } catch {
@@ -683,96 +649,29 @@ export class BreakpointManager {
   }
 
   /**
-   * Use CDP getPossibleBreakpoints to find the nearest valid breakpoint
-   * location to the generated position. This prevents Chrome from snapping
-   * the breakpoint to an unexpected location (e.g., function header).
-   *
-   * The scriptId from the source map may be stale (HMR replaced it).
-   * We try the given scriptId first, then fall back to finding the latest
-   * scriptId for the same source file via sourceMapResolver.
+   * Resolve a non-executable original position to the next mapped statement.
+   * Generated coordinates stay scoped to the script that supplied the map.
    */
   private async refineBreakpointPosition(
     generated: { scriptId: string; lineNumber: number; columnNumber: number },
-    sourcePath?: string,
-  ): Promise<{ lineNumber: number; columnNumber: number } | null> {
-    // Collect candidate scriptIds: the given one plus any others for the same source
-    const scriptIds = [generated.scriptId];
-    if (sourcePath) {
-      const others = this.sourceMapResolver.getScriptsForSource(sourcePath);
-      for (const id of others) {
-        if (!scriptIds.includes(id)) scriptIds.push(id);
-      }
-    }
-
-    for (const scriptId of scriptIds) {
-      try {
-        // Search on the same line first
-        const locations = await this.cdp.getPossibleBreakpoints(
-          { scriptId, lineNumber: generated.lineNumber, columnNumber: 0 },
-          { scriptId, lineNumber: generated.lineNumber + 1, columnNumber: 0 }
-        );
-
-        if (locations.length === 0) continue;
-
-        // A Vite-generated script can interleave user code with injected
-        // helpers (react-refresh preamble, JSX runtime calls, HMR hooks).
-        // getPossibleBreakpoints returns positions for ALL of those, and
-        // picking the nearest column blindly can land inside an injection
-        // that maps to a DIFFERENT original source (react-refresh, or
-        // nothing at all). When that bp fires at runtime, Chrome pauses
-        // deep in React internals like updateFunctionComponent.
-        //
-        // Filter candidates to only those whose round-trip back to the
-        // original source lands in `sourcePath`. If none qualify, fall
-        // back to the raw generated position (skip refinement) rather
-        // than snap to an injected region.
-        let candidates = locations;
-        if (sourcePath) {
-          const roundTripped = await Promise.all(
-            locations.map(async (loc) => {
-              const original = await this.sourceMapResolver.generatedToOriginal(
-                scriptId, loc.lineNumber, loc.columnNumber ?? 0,
-              );
-              return original && samePath(original.source, sourcePath) ? loc : null;
-            }),
-          );
-          const filtered = roundTripped.filter(
-            (loc): loc is typeof locations[number] => loc !== null,
-          );
-          if (filtered.length === 0) {
-            logger.debug(
-              `refineBreakpointPosition: no positions on generated line ` +
-              `${generated.lineNumber} round-trip to ${sourcePath} — ` +
-              `skipping refinement to avoid snapping into injected code`,
-            );
-            return null;
-          }
-          candidates = filtered;
-        }
-
-        // Find the location closest to the requested column
-        let best = candidates[0];
-        let bestDist = Math.abs((best.columnNumber ?? 0) - generated.columnNumber);
-
-        for (const loc of candidates) {
-          const dist = Math.abs((loc.columnNumber ?? 0) - generated.columnNumber);
-          if (dist < bestDist) {
-            best = loc;
-            bestDist = dist;
-          }
-        }
-
-        return {
-          lineNumber: best.lineNumber,
-          columnNumber: best.columnNumber ?? 0,
-        };
-      } catch {
-        // This scriptId is stale, try next
-        continue;
-      }
-    }
-
-    return null;
+    sourcePath: string,
+    requestedLine: number,
+  ): Promise<ResolvedBreakpointTarget | null> {
+    const { scriptId } = generated;
+    const candidates = (await this.locations.forGeneratedLine(scriptId, generated.lineNumber))
+      .filter((location) => samePath(location.source, sourcePath) && location.originalLine >= requestedLine);
+    candidates.sort((a, b) => a.originalLine - b.originalLine
+      || a.originalColumn - b.originalColumn
+      || a.columnNumber - b.columnNumber);
+    const best = candidates[0];
+    if (!best) return null;
+    return {
+      scriptId,
+      lineNumber: best.lineNumber,
+      columnNumber: best.columnNumber,
+      originalLine: best.originalLine,
+      originalColumn: best.originalColumn,
+    };
   }
 
   /**
@@ -814,28 +713,21 @@ export class BreakpointManager {
     return hitExpr || condExpr;
   }
 
-  private buildUrlRegex(sourcePath: string): string {
-    const cached = this.urlRegexCache.get(sourcePath);
+  private buildUrlRegex(scriptId: string): string {
+    const scriptUrl = this.sourceMapResolver.getScriptUrl(scriptId);
+    if (!scriptUrl) throw new Error(`No URL registered for breakpoint script ${scriptId}`);
+    const cached = this.urlRegexCache.get(scriptUrl);
     if (cached !== undefined) return cached;
 
-    // Build a URL regex that matches the Vite-served version of this file
-    // e.g., /src/App.tsx -> matches http://localhost:5173/src/App.tsx
-    const normalizedPath = sourcePath.replace(/\\/g, '/');
-    const vite = new URL(this.viteUrl);
-    const port = vite.port;
-    const hostPattern = urlHostPatternForHost(vite.hostname);
+    // Use the script that supplied the mapping: Vite base paths, /@fs/
+    // imports, nested src directories, and duplicate basenames all change
+    // the served URL. Only version/query suffixes may vary across reloads.
+    const url = new URL(scriptUrl);
+    const hostPattern = urlHostPatternForHost(url.hostname);
+    const port = url.port ? `:${escapeRegexLiteral(url.port)}` : '';
+    const regex = `^${escapeRegexLiteral(url.protocol)}//${hostPattern}${port}${escapeRegexLiteral(url.pathname)}(?:\\?.*)?$`;
 
-    let regex: string;
-    const srcIndex = normalizedPath.lastIndexOf('/src/');
-    if (srcIndex !== -1) {
-      const relative = normalizedPath.slice(srcIndex);
-      regex = `https?://${hostPattern}:${port}${escapeRegexLiteral(relative)}`;
-    } else {
-      const basename = normalizedPath.split('/').pop() ?? '';
-      regex = `https?://${hostPattern}:${port}/.*${escapeRegexLiteral(basename)}`;
-    }
-
-    this.urlRegexCache.set(sourcePath, regex);
+    this.urlRegexCache.set(scriptUrl, regex);
     return regex;
   }
 }
