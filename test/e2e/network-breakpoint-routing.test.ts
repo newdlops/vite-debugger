@@ -19,8 +19,8 @@ function pausedRequest(requestId: string): FetchRequestPausedEvent {
 
 function routableCdpClient(owners: Map<string, Set<string>>): {
   client: CdpClient;
-  continueRequest: Mock<[], Promise<undefined>>;
-  failRequest: Mock<[], Promise<undefined>>;
+  continueRequest: Mock<() => Promise<undefined>>;
+  failRequest: Mock<() => Promise<undefined>>;
 } {
   // CdpClient's constructor is intentionally private for production callers;
   // Reflect.construct gives this routing-only test a normally initialized

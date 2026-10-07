@@ -7,7 +7,8 @@ export default defineConfig({
     // The adapter E2E launches Chrome + Vite serially within a single suite;
     // run files sequentially so ports and Chrome instances don't collide.
     pool: 'forks',
-    poolOptions: { forks: { singleFork: true } },
+    fileParallelism: false,
+    maxWorkers: 1,
     testTimeout: 30_000,
     hookTimeout: 120_000,
     // Each test file can own its own Vite/Chrome pair, so isolate across files.

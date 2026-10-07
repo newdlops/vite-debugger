@@ -4,6 +4,8 @@
     "rootDir": "..",
     "outDir": "../dist-test",
     "noEmit": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
     "types": ["node", "mocha"],
     "lib": ["ES2022", "DOM", "DOM.Iterable"]
   },

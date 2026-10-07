@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Development
+
+- Updates Vitest, Vite, Mocha, esbuild, glob, and the React test plugins, and refreshes compatible transitive patches to resolve all 18 development/test dependency audit findings.
+- Keeps browser test files sequential and isolated with Vitest 5 worker settings, and updates test typechecking for modern ESM package exports.
+- Adds `npm run audit:all` for the complete dependency graph and documents the supported development Node versions.
+
 ## 0.1.7016 (2026-10-07)
 
 ### Security
